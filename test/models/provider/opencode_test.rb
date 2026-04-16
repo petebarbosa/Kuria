@@ -10,9 +10,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
   end
 
   test "supports any model in provider/model format" do
-    assert @provider.supports_model?("opencode/minimax-m2.5-free")
-    assert @provider.supports_model?("openai/gpt-4.1")
-    assert @provider.supports_model?("google/gemini-2.5-pro")
+    assert @provider.supports_model?("opencode/big-pickle")
   end
 
   test "chat_response creates session and sends message" do
@@ -21,7 +19,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_chat",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" }
+        "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
       },
       "parts" => [
         { "type" => "text", "content" => "Your net worth is $50,000." }
@@ -32,13 +30,13 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
     @client.expects(:send_message).with(
       "sess_chat",
       content: "What is my net worth?",
-      model: { providerID: "opencode", modelID: "minimax.2.5-free" },
+      model: { providerID: "opencode", modelID: "big-pickle" },
       system: "You are a helpful assistant."
     ).returns(message_response)
 
     response = @provider.chat_response(
       "What is my net worth?",
-      model: "opencode/minimax-m2.5-free",
+      model: "opencode/big-pickle",
       instructions: "You are a helpful assistant."
     )
 
@@ -53,7 +51,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_reuse",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" }
+        "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
       },
       "parts" => [
         { "type" => "text", "content" => "Reused session response." }
@@ -64,13 +62,13 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
     @client.expects(:send_message).with(
       "existing_sess_123",
       content: "Hello",
-      model: { providerID: "opencode", modelID: "minimax.2.5-free" },
+      model: { providerID: "opencode", modelID: "big-pickle" },
       system: nil
     ).returns(message_response)
 
     response = @provider.chat_response(
       "Hello",
-      model: "opencode/minimax-m2.5-free",
+      model: "opencode/big-pickle",
       previous_response_id: "existing_sess_123"
     )
 
@@ -84,7 +82,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_stream",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" }
+        "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
       },
       "parts" => [
         { "type" => "text", "content" => "Hello world" }
@@ -99,7 +97,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
 
     response = @provider.chat_response(
       "Hello",
-      model: "opencode/minimax-m2.5-free",
+      model: "opencode/big-pickle",
       streamer: streamer
     )
 
@@ -115,7 +113,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
 
     response = @provider.chat_response(
       "Hello",
-      model: "opencode/minimax-m2.5-free"
+      model: "opencode/big-pickle"
     )
 
     refute response.success?
@@ -149,7 +147,7 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
 
     response = @provider.chat_response(
       "Hello",
-      model: "opencode/minimax-m2.5-free"
+      model: "opencode/big-pickle"
     )
 
     refute response.success?

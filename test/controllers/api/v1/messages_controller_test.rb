@@ -39,7 +39,7 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
   test "should create message with write scope" do
     assert_difference "Message.count" do
       post "/api/v1/chats/#{@chat.id}/messages",
-        params: { content: "Test message", model: "qwen/qwen3.6-plus-free" },
+        params: { content: "Test message", model: "opencode/minimax-m2.5-free" },
         headers: bearer_auth_header(@write_token)
     end
 
@@ -65,7 +65,7 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
     assistant_message = @chat.messages.create!(
       type: "AssistantMessage",
       content: "Previous response",
-      ai_model: "qwen/qwen3.6-plus-free"
+      ai_model: "opencode/minimax-m2.5-free"
     )
 
     assert_enqueued_with(job: AssistantResponseJob) do

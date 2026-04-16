@@ -37,7 +37,7 @@ class Provider::Opencode::AutoCategorizerTest < ActiveSupport::TestCase
       @client,
       transactions: transactions,
       user_categories: categories,
-      model: { providerID: "anthropic", modelID: "minimax.2.5-free" }
+      model: { providerID: "opencode", modelID: "big-pickle" }
     )
 
     results = categorizer.auto_categorize
@@ -71,7 +71,7 @@ class Provider::Opencode::AutoCategorizerTest < ActiveSupport::TestCase
       @client,
       transactions: [{ id: "1", name: "Unknown", amount: 5 }],
       user_categories: [],
-      model: { providerID: "anthropic", modelID: "minimax.2.5-free" }
+      model: { providerID: "opencode", modelID: "big-pickle" }
     )
 
     results = categorizer.auto_categorize

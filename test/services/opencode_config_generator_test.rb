@@ -6,7 +6,7 @@ class OpencodeConfigGeneratorTest < ActiveSupport::TestCase
       mcp_url: "http://web:3000/mcp",
       mcp_auth_token: "test-token-123",
       provider_keys: {
-        "anthropic" => "sk-ant-test",
+        "opencode" => "sk-ant-test",
         "openai" => "sk-test"
       }
     )
@@ -23,7 +23,7 @@ class OpencodeConfigGeneratorTest < ActiveSupport::TestCase
   test "includes provider API keys" do
     config = @generator.generate
 
-    assert_equal "sk-ant-test", config.dig("provider", "anthropic", "api_key")
+    assert_equal "sk-ant-test", config.dig("provider", "opencode", "api_key")
     assert_equal "sk-test", config.dig("provider", "openai", "api_key")
   end
 
@@ -41,7 +41,7 @@ class OpencodeConfigGeneratorTest < ActiveSupport::TestCase
       mcp_url: "http://web:3000/mcp",
       mcp_auth_token: "test-token",
       provider_keys: {
-        "anthropic" => "sk-ant-test",
+        "opencode" => "sk-ant-test",
         "openai" => "",
         "google" => nil
       }
@@ -49,7 +49,7 @@ class OpencodeConfigGeneratorTest < ActiveSupport::TestCase
 
     config = generator.generate
 
-    assert config.dig("provider").key?("anthropic")
+    assert config.dig("provider").key?("opencode")
     refute config.dig("provider").key?("openai")
     refute config.dig("provider").key?("google")
   end
@@ -69,7 +69,7 @@ class OpencodeConfigGeneratorTest < ActiveSupport::TestCase
 
       assert File.exist?(path)
       parsed = JSON.parse(File.read(path))
-      assert_equal "sk-ant-test", parsed.dig("provider", "anthropic", "api_key")
+      assert_equal "sk-ant-test", parsed.dig("provider", "opencode", "api_key")
     end
   end
 

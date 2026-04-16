@@ -32,7 +32,7 @@ class Provider::Opencode::ClientTest < ActiveSupport::TestCase
           "info" => {
             "id" => "msg_456",
             "role" => "assistant",
-            "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" },
+            "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
             "structured_output" => nil
           },
           "parts" => [
@@ -44,7 +44,7 @@ class Provider::Opencode::ClientTest < ActiveSupport::TestCase
 
     result = @client.send_message("sess_123",
       content: "Hello",
-      model: { providerID: "opencode", modelID: "minimax.2.5-free" }
+      model: { providerID: "opencode", modelID: "big-pickle" }
     )
 
     assert_equal "msg_456", result.dig("info", "id")
@@ -102,10 +102,10 @@ class Provider::Opencode::ClientTest < ActiveSupport::TestCase
         status: 200,
         body: {
           "all" => [
-            { "id" => "opencode", "name" => "MiniMax", "models" => [ { "id" => "minimax.2.5-free", "name" => "MiniMax 2.5 Free" } ] }
+            { "id" => "opencode", "name" => "MiniMax", "models" => [ { "id" => "big-pickle", "name" => "big-pickle" } ] }
           ],
           "connected" => [ "opencode" ],
-          "default" => { "opencode" => "minimax.2.5-free" }
+          "default" => { "opencode" => "big-pickle" }
         }.to_json,
         headers: { "Content-Type" => "application/json" }
       )

@@ -6,7 +6,7 @@ class Provider::Opencode::ChatResponseParserTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_123",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" },
+      model: { providerID: "opencode", modelID: "big-pickle" }
         "structured_output" => nil
       },
       "parts" => [
@@ -48,7 +48,7 @@ class Provider::Opencode::ChatResponseParserTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_789",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" }
+        "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
       },
       "parts" => [
         {
@@ -76,7 +76,7 @@ class Provider::Opencode::ChatResponseParserTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_empty",
         "role" => "assistant",
-        "model" => { "providerID" => "opencode", "modelID" => "minimax.2.5-free" }
+        "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
       },
       "parts" => []
     }
