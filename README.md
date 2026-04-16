@@ -122,7 +122,7 @@ At minimum you will need to set the following environment variables:
 | `FREECRYPTO_API_KEY` | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier). |
 | `OPENCODE_SERVER_URL` | URL for OpenCode Server (AI assistant). |
 | `OPENCODE_SERVER_PASSWORD` | Password for OpenCode Server authentication. |
-| `OPENCODE_DEFAULT_MODEL` | Default model for AI assistant |
+| `OPENCODE_DEFAULT_MODEL` | Default model for AI assistant (e.g. `opencode/minimax-m2.5-free`). |
 | `MCP_AUTH_TOKEN` | Authentication token for MCP endpoint. |
 | `SMTP_*` | Mail delivery configuration (optional). |
 
