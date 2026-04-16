@@ -28,10 +28,6 @@ class OpencodeConfigGenerator
     new(
       mcp_url: "http://#{mcp_host}:#{mcp_port}/mcp",
       mcp_auth_token: Setting.mcp_auth_token,
-      provider_keys: {
-        "anthropic" => ENV["ANTHROPIC_API_KEY"],
-        "openai" => ENV["OPENAI_API_KEY"]
-      }
     )
   end
 
