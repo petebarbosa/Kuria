@@ -6,6 +6,7 @@ class Provider::Opencode < Provider
   def initialize
     @client = Provider::Opencode::Client.new(
       base_url: Setting.opencode_server_url,
+      username: Setting.opencode_server_username,
       password: Setting.opencode_server_password
     )
   end
