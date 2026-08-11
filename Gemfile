@@ -42,6 +42,7 @@ gem "skylight", groups: [ :production ]
 
 # Active Storage
 gem "image_processing", ">= 1.2"
+gem "ruby-vips", ">= 2.2.1", "< 3"
 
 # Other
 gem "ostruct"
@@ -76,6 +77,7 @@ gem "after_commit_everywhere", "~> 1.0"
 
 # AI
 gem "mcp"
+gem "ruby_llm", "~> 1.16.0"
 
 group :development, :test do
   gem "debug", platforms: %i[mri windows]
