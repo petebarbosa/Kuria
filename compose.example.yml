@@ -50,7 +50,7 @@ services:
       redis:
         condition: service_healthy
     networks:
-      - kuria_net
+      - kuria_network
 
   worker:
     build:
@@ -68,13 +68,13 @@ services:
     environment:
       <<: *rails_env
     networks:
-      - kuria_net
+      - kuria_network
 
   db:
-    image: postgres:17-alpine
+    image: postgres:18.4-trixie
     restart: unless-stopped
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql
     environment:
       <<: *db_env
     healthcheck:
@@ -83,10 +83,10 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - kuria_net
+      - kuria_network
 
   redis:
-    image: redis:alpine
+    image: redis:8.8.1-trixie
     restart: unless-stopped
     volumes:
       - redis-data:/data
@@ -96,7 +96,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - kuria_net
+      - kuria_network
 
   opencode:
     image: ghcr.io/anomalyco/opencode:dev
@@ -108,13 +108,13 @@ services:
     environment:
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:4096/global/health"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null --header \"Authorization: Basic $$(printf 'opencode:%s' \"$$OPENCODE_SERVER_PASSWORD\" | base64)\" http://127.0.0.1:4096/global/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - kuria_net
+      - kuria_network
     depends_on:
       web:
         condition: service_started
@@ -126,5 +126,6 @@ volumes:
   opencode-config:
 
 networks:
-  kuria_net:
+  kuria_network:
+    name: kuria_network
     driver: bridge

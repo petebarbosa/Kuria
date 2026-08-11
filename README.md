@@ -109,7 +109,7 @@ The production compose file (`compose.example.yml`) includes:
 | `redis` | Redis 7 |
 | `opencode` | OpenCode Server for AI assistant |
 
-All services run on the `kuria_net` bridge network.
+All services run on the `kuria_network` bridge network.
 
 At minimum you will need to set the following environment variables:
 
