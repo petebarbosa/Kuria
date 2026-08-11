@@ -73,6 +73,25 @@ class Provider::Registry
 
         Provider::Opencode.new
       end
+
+      def ruby_llm
+        return nil unless ruby_llm_provider_enabled?
+
+        Provider::RubyLlm.new
+      end
+
+      def ruby_llm_provider_enabled?
+        value = ENV["KURIA_LLM_PROVIDER"].to_s.strip
+
+        case value
+        when "", "opencode"
+          false
+        when "ruby_llm"
+          true
+        else
+          raise Error, "Unknown LLM provider '#{value}' for KURIA_LLM_PROVIDER. Use 'ruby_llm' to enable the RubyLLM proof of concept, or leave it unset (or set it to 'opencode') to keep the current OpenCode behavior."
+        end
+      end
   end
 
   def initialize(concept)
@@ -102,7 +121,7 @@ class Provider::Registry
       when :securities
         %i[synth]
       when :llm
-        %i[opencode]
+        self.class.send(:ruby_llm_provider_enabled?) ? %i[ruby_llm] : %i[opencode]
       else
         %i[synth plaid_us plaid_eu github opencode]
       end

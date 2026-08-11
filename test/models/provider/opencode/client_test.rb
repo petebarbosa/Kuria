@@ -32,7 +32,7 @@ class Provider::Opencode::ClientTest < ActiveSupport::TestCase
           "info" => {
             "id" => "msg_456",
             "role" => "assistant",
-            "model" => { "providerID" => "opencode", "modelID" => "big-pickle" }
+            "model" => { "providerID" => "opencode", "modelID" => "big-pickle" },
             "structured_output" => nil
           },
           "parts" => [
