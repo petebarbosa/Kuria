@@ -6,7 +6,7 @@ class Provider::Opencode::ChatResponseParserTest < ActiveSupport::TestCase
       "info" => {
         "id" => "msg_123",
         "role" => "assistant",
-      model: { providerID: "opencode", modelID: "big-pickle" }
+        "model" => { "providerID" => "opencode", "modelID" => "minimax-m2.5-free" },
         "structured_output" => nil
       },
       "parts" => [
