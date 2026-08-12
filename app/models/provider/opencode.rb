@@ -11,8 +11,9 @@ class Provider::Opencode < Provider
     )
   end
 
-  def supports_model?(_model)
-    true
+  def supports_model?(model)
+    parts = model.to_s.split("/", 2)
+    parts.size == 2 && parts.first == "opencode" && parts.last.present?
   end
 
   def auto_categorize(transactions: [], user_categories: [])
