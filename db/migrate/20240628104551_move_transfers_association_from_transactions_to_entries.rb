@@ -10,7 +10,7 @@ class MoveTransfersAssociationFromTransactionsToEntries < ActiveRecord::Migratio
           SET transfer_id = transactions.transfer_id,
               marked_as_transfer = transactions.marked_as_transfer
           FROM account_transactions AS transactions
-          WHERE account_entries.entryable_id = transactions.id::varchar
+          WHERE account_entries.entryable_id = transactions.id
           AND account_entries.entryable_type = 'Account::Transaction'
         SQL
 
@@ -27,7 +27,7 @@ class MoveTransfersAssociationFromTransactionsToEntries < ActiveRecord::Migratio
           SET transfer_id = account_entries.transfer_id,
               marked_as_transfer = account_entries.marked_as_transfer
           FROM account_entries
-          WHERE account_entries.entryable_id = account_transactions.id::varchar
+          WHERE account_entries.entryable_id = account_transactions.id
           AND account_entries.entryable_type = 'Account::Transaction'
         SQL
 

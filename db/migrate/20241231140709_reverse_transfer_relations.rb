@@ -15,8 +15,8 @@ class ReverseTransferRelations < ActiveRecord::Migration[7.2]
         execute <<~SQL
           INSERT INTO transfers (inflow_transaction_id, outflow_transaction_id, status, created_at, updated_at)
           SELECT
-            CASE WHEN e1.amount <= 0 THEN e1.entryable_id::bigint ELSE e2.entryable_id::bigint END as inflow_transaction_id,
-            CASE WHEN e1.amount <= 0 THEN e2.entryable_id::bigint ELSE e1.entryable_id::bigint END as outflow_transaction_id,
+            CASE WHEN e1.amount <= 0 THEN e1.entryable_id ELSE e2.entryable_id END as inflow_transaction_id,
+            CASE WHEN e1.amount <= 0 THEN e2.entryable_id ELSE e1.entryable_id END as outflow_transaction_id,
             'confirmed' as status,
             e1.created_at,
             e1.updated_at
@@ -50,8 +50,8 @@ class ReverseTransferRelations < ActiveRecord::Migration[7.2]
               ae_out.id as outflow_entry_id
             FROM transfers t
             JOIN new_transfers nt ON nt.created_at = t.created_at
-            JOIN account_entries ae_in ON ae_in.entryable_id::bigint = t.inflow_transaction_id
-            JOIN account_entries ae_out ON ae_out.entryable_id::bigint = t.outflow_transaction_id
+            JOIN account_entries ae_in ON ae_in.entryable_id = t.inflow_transaction_id
+            JOIN account_entries ae_out ON ae_out.entryable_id = t.outflow_transaction_id
             WHERE
               ae_in.entryable_type = 'Account::Transaction' AND
               ae_out.entryable_type = 'Account::Transaction'

@@ -1,6 +1,6 @@
 class AddPlaidDomain < ActiveRecord::Migration[7.2]
   def change
-    create_table :plaid_items do |t|
+    create_table :plaid_items, id: :uuid do |t|
       t.references :family, null: false, foreign_key: true, type: :uuid
       t.string :access_token
       t.string :plaid_id
@@ -12,7 +12,7 @@ class AddPlaidDomain < ActiveRecord::Migration[7.2]
     end
 
     create_table :plaid_accounts do |t|
-      t.references :plaid_item, null: false, foreign_key: true
+      t.references :plaid_item, null: false, foreign_key: true, type: :uuid
       t.string :plaid_id
       t.string :plaid_type
       t.string :plaid_subtype
@@ -26,7 +26,7 @@ class AddPlaidDomain < ActiveRecord::Migration[7.2]
     end
 
     create_table :syncs do |t|
-      t.references :syncable, polymorphic: true, null: false
+      t.references :syncable, polymorphic: true, null: false, type: :uuid
       t.datetime :last_ran_at
       t.date :start_date
       t.string :status, default: "pending"

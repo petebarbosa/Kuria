@@ -37,7 +37,7 @@ class IncomeStatement::Totals
           ABS(SUM(ae.amount * COALESCE(er.rate, 1))) as total,
           COUNT(ae.id) as transactions_count
         FROM (#{@transactions_scope.to_sql}) at
-        JOIN entries ae ON ae.entryable_id = at.id::varchar AND ae.entryable_type = 'Transaction'
+        JOIN entries ae ON ae.entryable_id = at.id AND ae.entryable_type = 'Transaction'
         LEFT JOIN categories c ON c.id = at.category_id
         LEFT JOIN exchange_rates er ON (
           er.date = ae.date AND

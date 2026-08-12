@@ -126,7 +126,7 @@ class IncomeStatement
 
     def base_transactions_scope(period: nil)
       scope = Transaction
-        .joins("INNER JOIN entries ON entries.entryable_id = transactions.id::varchar AND entries.entryable_type = 'Transaction'")
+        .joins("INNER JOIN entries ON entries.entryable_id = transactions.id AND entries.entryable_type = 'Transaction'")
         .joins("INNER JOIN accounts ON entries.account_id = accounts.id")
         .where(accounts: { family_id: family.id, status: [ "draft", "active" ] })
 

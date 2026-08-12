@@ -39,7 +39,7 @@ class RemoveOldColumnsFromEntryables < ActiveRecord::Migration[7.2]
               currency = ae.currency,
               account_id = ae.account_id
           FROM account_entries ae
-          WHERE ae.entryable_type = 'Account::Transaction' AND ae.entryable_id = at.id::varchar
+          WHERE ae.entryable_type = 'Account::Transaction' AND ae.entryable_id = at.id
         SQL
 
         # Repopulate data for Account::Valuation
@@ -50,7 +50,7 @@ class RemoveOldColumnsFromEntryables < ActiveRecord::Migration[7.2]
               currency = ae.currency,
               account_id = ae.account_id
           FROM account_entries ae
-          WHERE ae.entryable_type = 'Account::Valuation' AND ae.entryable_id = av.id::varchar
+          WHERE ae.entryable_type = 'Account::Valuation' AND ae.entryable_id = av.id
         SQL
       end
     end

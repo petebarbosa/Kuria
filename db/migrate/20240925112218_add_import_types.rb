@@ -51,7 +51,7 @@ class AddImportTypes < ActiveRecord::Migration[7.2]
       t.string :value
       t.boolean :create_when_empty, default: true
       t.references :import, null: false
-      t.references :mappable, polymorphic: true
+      t.references :mappable, polymorphic: true, type: :string
 
       t.timestamps
     end

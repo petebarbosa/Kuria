@@ -297,7 +297,7 @@ class Demo::Generator
       analysis_period = analysis_start..(current_month - 1.day)
 
       # Fetch expense transactions in the analysis period
-      txns = Entry.joins("INNER JOIN transactions ON transactions.id::varchar = entries.entryable_id")
+      txns = Entry.joins("INNER JOIN transactions ON transactions.id = entries.entryable_id")
                   .joins("INNER JOIN categories ON categories.id = transactions.category_id")
                   .where(entries: { entryable_type: "Transaction", date: analysis_period })
                   .where(categories: { classification: "expense" })
