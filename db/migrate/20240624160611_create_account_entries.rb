@@ -3,7 +3,7 @@ class CreateAccountEntries < ActiveRecord::Migration[7.2]
     create_table :account_entries do |t|
       t.references :account, null: false, foreign_key: true
       t.string :entryable_type
-      t.string :entryable_id
+      t.bigint :entryable_id
       t.decimal :amount, precision: 19, scale: 4
       t.string :currency
       t.date :date

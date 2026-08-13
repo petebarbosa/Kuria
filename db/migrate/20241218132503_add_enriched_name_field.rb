@@ -11,7 +11,7 @@ class AddEnrichedNameField < ActiveRecord::Migration[7.2]
               CASE
                 WHEN EXISTS (
                   SELECT 1 FROM account_trades t
-                  WHERE t.id::varchar = account_entries.entryable_id AND t.qty < 0
+                  WHERE t.id = account_entries.entryable_id AND t.qty < 0
                 ) THEN 'Sell trade'
                 ELSE 'Buy trade'
               END

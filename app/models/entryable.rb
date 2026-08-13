@@ -12,7 +12,7 @@ module Entryable
 
     has_one :entry, as: :entryable, touch: true
 
-    scope :with_entry, -> { joins("INNER JOIN entries ON entries.entryable_id = #{table_name}.id::varchar AND entries.entryable_type = '#{name}'") }
+    scope :with_entry, -> { joins(:entry) }
 
     scope :visible, -> { with_entry.merge(Entry.visible) }
 

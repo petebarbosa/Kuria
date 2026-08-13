@@ -11,7 +11,7 @@ class AddNotesToEntry < ActiveRecord::Migration[7.2]
               excluded = account_transactions.excluded
           FROM account_transactions
           WHERE account_entries.entryable_type = 'Account::Transaction'
-            AND account_entries.entryable_id = account_transactions.id::varchar
+            AND account_entries.entryable_id = account_transactions.id
         SQL
       end
 
@@ -22,7 +22,7 @@ class AddNotesToEntry < ActiveRecord::Migration[7.2]
               excluded = account_entries.excluded
           FROM account_entries
           WHERE account_entries.entryable_type = 'Account::Transaction'
-            AND account_entries.entryable_id = account_transactions.id::varchar
+            AND account_entries.entryable_id = account_transactions.id
         SQL
       end
     end
