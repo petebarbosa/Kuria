@@ -162,68 +162,39 @@ class AssistantTest < ActiveSupport::TestCase
     chat_fake = FakeChat.new(final_message: final_message, chunks: [ FakeChunk.new(content: "Your net worth is $50,000.") ])
     RubyLLM.stubs(:context).yields(FakeConfig.new).returns(FakeContext.new(chat_fake))
 
-    with_env_overrides KURIA_LLM_PROVIDER: "ruby_llm", OPENAI_API_KEY: "test-openai-key" do
-      assert_difference "AssistantMessage.count", 1 do
-        @assistant.respond_to(@message)
-      end
-    end
-
-    message = @chat.messages.ordered.where(type: "AssistantMessage").last
-    assert_equal "Your net worth is $50,000.", message.content
-    assert_equal "openai/gpt-4o", message.ai_model
+    assert_assistant_message_persisted(
+      KURIA_LLM_PROVIDER: "ruby_llm",
+      OPENAI_API_KEY: "test-openai-key",
+      content: "Your net worth is $50,000.",
+      ai_model: "openai/gpt-4o"
+    )
   end
 
   test "fails closed for an unsupported reference when RubyLlm is enabled" do
     @message.update!(ai_model: "anthropic/claude-3-5-sonnet")
     @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
 
-    with_env_overrides KURIA_LLM_PROVIDER: "ruby_llm" do
-      assert_no_difference "AssistantMessage.count" do
-        @assistant.respond_to(@message)
-      end
-    end
+    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: "ruby_llm")
   end
 
   test "routes an opencode reference through OpenCode when the switch is unset" do
-    client = stub_opencode_client
-    client.expects(:create_session).with(title: "What is my net worth?").returns({ "id" => "sess_default" })
-    client.expects(:send_message).with(
-      "sess_default",
-      content: "What is my net worth?",
-      model: { providerID: "opencode", modelID: "minimax-m2.5-free" },
-      system: anything
-    ).returns(opencode_message_response(id: "msg_default", content: "OpenCode default answer."))
+    stub_opencode_routing(session_id: "sess_default", message_id: "msg_default", content: "OpenCode default answer.")
 
-    with_env_overrides KURIA_LLM_PROVIDER: nil do
-      assert_difference "AssistantMessage.count", 1 do
-        @assistant.respond_to(@message)
-      end
-    end
-
-    message = @chat.messages.ordered.where(type: "AssistantMessage").last
-    assert_equal "OpenCode default answer.", message.content
-    assert_equal "opencode/minimax-m2.5-free", message.ai_model
+    assert_assistant_message_persisted(
+      KURIA_LLM_PROVIDER: nil,
+      content: "OpenCode default answer.",
+      ai_model: "opencode/minimax-m2.5-free"
+    )
   end
 
   test "routes an opencode reference through OpenCode when the switch is set to opencode" do
-    client = stub_opencode_client
-    client.expects(:create_session).with(title: "What is my net worth?").returns({ "id" => "sess_explicit" })
-    client.expects(:send_message).with(
-      "sess_explicit",
-      content: "What is my net worth?",
-      model: { providerID: "opencode", modelID: "minimax-m2.5-free" },
-      system: anything
-    ).returns(opencode_message_response(id: "msg_explicit", content: "OpenCode explicit answer."))
+    stub_opencode_routing(session_id: "sess_explicit", message_id: "msg_explicit", content: "OpenCode explicit answer.")
 
-    with_env_overrides KURIA_LLM_PROVIDER: "opencode" do
-      assert_difference "AssistantMessage.count", 1 do
-        @assistant.respond_to(@message)
-      end
-    end
-
-    message = @chat.messages.ordered.where(type: "AssistantMessage").last
-    assert_equal "OpenCode explicit answer.", message.content
-    assert_equal "opencode/minimax-m2.5-free", message.ai_model
+    assert_assistant_message_persisted(
+      KURIA_LLM_PROVIDER: "opencode",
+      content: "OpenCode explicit answer.",
+      ai_model: "opencode/minimax-m2.5-free"
+    )
   end
 
   test "fails closed for a foreign openai reference when the switch is unset" do
@@ -231,11 +202,7 @@ class AssistantTest < ActiveSupport::TestCase
     stub_opencode_client
     @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
 
-    with_env_overrides KURIA_LLM_PROVIDER: nil do
-      assert_no_difference "AssistantMessage.count" do
-        @assistant.respond_to(@message)
-      end
-    end
+    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: nil)
   end
 
   test "fails closed for an opencode_go reference when the switch is unset" do
@@ -243,11 +210,7 @@ class AssistantTest < ActiveSupport::TestCase
     stub_opencode_client
     @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
 
-    with_env_overrides KURIA_LLM_PROVIDER: nil do
-      assert_no_difference "AssistantMessage.count" do
-        @assistant.respond_to(@message)
-      end
-    end
+    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: nil)
   end
 
   test "routes an opencode_go reference through RubyLlm and persists one streamed message when the switch is enabled" do
@@ -257,15 +220,12 @@ class AssistantTest < ActiveSupport::TestCase
     chat_fake = FakeChat.new(final_message: final_message, chunks: [ FakeChunk.new(content: "Hello from Go.") ])
     RubyLLM.stubs(:context).yields(FakeConfig.new).returns(FakeContext.new(chat_fake))
 
-    with_env_overrides KURIA_LLM_PROVIDER: "ruby_llm", OPENCODE_GO_API_KEY: "test-go-key" do
-      assert_difference "AssistantMessage.count", 1 do
-        @assistant.respond_to(@message)
-      end
-    end
-
-    message = @chat.messages.ordered.where(type: "AssistantMessage").last
-    assert_equal "Hello from Go.", message.content
-    assert_equal "opencode_go/grok-4-fast", message.ai_model
+    assert_assistant_message_persisted(
+      KURIA_LLM_PROVIDER: "ruby_llm",
+      OPENCODE_GO_API_KEY: "test-go-key",
+      content: "Hello from Go.",
+      ai_model: "opencode_go/grok-4-fast"
+    )
   end
 
   private
@@ -283,6 +243,17 @@ class AssistantTest < ActiveSupport::TestCase
       client
     end
 
+    def stub_opencode_routing(session_id:, message_id:, content:)
+      client = stub_opencode_client
+      client.expects(:create_session).with(title: "What is my net worth?").returns({ "id" => session_id })
+      client.expects(:send_message).with(
+        session_id,
+        content: "What is my net worth?",
+        model: { providerID: "opencode", modelID: "minimax-m2.5-free" },
+        system: anything
+      ).returns(opencode_message_response(id: message_id, content: content))
+    end
+
     def opencode_message_response(id:, content:)
       {
         "info" => {
@@ -294,5 +265,25 @@ class AssistantTest < ActiveSupport::TestCase
           { "type" => "text", "content" => content }
         ]
       }
+    end
+
+    def assert_assistant_message_persisted(content:, ai_model:, **overrides)
+      with_env_overrides overrides do
+        assert_difference "AssistantMessage.count", 1 do
+          @assistant.respond_to(@message)
+        end
+      end
+
+      message = @chat.messages.ordered.where(type: "AssistantMessage").last
+      assert_equal content, message.content
+      assert_equal ai_model, message.ai_model
+    end
+
+    def assert_no_assistant_message_persisted(**overrides)
+      with_env_overrides overrides do
+        assert_no_difference "AssistantMessage.count" do
+          @assistant.respond_to(@message)
+        end
+      end
     end
 end
