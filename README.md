@@ -16,7 +16,7 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 - **Transaction management** — categorization, tagging, bulk editing, auto-classification rules, and merchant resolution with aliases
 - **Budgets** — monthly budget planning and tracking
 - **Investment portfolio** — holdings, valuations, and performance tracking
-- **AI financial assistant** — conversational assistant with access to your financial data, powered by OpenCode Server
+- **AI financial assistant** — conversational assistant with access to your financial data. OpenCode Server remains the current backend (transitional, being migrated away); set `KURIA_LLM_PROVIDER=ruby_llm` to opt into the RubyLLM provider (OpenAI or OpenCode Go)
 - **Merchant intelligence** — automatic merchant name normalization, tiered matching resolver, and AI-powered merchant suggestions
 - **Imports** — CSV import, Plaid bank sync, and Mint data migration
 - **Data exports** — export your data at any time
@@ -37,11 +37,11 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 
 The app requires the following external services:
 
-| Service | Purpose | Port |
-|---|---|---|
-| PostgreSQL | Primary database | 5432 |
-| Redis | Action Cable (WebSockets) + Sidekiq (background jobs) | 6379 |
-| OpenCode Server | AI assistant backend | 4096 |
+| Service         | Purpose                                                         | Port |
+| --------------- | --------------------------------------------------------------- | ---- |
+| PostgreSQL      | Primary database                                                | 5432 |
+| Redis           | Action Cable (WebSockets) + Sidekiq (background jobs)           | 6379 |
+| OpenCode Server | AI assistant backend (transitional — being migrated to RubyLLM) | 4096 |
 
 Start the infrastructure with Docker:
 
@@ -67,6 +67,7 @@ bin/dev                           # starts Rails, Tailwind, and Sidekiq
 ```
 
 `bin/dev` starts three processes concurrently:
+
 - Rails server on port 3000
 - Tailwind CSS watcher
 - Sidekiq worker for background jobs
@@ -93,6 +94,17 @@ bin/rails test:system   # browser-based system tests
 
 Test environment uses its own database (`kuria_test`) and Redis namespace. Configure with `.env.test` or `.env.test.example`.
 
+### Pre-commit checks
+
+The repo uses [Husky](https://typicode.github.io/husky/) git hooks. Run `npm run prepare` once (npm also runs it automatically after `npm install`) to install the hooks.
+
+The `pre-commit` hook runs `lint-staged`, which processes only staged files:
+
+- **Prettier** — all staged files are formatted with `prettier --ignore-unknown --write`
+- **RuboCop** — staged Ruby and Rake files are additionally linted with `bin/rubocop --force-exclusion`
+
+Both need their dependencies installed (Node packages via `npm install`, Ruby gems via `bundle install`) for the hook to run.
+
 ---
 
 ## Self-Hosting with Docker
@@ -101,30 +113,35 @@ See [`docs/hosting/docker.md`](docs/hosting/docker.md) for the full guide.
 
 The production compose file (`compose.example.yml`) includes:
 
-| Service | Description |
-|---|---|
-| `web` | Rails app (port 3000) |
-| `worker` | Sidekiq background jobs |
-| `db` | PostgreSQL 16 |
-| `redis` | Redis 7 |
-| `opencode` | OpenCode Server for AI assistant |
+| Service    | Description                                                                           |
+| ---------- | ------------------------------------------------------------------------------------- |
+| `web`      | Rails app (port 3000)                                                                 |
+| `worker`   | Sidekiq background jobs                                                               |
+| `db`       | PostgreSQL 16                                                                         |
+| `redis`    | Redis 7                                                                               |
+| `opencode` | OpenCode Server for AI assistant (transitional — planned for removal after migration) |
 
 All services run on the `kuria_network` bridge network.
 
+> **AI provider (transitional):** OpenCode Server remains the default/current compose service for the AI assistant while the migration to the RubyLLM provider is in progress. Set `KURIA_LLM_PROVIDER=ruby_llm` to opt into RubyLLM (OpenAI or OpenCode Go). OpenCode is being migrated away and is **not** intended as a maintained fallback; its service and variables are planned for removal after the migration.
+
 At minimum you will need to set the following environment variables:
 
-| Variable | Description |
-|---|---|
-| `SECRET_KEY_BASE` | Required. Generate with `openssl rand -hex 64`. |
-| `SELF_HOSTED` | Set to `true` to enable self-hosting mode. |
-| `PAYMENTS_ENABLED` | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid). |
-| `SYNTH_API_KEY` | Security market data provider (optional). |
-| `FREECRYPTO_API_KEY` | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier). |
-| `OPENCODE_SERVER_URL` | URL for OpenCode Server (AI assistant). |
-| `OPENCODE_SERVER_PASSWORD` | Password for OpenCode Server authentication. |
-| `OPENCODE_DEFAULT_MODEL` | Default model for AI assistant (e.g. `opencode/minimax-m2.5-free`). |
-| `MCP_AUTH_TOKEN` | Authentication token for MCP endpoint. |
-| `SMTP_*` | Mail delivery configuration (optional). |
+| Variable                   | Description                                                                                                                                                 |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SECRET_KEY_BASE`          | Required. Generate with `openssl rand -hex 64`.                                                                                                             |
+| `SELF_HOSTED`              | Set to `true` to enable self-hosting mode.                                                                                                                  |
+| `PAYMENTS_ENABLED`         | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                                                       |
+| `SYNTH_API_KEY`            | Security market data provider (optional).                                                                                                                   |
+| `FREECRYPTO_API_KEY`       | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                                                    |
+| `KURIA_LLM_PROVIDER`       | LLM provider selector. Leave unset (or set to `opencode`) to keep the current OpenCode Server behavior; set to `ruby_llm` to opt into the RubyLLM provider. |
+| `OPENAI_API_KEY`           | Required for RubyLLM `openai/<model>` references (e.g. `openai/gpt-4o`).                                                                                    |
+| `OPENCODE_GO_API_KEY`      | Required for RubyLLM `opencode_go/<model>` references (e.g. `opencode_go/grok-4-fast`).                                                                     |
+| `OPENCODE_SERVER_URL`      | URL for OpenCode Server (AI assistant) — **transitional**, planned for removal.                                                                             |
+| `OPENCODE_SERVER_PASSWORD` | Password for OpenCode Server authentication — **transitional**, planned for removal.                                                                        |
+| `OPENCODE_DEFAULT_MODEL`   | Default model for AI assistant (e.g. `opencode/minimax-m2.5-free`) — **transitional**, planned for removal.                                                 |
+| `MCP_AUTH_TOKEN`           | Authentication token for MCP endpoint — **transitional**, planned for removal.                                                                              |
+| `SMTP_*`                   | Mail delivery configuration (optional).                                                                                                                     |
 
 ---
 
