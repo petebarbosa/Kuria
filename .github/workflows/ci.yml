@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  pull_request:
   workflow_call:
 
 jobs:
@@ -66,7 +67,7 @@ jobs:
           cache: "npm"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
         shell: bash
 
       - name: Lint/Format js code

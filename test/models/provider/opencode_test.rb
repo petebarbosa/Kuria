@@ -9,8 +9,20 @@ class Provider::OpencodeTest < ActiveSupport::TestCase
     @provider = Provider::Opencode.new
   end
 
-  test "supports any model in provider/model format" do
+  test "supports canonical opencode references in provider/model format" do
     assert @provider.supports_model?("opencode/big-pickle")
+    assert @provider.supports_model?("opencode/minimax-m2.5-free")
+  end
+
+  test "rejects foreign, malformed, blank, and unprefixed model references" do
+    refute @provider.supports_model?("openai/gpt-4o")
+    refute @provider.supports_model?("opencode_go/grok-4-fast")
+    refute @provider.supports_model?("anthropic/claude-3-5-sonnet")
+    refute @provider.supports_model?("gpt-4o")
+    refute @provider.supports_model?("opencode/")
+    refute @provider.supports_model?("/model")
+    refute @provider.supports_model?("")
+    refute @provider.supports_model?(nil)
   end
 
   test "chat_response creates session and sends message" do

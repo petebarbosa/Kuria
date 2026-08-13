@@ -11,8 +11,10 @@ class Provider::Opencode < Provider
     )
   end
 
-  def supports_model?(_model)
-    true
+  def supports_model?(model)
+    parsed_model = parse_model(model.to_s)
+
+    parsed_model.present? && parsed_model[:providerID] == "opencode" && parsed_model[:modelID].present?
   end
 
   def auto_categorize(transactions: [], user_categories: [])

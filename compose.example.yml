@@ -31,6 +31,18 @@ x-rails-env: &rails_env
   OPENCODE_DEFAULT_MODEL: ${OPENCODE_DEFAULT_MODEL:-opencode/minimax-m2.5-free}
   MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
   FREECRYPTO_API_KEY: ${FREECRYPTO_API_KEY}
+  # --- AI provider ---
+  # Unset (default) keeps the current OpenCode Server behavior. Set
+  # KURIA_LLM_PROVIDER=ruby_llm to opt into the RubyLLM provider.
+  KURIA_LLM_PROVIDER: ${KURIA_LLM_PROVIDER:-}
+  # RubyLLM provider API keys (used only when KURIA_LLM_PROVIDER=ruby_llm).
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+  # --- AI: OpenCode Server (transitional) ---
+  # OpenCode is the current default while the migration to RubyLLM is in
+  # progress. These variables and the `opencode` service are planned for
+  # removal after the migration; OpenCode is not intended as a maintained
+  # fallback.
 
 services:
   web:
@@ -78,7 +90,7 @@ services:
     environment:
       <<: *db_env
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -91,13 +103,15 @@ services:
     volumes:
       - redis-data:/data
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
     networks:
       - kuria_network
 
+  # Transitional: OpenCode Server (AI assistant backend). Planned for removal
+  # after the migration to RubyLLM; not a maintained fallback.
   opencode:
     image: ghcr.io/anomalyco/opencode:dev
     container_name: maybe-opencode
@@ -108,7 +122,11 @@ services:
     environment:
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null --header \"Authorization: Basic $$(printf 'opencode:%s' \"$$OPENCODE_SERVER_PASSWORD\" | base64)\" http://127.0.0.1:4096/global/health"]
+      test:
+        [
+          "CMD-SHELL",
+          'wget -q -O /dev/null --header "Authorization: Basic $$(printf ''opencode:%s'' "$$OPENCODE_SERVER_PASSWORD" | base64)" http://127.0.0.1:4096/global/health',
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
