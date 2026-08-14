@@ -38,7 +38,7 @@ class OnboardingsTest < ApplicationSystemTestCase
 
     # Should redirect to goals page
     assert_current_path goals_onboarding_path
-    assert_text "What brings you to Maybe?"
+    assert_text "What brings you to Kuria?"
   end
 
   test "preferences page renders chart without errors" do
@@ -110,7 +110,7 @@ class OnboardingsTest < ApplicationSystemTestCase
     visit preferences_onboarding_path
 
     # Fill out form with specific values
-    select "Spanish (es)", from: "user_family_attributes_locale"
+    select "Spanish (Peru) (es-PE)", from: "user_family_attributes_locale"
     select "Euro (EUR)", from: "user_family_attributes_currency"
     select "DD/MM/YYYY", from: "user_family_attributes_date_format"
     select "Dark", from: "user_theme"
@@ -124,7 +124,7 @@ class OnboardingsTest < ApplicationSystemTestCase
     @family.reload
     @user.reload
 
-    assert_equal "es", @family.locale
+    assert_equal "es-PE", @family.locale
     assert_equal "EUR", @family.currency
     assert_equal "%d/%m/%Y", @family.date_format
     assert_equal "dark", @user.theme
@@ -137,7 +137,7 @@ class OnboardingsTest < ApplicationSystemTestCase
 
     visit goals_onboarding_path
 
-    assert_text "What brings you to Maybe?"
+    assert_text "What brings you to Kuria?"
     assert_button "Next"
   end
 

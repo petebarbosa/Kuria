@@ -11,6 +11,12 @@ class OnboardingsControllerTest < ActionDispatch::IntegrationTest
     sign_in @user
   end
 
+  def sign_out
+    @user.sessions.each do |session|
+      delete session_path(session)
+    end
+  end
+
   test "should get show" do
     get onboarding_url
     assert_response :success
@@ -82,7 +88,7 @@ class OnboardingsControllerTest < ActionDispatch::IntegrationTest
   test "should get goals" do
     get goals_onboarding_url
     assert_response :success
-    assert_select "h1", text: /What brings you to Maybe/i
+    assert_select "h1", text: /What brings you to Kuria/i
   end
 
   test "should get trial" do

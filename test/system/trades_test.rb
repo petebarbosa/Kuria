@@ -28,6 +28,11 @@ class TradesTest < ApplicationSystemTestCase
 
     click_button "Add transaction"
 
+    # Wait for the turbo redirect back to the account page to complete so the
+    # trade is committed before loading the activity feed (avoids racing the
+    # async form submission).
+    assert_no_selector "h2", text: "New transaction"
+
     visit_trades
 
     within_trades do
@@ -48,6 +53,11 @@ class TradesTest < ApplicationSystemTestCase
     fill_in "model[price]", with: 215.33
 
     click_button "Add transaction"
+
+    # Wait for the turbo redirect back to the account page to complete so the
+    # trade is committed before loading the activity feed (avoids racing the
+    # async form submission).
+    assert_no_selector "h2", text: "New transaction"
 
     visit_trades
 
