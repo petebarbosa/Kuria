@@ -1,5 +1,6 @@
 class User < ApplicationRecord
   has_secure_password
+  serialize :otp_backup_codes, coder: JSON
 
   belongs_to :family
   belongs_to :last_viewed_chat, class_name: "Chat", optional: true
