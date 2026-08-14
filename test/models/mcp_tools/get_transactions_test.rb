@@ -9,7 +9,7 @@ class McpTools::GetTransactionsTest < ActiveSupport::TestCase
   end
 
   test "tool has correct name and description" do
-    assert_equal "get_transactions", McpTools::GetTransactions.tool_name_value
+    assert_equal "get_transactions", McpTools::GetTransactions.name_value
     assert McpTools::GetTransactions.description_value.present?
   end
 
@@ -24,7 +24,7 @@ class McpTools::GetTransactionsTest < ActiveSupport::TestCase
     )
 
     assert result.is_a?(MCP::Tool::Response)
-    refute result.is_error
+    refute result.error?
     parsed = JSON.parse(result.content.first[:text])
     assert parsed["transactions"].any? { |t| t["account"] == "MCP test account" }
   end
@@ -38,6 +38,6 @@ class McpTools::GetTransactionsTest < ActiveSupport::TestCase
     )
 
     assert result.is_a?(MCP::Tool::Response)
-    assert result.is_error
+    assert result.error?
   end
 end

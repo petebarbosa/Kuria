@@ -65,7 +65,7 @@ class Provider::Opencode::AutoCategorizer
                 category_name: {
                   type: "string",
                   description: "The matched category name of the transaction, or null if no match",
-                  enum: [*user_categories.map { |c| c[:name] }, "null"]
+                  enum: [ *user_categories.map { |c| c[:name] }, "null" ]
                 }
               },
               required: %w[transaction_id category_name],

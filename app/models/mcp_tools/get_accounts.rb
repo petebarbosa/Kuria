@@ -31,15 +31,15 @@ class McpTools::GetAccounts < MCP::Tool
       end
     }
 
-    MCP::Tool::Response.new([{ type: "text", text: data.to_json }])
+    MCP::Tool::Response.new([ { type: "text", text: data.to_json } ])
   rescue ArgumentError => e
-    MCP::Tool::Response.new([{ type: "text", text: e.message }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: e.message } ], error: true)
   rescue => e
-    MCP::Tool::Response.new([{ type: "text", text: "Error querying accounts: #{e.message}" }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: "Error querying accounts: #{e.message}" } ], error: true)
   end
 
   private_class_method def self.historical_balances(account)
-    start_date = [account.start_date, 5.years.ago.to_date].max
+    start_date = [ account.start_date, 5.years.ago.to_date ].max
     period = Period.custom(start_date: start_date, end_date: Date.current)
     balance_series = account.balance_series(period: period, interval: "1 month")
 

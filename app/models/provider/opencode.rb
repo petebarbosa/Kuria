@@ -44,7 +44,8 @@ class Provider::Opencode < Provider
   end
 
   def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
-    with_provider_response do
+    session_id = nil
+    with_provider_response(error_transformer: ->(error) { chat_error_transformer(error, session_id, model) }) do
       session_id = if previous_response_id.present?
         previous_response_id
       else
@@ -71,12 +72,6 @@ class Provider::Opencode < Provider
 
       parsed
     end
-  rescue Provider::Opencode::Client::InvalidResponseError, Provider::Opencode::ChatResponseParser::InvalidResponseError => e
-    raise Error.new("OpenCode API response error: #{e.message}", details: {
-      session_id: session_id,
-      model: model,
-      error_type: e.class.name
-    })
   end
 
   def suggest_merchant(raw_name:, normalized_name:, user_merchants:)
@@ -93,6 +88,19 @@ class Provider::Opencode < Provider
 
   private
     attr_reader :client
+
+    def chat_error_transformer(error, session_id, model)
+      case error
+      when Provider::Opencode::Client::InvalidResponseError, Provider::Opencode::ChatResponseParser::InvalidResponseError
+        Error.new("OpenCode API response error: #{error.message}", details: {
+          session_id: session_id,
+          model: model,
+          error_type: error.class.name
+        })
+      else
+        default_error_transformer(error)
+      end
+    end
 
     def parse_model(model_string)
       return nil unless model_string.present?

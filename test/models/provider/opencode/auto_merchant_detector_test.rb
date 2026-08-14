@@ -10,7 +10,7 @@ class Provider::Opencode::AutoMerchantDetectorTest < ActiveSupport::TestCase
       { id: "1", name: "McDonalds", amount: 20, classification: "expense" },
       { id: "2", name: "local pub", amount: 20, classification: "expense" }
     ]
-    user_merchants = [{ name: "Shooters" }]
+    user_merchants = [ { name: "Shooters" } ]
 
     session_response = { "id" => "sess_merchant" }
     message_response = {

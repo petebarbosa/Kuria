@@ -46,11 +46,11 @@ class McpTools::GetIncomeStatement < MCP::Tool
       insights: build_insights(family, income_data, expense_data)
     }
 
-    MCP::Tool::Response.new([{ type: "text", text: data.to_json }])
+    MCP::Tool::Response.new([ { type: "text", text: data.to_json } ])
   rescue ArgumentError => e
-    MCP::Tool::Response.new([{ type: "text", text: e.message }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: e.message } ], error: true)
   rescue => e
-    MCP::Tool::Response.new([{ type: "text", text: "Error querying income statement: #{e.message}" }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: "Error querying income statement: #{e.message}" } ], error: true)
   end
 
   private_class_method def self.format_money(value, currency)

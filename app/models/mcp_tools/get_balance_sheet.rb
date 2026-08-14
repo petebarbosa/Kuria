@@ -18,7 +18,7 @@ class McpTools::GetBalanceSheet < MCP::Tool
   def self.call(server_context:, **params)
     family = McpTools::Base.resolve_family(params[:family_id])
 
-    observation_start_date = [5.years.ago.to_date, family.oldest_entry_date].max
+    observation_start_date = [ 5.years.ago.to_date, family.oldest_entry_date ].max
     period = Period.custom(start_date: observation_start_date, end_date: Date.current)
 
     data = {
@@ -40,11 +40,11 @@ class McpTools::GetBalanceSheet < MCP::Tool
       insights: insights_data(family)
     }
 
-    MCP::Tool::Response.new([{ type: "text", text: data.to_json }])
+    MCP::Tool::Response.new([ { type: "text", text: data.to_json } ])
   rescue ArgumentError => e
-    MCP::Tool::Response.new([{ type: "text", text: e.message }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: e.message } ], error: true)
   rescue => e
-    MCP::Tool::Response.new([{ type: "text", text: "Error querying balance sheet: #{e.message}" }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: "Error querying balance sheet: #{e.message}" } ], error: true)
   end
 
   private_class_method def self.historical_data(family, period, classification: nil)
