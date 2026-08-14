@@ -108,8 +108,8 @@ class Family::DataExporterTest < ActiveSupport::TestCase
 
       # Check NDJSON doesn't contain other family's data
       ndjson_content = zip.read("all.ndjson")
-      refute ndjson_content.include?(other_account.id)
-      refute ndjson_content.include?(other_category.id)
+      refute ndjson_content.include?(other_account.id.to_s)
+      refute ndjson_content.include?(other_category.id.to_s)
     end
   end
 end

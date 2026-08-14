@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_11_000700) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pgcrypto"
@@ -25,7 +25,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.string "currency"
     t.uuid "family_id", null: false
     t.bigint "import_id"
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.string "name"
     t.bigint "plaid_account_id"
     t.string "status", default: "active"
@@ -103,7 +103,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   end
 
   create_table "balances", force: :cascade do |t|
-    t.bigint "account_id", null: false
+    t.uuid "account_id", null: false
     t.decimal "balance", precision: 19, scale: 4, null: false
     t.decimal "cash_adjustments", precision: 19, scale: 4, default: "0.0", null: false
     t.decimal "cash_balance", precision: 19, scale: 4, default: "0.0"
@@ -161,7 +161,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.uuid "family_id", null: false
     t.string "lucide_icon", default: "shapes", null: false
     t.string "name", null: false
-    t.string "parent_id"
+    t.bigint "parent_id"
     t.datetime "updated_at", null: false
     t.index ["family_id"], name: "index_categories_on_family_id"
   end
@@ -184,52 +184,54 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.decimal "available_credit", precision: 10, scale: 2
     t.datetime "created_at", null: false
     t.date "expiration_date"
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.decimal "minimum_payment", precision: 10, scale: 2
     t.datetime "updated_at", null: false
   end
 
   create_table "cryptos", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
   create_table "data_enrichments", force: :cascade do |t|
     t.string "attribute_name"
     t.datetime "created_at", null: false
-    t.bigint "enrichable_id", null: false
+    t.string "enrichable_id", null: false
     t.string "enrichable_type", null: false
-    t.json "metadata"
+    t.jsonb "metadata"
     t.string "source"
     t.datetime "updated_at", null: false
-    t.json "value"
+    t.jsonb "value"
     t.index ["enrichable_id", "enrichable_type", "source", "attribute_name"], name: "idx_on_enrichable_id_enrichable_type_source_attribu_5be5f63e08", unique: true
     t.index ["enrichable_type", "enrichable_id"], name: "index_data_enrichments_on_enrichable"
   end
 
   create_table "depositories", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
   create_table "entries", force: :cascade do |t|
-    t.uuid "account_id"
+    t.uuid "account_id", null: false
     t.decimal "amount", precision: 19, scale: 4, null: false
     t.datetime "created_at", null: false
     t.string "currency"
     t.date "date"
-    t.string "entryable_id"
+    t.bigint "entryable_id"
     t.string "entryable_type"
     t.boolean "excluded", default: false
     t.bigint "import_id"
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.string "name", null: false
     t.text "notes"
     t.string "plaid_id"
     t.datetime "updated_at", null: false
     t.index "lower((name)::text)", name: "index_entries_on_lower_name"
+    t.index ["account_id", "date"], name: "index_entries_on_account_id_and_date"
+    t.index ["account_id"], name: "index_entries_on_account_id"
     t.index ["date"], name: "index_entries_on_date"
     t.index ["entryable_type"], name: "index_entries_on_entryable_type"
     t.index ["import_id"], name: "index_entries_on_import_id"
@@ -264,7 +266,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.datetime "updated_at", null: false
   end
 
-  create_table "family_exports", force: :cascade do |t|
+  create_table "family_exports", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
     t.datetime "created_at", null: false
     t.uuid "family_id", null: false
     t.string "status", default: "pending", null: false
@@ -273,7 +275,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   end
 
   create_table "holdings", force: :cascade do |t|
-    t.bigint "account_id", null: false
+    t.uuid "account_id", null: false
     t.decimal "amount", precision: 19, scale: 4, null: false
     t.datetime "created_at", null: false
     t.string "currency", null: false
@@ -315,7 +317,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.datetime "created_at", null: false
     t.bigint "import_id", null: false
     t.string "key"
-    t.bigint "mappable_id"
+    t.string "mappable_id"
     t.string "mappable_type"
     t.string "type", null: false
     t.datetime "updated_at", null: false
@@ -346,7 +348,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
 
   create_table "imports", force: :cascade do |t|
     t.string "account_col_label"
-    t.string "account_id"
+    t.uuid "account_id"
     t.string "amount_col_label"
     t.string "amount_type_inflow_value"
     t.string "amount_type_strategy", default: "signed_amount"
@@ -379,7 +381,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
 
   create_table "investments", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
@@ -411,7 +413,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.datetime "created_at", null: false
     t.decimal "initial_balance", precision: 19, scale: 4
     t.decimal "interest_rate", precision: 10, scale: 3
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.string "rate_type"
     t.integer "term_months"
     t.datetime "updated_at", null: false
@@ -525,13 +527,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
 
   create_table "other_assets", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
   create_table "other_liabilities", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
@@ -559,7 +561,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.string "mask"
     t.string "name", null: false
     t.string "plaid_id", null: false
-    t.bigint "plaid_item_id", null: false
+    t.uuid "plaid_item_id", null: false
     t.string "plaid_subtype"
     t.string "plaid_type", null: false
     t.json "raw_investments_payload", default: {}
@@ -571,7 +573,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.index ["plaid_item_id"], name: "index_plaid_accounts_on_plaid_item_id"
   end
 
-  create_table "plaid_items", force: :cascade do |t|
+  create_table "plaid_items", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
     t.string "access_token"
     t.string "available_products", default: "[]"
     t.string "billed_products", default: "[]"
@@ -597,9 +599,52 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.string "area_unit"
     t.integer "area_value"
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
     t.integer "year_built"
+  end
+
+  create_table "quarantined_data_enrichments", id: :bigint, default: nil, force: :cascade do |t|
+    t.string "attribute_name"
+    t.datetime "created_at"
+    t.bigint "enrichable_id"
+    t.string "enrichable_type"
+    t.jsonb "metadata"
+    t.timestamptz "quarantined_at"
+    t.string "source"
+    t.datetime "updated_at"
+    t.jsonb "value"
+  end
+
+  create_table "quarantined_import_mappings", id: :bigint, default: nil, force: :cascade do |t|
+    t.boolean "create_when_empty"
+    t.datetime "created_at"
+    t.bigint "import_id"
+    t.string "key"
+    t.bigint "mappable_id"
+    t.string "mappable_type"
+    t.timestamptz "quarantined_at"
+    t.string "type"
+    t.datetime "updated_at"
+    t.string "value"
+  end
+
+  create_table "quarantined_syncs", id: :bigint, default: nil, force: :cascade do |t|
+    t.datetime "completed_at"
+    t.datetime "created_at"
+    t.json "data"
+    t.string "error"
+    t.datetime "failed_at"
+    t.bigint "parent_id"
+    t.datetime "pending_at"
+    t.timestamptz "quarantined_at"
+    t.string "status"
+    t.bigint "syncable_id"
+    t.string "syncable_type"
+    t.datetime "syncing_at"
+    t.datetime "updated_at"
+    t.date "window_end_date"
+    t.date "window_start_date"
   end
 
   create_table "rejected_transfers", force: :cascade do |t|
@@ -719,7 +764,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.bigint "parent_id"
     t.datetime "pending_at"
     t.string "status", default: "pending"
-    t.bigint "syncable_id", null: false
+    t.uuid "syncable_id", null: false
     t.string "syncable_type", null: false
     t.datetime "syncing_at"
     t.datetime "updated_at", null: false
@@ -765,7 +810,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   create_table "trades", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "currency"
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.decimal "price", precision: 19, scale: 4
     t.decimal "qty", precision: 19, scale: 4
     t.bigint "security_id", null: false
@@ -777,7 +822,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
     t.bigint "category_id"
     t.datetime "created_at", null: false
     t.string "kind", default: "standard", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.bigint "merchant_id"
     t.datetime "updated_at", null: false
     t.index ["category_id"], name: "index_transactions_on_category_id"
@@ -834,13 +879,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   create_table "valuations", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "kind", default: "reconciliation", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
   end
 
   create_table "vehicles", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.json "locked_attributes", default: {}
+    t.jsonb "locked_attributes", default: {}
     t.string "make"
     t.string "mileage_unit"
     t.integer "mileage_value"
@@ -855,6 +900,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   add_foreign_key "active_storage_attachments", "active_storage_blobs", column: "blob_id"
   add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
   add_foreign_key "api_keys", "users"
+  add_foreign_key "balances", "accounts", on_delete: :cascade
   add_foreign_key "budget_categories", "budgets"
   add_foreign_key "budget_categories", "categories"
   add_foreign_key "budgets", "families"
@@ -863,6 +909,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_044026) do
   add_foreign_key "entries", "accounts"
   add_foreign_key "entries", "imports"
   add_foreign_key "family_exports", "families"
+  add_foreign_key "holdings", "accounts"
   add_foreign_key "holdings", "securities"
   add_foreign_key "impersonation_session_logs", "impersonation_sessions"
   add_foreign_key "impersonation_sessions", "users", column: "impersonated_id"

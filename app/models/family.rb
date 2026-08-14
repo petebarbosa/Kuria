@@ -21,13 +21,7 @@ class Family < ApplicationRecord
   has_many :family_exports, dependent: :destroy
 
   has_many :entries, through: :accounts
-
-  def transactions
-    Transaction
-      .joins("INNER JOIN entries ON entries.entryable_id = transactions.id::varchar AND entries.entryable_type = 'Transaction'")
-      .joins("INNER JOIN accounts ON entries.account_id = accounts.id")
-      .where(accounts: { family_id: id })
-  end
+  has_many :transactions, through: :accounts
   has_many :rules, dependent: :destroy
   has_many :trades, through: :accounts
   has_many :holdings, through: :accounts
