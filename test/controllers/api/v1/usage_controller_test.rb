@@ -2,6 +2,10 @@ require "test_helper"
 
 class Api::V1::UsageControllerTest < ActionDispatch::IntegrationTest
   setup do
+    # Use the real limiter regardless of SELF_HOSTED in .env (self-hosted
+    # mode routes ApiRateLimiter.limit to the NoopApiRateLimiter)
+    Rails.configuration.stubs(:app_mode).returns("managed".inquiry)
+
     @user = users(:family_admin)
     # Destroy any existing active API keys for this user
     @user.api_keys.active.destroy_all
@@ -13,13 +17,13 @@ class Api::V1::UsageControllerTest < ActionDispatch::IntegrationTest
       display_key: "usage_test_#{SecureRandom.hex(8)}"
     )
 
-    # Clear any existing rate limit data
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    # Clear any existing rate limit data for this API key
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   teardown do
     # Clean up Redis data after each test
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   test "should return usage information for API key authentication" do
@@ -68,7 +72,7 @@ class Api::V1::UsageControllerTest < ActionDispatch::IntegrationTest
       response_body = JSON.parse(response.body)
       assert_equal "insufficient_scope", response_body["error"]
     ensure
-      Redis.new.del("api_rate_limit:#{api_key_no_read.id}")
+      Redis.new.del(ApiRateLimiter.redis_key_for(api_key_no_read))
       api_key_no_read.destroy
     end
   end

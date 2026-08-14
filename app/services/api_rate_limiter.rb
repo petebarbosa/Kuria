@@ -1,3 +1,5 @@
+require "digest"
+
 class ApiRateLimiter
   # Rate limit tiers (requests per hour)
   RATE_LIMITS = {
@@ -80,10 +82,18 @@ class ApiRateLimiter
     end
   end
 
+  # Redis key for an API key's counters. Includes a hash of the unique
+  # display_key so counters can never bleed between distinct API keys, even
+  # when a numeric DB id gets reused (e.g. after a DB restore or test fixture
+  # reloads rewind the id sequence).
+  def self.redis_key_for(api_key)
+    "api_rate_limit:#{api_key.id}:#{Digest::SHA256.hexdigest(api_key.display_key.to_s)[0, 16]}"
+  end
+
   private
 
     def redis_key
-      "api_rate_limit:#{@api_key.id}"
+      self.class.redis_key_for(@api_key)
     end
 
     def determine_tier

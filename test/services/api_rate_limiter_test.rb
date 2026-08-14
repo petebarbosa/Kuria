@@ -2,6 +2,10 @@ require "test_helper"
 
 class ApiRateLimiterTest < ActiveSupport::TestCase
   setup do
+    # Use the real limiter regardless of SELF_HOSTED in .env (self-hosted
+    # mode routes ApiRateLimiter.limit to the NoopApiRateLimiter)
+    Rails.configuration.stubs(:app_mode).returns("managed".inquiry)
+
     @user = users(:family_admin)
     # Destroy any existing active API keys for this user
     @user.api_keys.active.destroy_all
@@ -14,13 +18,13 @@ class ApiRateLimiterTest < ActiveSupport::TestCase
     )
     @rate_limiter = ApiRateLimiter.new(@api_key)
 
-    # Clear any existing rate limit data
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    # Clear any existing rate limit data for this API key
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   teardown do
     # Clean up Redis data after each test
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   test "should have default rate limit" do
@@ -117,7 +121,7 @@ class ApiRateLimiterTest < ActiveSupport::TestCase
     assert_equal 1, @rate_limiter.current_count
     assert_equal 2, other_rate_limiter.current_count
   ensure
-    Redis.new.del("api_rate_limit:#{other_api_key.id}")
+    Redis.new.del(ApiRateLimiter.redis_key_for(other_api_key))
     other_api_key.destroy
   end
 
