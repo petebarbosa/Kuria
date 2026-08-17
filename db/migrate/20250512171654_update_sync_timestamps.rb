@@ -38,7 +38,7 @@ class UpdateSyncTimestamps < ActiveRecord::Migration[7.2]
             SET status = 'failed'
             WHERE (
               status = 'syncing' AND
-              created_at < datetime('now', '-2 hours')
+              created_at < NOW() - INTERVAL '2 hours'
             )
           SQL
         end

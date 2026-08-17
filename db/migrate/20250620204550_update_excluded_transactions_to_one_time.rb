@@ -8,7 +8,7 @@ class UpdateExcludedTransactionsToOneTime < ActiveRecord::Migration[7.2]
           UPDATE transactions
           SET kind = 'one_time'
           FROM entries
-          WHERE entries.entryable_id = transactions.id::varchar
+          WHERE entries.entryable_id = transactions.id
             AND entries.entryable_type = 'Transaction'
             AND entries.excluded = true
             AND transactions.kind = 'standard'
@@ -22,7 +22,7 @@ class UpdateExcludedTransactionsToOneTime < ActiveRecord::Migration[7.2]
           UPDATE transactions
           SET kind = 'standard'
           FROM entries
-          WHERE entries.entryable_id = transactions.id::varchar
+          WHERE entries.entryable_id = transactions.id
             AND entries.entryable_type = 'Transaction'
             AND entries.excluded = true
             AND transactions.kind = 'one_time'

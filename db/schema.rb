@@ -10,17 +10,17 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_11_000700) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_11_000200) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pgcrypto"
 
   create_table "accounts", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
-    t.string "accountable_id"
+    t.bigint "accountable_id"
     t.string "accountable_type"
     t.decimal "balance", precision: 19, scale: 4
     t.decimal "cash_balance", precision: 19, scale: 4, default: "0.0"
-    t.virtual "classification", type: :string, as: "\nCASE\n    WHEN ((accountable_type)::text = ANY (ARRAY[('Loan'::character varying)::text, ('CreditCard'::character varying)::text, ('OtherLiability'::character varying)::text])) THEN 'liability'::text\n    ELSE 'asset'::text\nEND", stored: true
+    t.virtual "classification", type: :string, as: "\nCASE\n    WHEN ((accountable_type)::text = ANY ((ARRAY['Loan'::character varying, 'CreditCard'::character varying, 'OtherLiability'::character varying])::text[])) THEN 'liability'::text\n    ELSE 'asset'::text\nEND", stored: true
     t.datetime "created_at", null: false
     t.string "currency"
     t.uuid "family_id", null: false
@@ -471,7 +471,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_000700) do
     t.string "device_name"
     t.string "device_type"
     t.datetime "last_seen_at"
-    t.integer "oauth_application_id"
+    t.bigint "oauth_application_id"
     t.string "os_version"
     t.datetime "updated_at", null: false
     t.uuid "user_id", null: false
@@ -873,7 +873,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_000700) do
     t.index ["family_id"], name: "index_users_on_family_id"
     t.index ["last_viewed_chat_id"], name: "index_users_on_last_viewed_chat_id"
     t.index ["otp_secret"], name: "index_users_on_otp_secret", unique: true, where: "(otp_secret IS NOT NULL)"
-    t.check_constraint "role::text = ANY (ARRAY['admin'::character varying::text, 'member'::character varying::text, 'super_admin'::character varying::text])", name: "check_user_role"
+    t.check_constraint "role::text = ANY (ARRAY['admin'::character varying, 'member'::character varying, 'super_admin'::character varying]::text[])", name: "check_user_role"
   end
 
   create_table "valuations", force: :cascade do |t|
