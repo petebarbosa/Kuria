@@ -69,7 +69,7 @@ class RulesControllerTest < ActionDispatch::IntegrationTest
     # Actions assertions
     assert_equal 1, rule.actions.count
     assert_equal "set_transaction_category", rule.actions.first.action_type
-    assert_equal categories(:food_and_drink).id, rule.actions.first.value
+    assert_equal categories(:food_and_drink).id.to_s, rule.actions.first.value
 
     assert_redirected_to confirm_rule_url(rule)
   end
@@ -113,7 +113,7 @@ class RulesControllerTest < ActionDispatch::IntegrationTest
     assert_not rule.active
     assert_equal "new_value", rule.conditions.order("created_at ASC").first.value
     assert_equal "new_value", rule.actions.order("created_at ASC").first.value
-    assert_equal tags(:one).id, rule.actions.order("created_at ASC").last.value
+    assert_equal tags(:one).id.to_s, rule.actions.order("created_at ASC").last.value
     assert_equal "100", rule.conditions.order("created_at ASC").last.value
 
     assert_redirected_to rules_url

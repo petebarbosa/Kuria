@@ -69,7 +69,7 @@ class Provider::Opencode::AutoCategorizerTest < ActiveSupport::TestCase
 
     categorizer = Provider::Opencode::AutoCategorizer.new(
       @client,
-      transactions: [{ id: "1", name: "Unknown", amount: 5 }],
+      transactions: [ { id: "1", name: "Unknown", amount: 5 } ],
       user_categories: [],
       model: { providerID: "opencode", modelID: "big-pickle" }
     )

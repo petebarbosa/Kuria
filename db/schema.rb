@@ -198,7 +198,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_000200) do
   create_table "data_enrichments", force: :cascade do |t|
     t.string "attribute_name"
     t.datetime "created_at", null: false
-    t.bigint "enrichable_id", null: false
+    t.string "enrichable_id", null: false
     t.string "enrichable_type", null: false
     t.jsonb "metadata"
     t.string "source"
@@ -602,6 +602,49 @@ ActiveRecord::Schema[8.1].define(version: 2026_08_11_000200) do
     t.jsonb "locked_attributes", default: {}
     t.datetime "updated_at", null: false
     t.integer "year_built"
+  end
+
+  create_table "quarantined_data_enrichments", id: :bigint, default: nil, force: :cascade do |t|
+    t.string "attribute_name"
+    t.datetime "created_at"
+    t.bigint "enrichable_id"
+    t.string "enrichable_type"
+    t.jsonb "metadata"
+    t.timestamptz "quarantined_at"
+    t.string "source"
+    t.datetime "updated_at"
+    t.jsonb "value"
+  end
+
+  create_table "quarantined_import_mappings", id: :bigint, default: nil, force: :cascade do |t|
+    t.boolean "create_when_empty"
+    t.datetime "created_at"
+    t.bigint "import_id"
+    t.string "key"
+    t.bigint "mappable_id"
+    t.string "mappable_type"
+    t.timestamptz "quarantined_at"
+    t.string "type"
+    t.datetime "updated_at"
+    t.string "value"
+  end
+
+  create_table "quarantined_syncs", id: :bigint, default: nil, force: :cascade do |t|
+    t.datetime "completed_at"
+    t.datetime "created_at"
+    t.json "data"
+    t.string "error"
+    t.datetime "failed_at"
+    t.bigint "parent_id"
+    t.datetime "pending_at"
+    t.timestamptz "quarantined_at"
+    t.string "status"
+    t.bigint "syncable_id"
+    t.string "syncable_type"
+    t.datetime "syncing_at"
+    t.datetime "updated_at"
+    t.date "window_end_date"
+    t.date "window_start_date"
   end
 
   create_table "rejected_transfers", force: :cascade do |t|

@@ -7,7 +7,7 @@ class McpTools::GetAccountsTest < ActiveSupport::TestCase
   end
 
   test "tool has correct name" do
-    assert_equal "get_accounts", McpTools::GetAccounts.tool_name_value
+    assert_equal "get_accounts", McpTools::GetAccounts.name_value
   end
 
   test "returns accounts for a family" do
@@ -17,7 +17,7 @@ class McpTools::GetAccountsTest < ActiveSupport::TestCase
     )
 
     assert result.is_a?(MCP::Tool::Response)
-    refute result.is_error
+    refute result.error?
     parsed = JSON.parse(result.content.first[:text])
     assert parsed["accounts"].any? { |a| a["name"] == "MCP checking" }
   end
@@ -28,6 +28,6 @@ class McpTools::GetAccountsTest < ActiveSupport::TestCase
       server_context: {}
     )
 
-    assert result.is_error
+    assert result.error?
   end
 end

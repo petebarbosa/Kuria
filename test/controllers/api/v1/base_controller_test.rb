@@ -4,6 +4,10 @@ require "test_helper"
 
 class Api::V1::BaseControllerTest < ActionDispatch::IntegrationTest
   setup do
+    # Use the real limiter regardless of SELF_HOSTED in .env (self-hosted
+    # mode routes ApiRateLimiter.limit to the NoopApiRateLimiter)
+    Rails.configuration.stubs(:app_mode).returns("managed".inquiry)
+
     @user = users(:family_admin)
     @oauth_app = Doorkeeper::Application.create!(
       name: "Test API App",
@@ -23,13 +27,13 @@ class Api::V1::BaseControllerTest < ActionDispatch::IntegrationTest
       scopes: [ "read_write" ]
     )
 
-    # Clear any existing rate limit data
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    # Clear any existing rate limit data for this API key
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   teardown do
     # Clean up Redis data after each test
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
   end
 
   test "should require authentication" do
@@ -420,7 +424,7 @@ class Api::V1::BaseControllerTest < ActionDispatch::IntegrationTest
       assert_response :success
       assert_equal "99", response.headers["X-RateLimit-Remaining"]
     ensure
-      Redis.new.del("api_rate_limit:#{other_api_key.id}")
+      Redis.new.del(ApiRateLimiter.redis_key_for(other_api_key))
       other_api_key.destroy
     end
   end

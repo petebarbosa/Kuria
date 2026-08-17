@@ -71,15 +71,15 @@ class McpTools::GetTransactions < MCP::Tool
       total_results: total_count,
       page: page,
       page_size: PAGE_SIZE,
-      total_pages: [total_pages, 1].max,
+      total_pages: [ total_pages, 1 ].max,
       total_income: totals.income_money.format,
       total_expenses: totals.expense_money.format
     }
 
-    MCP::Tool::Response.new([{ type: "text", text: data.to_json }])
+    MCP::Tool::Response.new([ { type: "text", text: data.to_json } ])
   rescue ArgumentError => e
-    MCP::Tool::Response.new([{ type: "text", text: e.message }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: e.message } ], error: true)
   rescue => e
-    MCP::Tool::Response.new([{ type: "text", text: "Error querying transactions: #{e.message}" }], is_error: true)
+    MCP::Tool::Response.new([ { type: "text", text: "Error querying transactions: #{e.message}" } ], error: true)
   end
 end

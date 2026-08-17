@@ -9,7 +9,7 @@ class McpTools::GetIncomeStatementTest < ActiveSupport::TestCase
   end
 
   test "tool has correct name" do
-    assert_equal "get_income_statement", McpTools::GetIncomeStatement.tool_name_value
+    assert_equal "get_income_statement", McpTools::GetIncomeStatement.name_value
   end
 
   test "returns income statement for a date range" do
@@ -24,7 +24,7 @@ class McpTools::GetIncomeStatementTest < ActiveSupport::TestCase
     )
 
     assert result.is_a?(MCP::Tool::Response)
-    refute result.is_error
+    refute result.error?
     parsed = JSON.parse(result.content.first[:text])
     assert parsed.key?("income")
     assert parsed.key?("expense")
@@ -40,6 +40,6 @@ class McpTools::GetIncomeStatementTest < ActiveSupport::TestCase
       server_context: {}
     )
 
-    assert result.is_error
+    assert result.error?
   end
 end

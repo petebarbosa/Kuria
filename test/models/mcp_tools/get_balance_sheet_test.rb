@@ -7,7 +7,7 @@ class McpTools::GetBalanceSheetTest < ActiveSupport::TestCase
   end
 
   test "tool has correct name" do
-    assert_equal "get_balance_sheet", McpTools::GetBalanceSheet.tool_name_value
+    assert_equal "get_balance_sheet", McpTools::GetBalanceSheet.name_value
   end
 
   test "returns balance sheet for a family" do
@@ -17,7 +17,7 @@ class McpTools::GetBalanceSheetTest < ActiveSupport::TestCase
     )
 
     assert result.is_a?(MCP::Tool::Response)
-    refute result.is_error
+    refute result.error?
     parsed = JSON.parse(result.content.first[:text])
     assert parsed.key?("net_worth")
     assert parsed.key?("assets")
@@ -31,6 +31,6 @@ class McpTools::GetBalanceSheetTest < ActiveSupport::TestCase
       server_context: {}
     )
 
-    assert result.is_error
+    assert result.error?
   end
 end

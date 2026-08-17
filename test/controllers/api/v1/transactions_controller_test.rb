@@ -28,9 +28,9 @@ class Api::V1::TransactionsControllerTest < ActionDispatch::IntegrationTest
       source: "mobile"  # Use different source to allow multiple keys
     )
 
-    # Clear any existing rate limit data
-    Redis.new.del("api_rate_limit:#{@api_key.id}")
-    Redis.new.del("api_rate_limit:#{@read_only_api_key.id}")
+    # Clear any existing rate limit data for the API keys used by this test
+    Redis.new.del(ApiRateLimiter.redis_key_for(@api_key))
+    Redis.new.del(ApiRateLimiter.redis_key_for(@read_only_api_key))
   end
 
   # INDEX action tests

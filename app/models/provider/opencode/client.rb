@@ -7,7 +7,7 @@ class Provider::Opencode::Client
   class InvalidResponseError < StandardError; end
 
   def initialize(base_url:, password: nil, username: "opencode")
-    @connection = Faraday.new(url: base_url) do |f|
+    @faraday_connection = Faraday.new(url: base_url) do |f|
       f.request :json
       f.response :json
       f.response :raise_error
@@ -21,7 +21,7 @@ class Provider::Opencode::Client
     body[:title] = title if title.present?
     body[:parentID] = parent_id if parent_id.present?
 
-    response = connection.post("/session", body)
+    response = faraday_connection.post("/session", body)
     response.body
   end
 
@@ -34,7 +34,7 @@ class Provider::Opencode::Client
     body[:system] = system if system.present?
     body[:tools] = tools if tools.present?
 
-    response = connection.post("/session/#{session_id}/message", body)
+    response = faraday_connection.post("/session/#{session_id}/message", body)
     body = response.body
 
     unless body.is_a?(Hash)
@@ -52,7 +52,7 @@ class Provider::Opencode::Client
     body[:format] = format if format.present?
     body[:system] = system if system.present?
 
-    connection.post("/session/#{session_id}/prompt_async", body)
+    faraday_connection.post("/session/#{session_id}/prompt_async", body)
     true
   end
 
@@ -60,40 +60,40 @@ class Provider::Opencode::Client
     params = {}
     params[:limit] = limit if limit.present?
 
-    response = connection.get("/session/#{session_id}/message", params)
+    response = faraday_connection.get("/session/#{session_id}/message", params)
     response.body
   end
 
   def get_message(session_id, message_id:)
-    response = connection.get("/session/#{session_id}/message/#{message_id}")
+    response = faraday_connection.get("/session/#{session_id}/message/#{message_id}")
     response.body
   end
 
   def list_providers
-    response = connection.get("/provider")
+    response = faraday_connection.get("/provider")
     response.body
   end
 
   def abort_session(session_id)
-    response = connection.post("/session/#{session_id}/abort")
+    response = faraday_connection.post("/session/#{session_id}/abort")
     response.body
   end
 
   def get_session(session_id)
-    response = connection.get("/session/#{session_id}")
+    response = faraday_connection.get("/session/#{session_id}")
     response.body
   end
 
   def delete_session(session_id)
-    response = connection.delete("/session/#{session_id}")
+    response = faraday_connection.delete("/session/#{session_id}")
     response.body
   end
 
   def health
-    response = connection.get("/global/health")
+    response = faraday_connection.get("/global/health")
     response.body
   end
 
   private
-    attr_reader :connection
+    attr_reader :faraday_connection
 end
