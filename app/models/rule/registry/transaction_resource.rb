@@ -28,7 +28,14 @@ class Rule::Registry::TransactionResource < Rule::Registry
   end
 
   private
+    # The AI actions above (auto-categorize, auto-detect merchants) are powered
+    # by LLM enrichment capabilities the RubyLLM provider contract does not
+    # implement yet — they are deferred to #15 and #30. RubyLLM is the only LLM
+    # provider and always returns an instance, so a bare provider-presence check
+    # would advertise actions the provider cannot perform, promising an
+    # unsupported operation. Keep the affordance disabled until those
+    # capabilities land rather than routing to any provider.
     def ai_enabled?
-      Provider::Registry.get_provider(:opencode).present?
+      false
     end
 end

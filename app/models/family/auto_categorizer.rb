@@ -46,9 +46,12 @@ class Family::AutoCategorizer
   private
     attr_reader :family, :transaction_ids
 
-    # Supports any LLM concept provider
+    # The registry's llm concept resolves to RubyLLM only; there is no
+    # OpenCode Server fallback. RubyLLM currently returns a failed
+    # Provider::Response for this capability (deferred to #15), which the
+    # caller treats as a safe no-op.
     def llm_provider
-      Provider::Registry.get_provider(:opencode)
+      Provider::Registry.get_provider(:ruby_llm)
     end
 
     def user_categories_input

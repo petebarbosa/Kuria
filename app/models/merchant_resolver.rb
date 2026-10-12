@@ -21,7 +21,7 @@ class MerchantResolver
   end
 
   def try_ai_suggestion(raw_name, normalized)
-    llm_provider = Provider::Registry.get_provider(:opencode)
+    llm_provider = Provider::Registry.get_provider(:ruby_llm)
     return nil unless llm_provider
 
     user_merchants = @family.merchants.map { |m| { id: m.id, name: m.name } }
