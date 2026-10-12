@@ -26,19 +26,13 @@ en:
           body: Are you sure you want to clear the data cache? This will remove all exchange rates, security prices, account balances, and other data. This action cannot be undone.
       ai_settings:
         title: AI Model
-        description: Select the default AI model used for chat and auto-categorization. Models are provided by OpenCode Server.
         ruby_llm_description: AI models are provided by the credentials you configure in your environment. You choose a model when you send a chat message.
-        model_label: Default model
-        connection_status: Connection Status
         connected: Connected
         disconnected: Not connected
         connected_providers: "Connected providers: %{providers}"
-        no_providers: No AI providers connected. Configure API keys in your environment.
         ruby_llm_credentials_configured: Provider credentials are configured through environment variables.
         ruby_llm_no_credentials: No provider credentials are configured.
         ruby_llm_environment_hint: Set OPENAI_API_KEY or OPENCODE_GO_API_KEY in your environment, then restart Kuria.
-        model_updated_title: "Model Updated:"
-        model_updated_body: Your previous AI model was unavailable and has been automatically switched to a working free model.
       synth_settings:
         api_calls_used: "%{used} / %{limit} API calls used (%{percentage})"
         description: Input the API key provided by Synth
