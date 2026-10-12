@@ -7,7 +7,7 @@
     <% if Current.user.ai_available? %>
       Kuria AI can answer financial questions and provide insights based on your data. To use this feature you'll need to explicitly enable it.
     <% else %>
-      To use the AI assistant, you need to configure the OpenCode Server connection in your
+      To use the AI assistant, you need to configure an AI provider connection in your
       <%= link_to "self-hosting settings", settings_hosting_path, class: "text-primary underline" %>.
     <% end %>
   </p>

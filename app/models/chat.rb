@@ -7,15 +7,30 @@ class Chat < ApplicationRecord
   has_many :messages, dependent: :destroy
 
   validates :title, presence: true
+  validate :validate_ai_model, if: -> { ai_model_changed? && ai_model.present? }
 
   scope :ordered, -> { order(created_at: :desc) }
 
   class << self
-    def start!(prompt, model:)
-      create!(
-        title: generate_title(prompt),
-        messages: [ UserMessage.new(content: prompt, ai_model: model) ]
-      )
+    # Creates a chat with its initial user message, snapshotting the caller's
+    # explicit model onto both the chat and the message. There is no automatic
+    # or deployment default: a blank model fails the UserMessage presence
+    # validation rather than being substituted.
+    def start!(prompt, model: nil)
+      transaction do
+        chat = create!(
+          title: generate_title(prompt),
+          ai_model: model.presence
+        )
+
+        chat.messages.create!(
+          type: "UserMessage",
+          content: prompt,
+          ai_model: chat.ai_model
+        )
+
+        chat
+      end
     end
 
     def generate_title(prompt)
@@ -72,4 +87,21 @@ class Chat < ApplicationRecord
       messages.where(type: [ "UserMessage", "AssistantMessage" ])
     end
   end
+
+  # Revalidates and returns this chat's persisted explicit model selection.
+  # There is no family or deployment fallback — a blank selection stays blank
+  # so callers must supply an explicit model.
+  def effective_ai_model
+    return if ai_model.blank?
+
+    Provider::Registry.validate_llm_model!(ai_model)
+    ai_model
+  end
+
+  private
+    def validate_ai_model
+      Provider::Registry.validate_llm_model!(ai_model)
+    rescue Provider::Registry::Error => e
+      errors.add(:ai_model, e.message)
+    end
 end

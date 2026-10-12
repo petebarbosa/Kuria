@@ -30,6 +30,7 @@ class Api::V1::BaseController < ApplicationController
   rescue_from ActiveRecord::RecordNotFound, with: :handle_not_found
   rescue_from Doorkeeper::Errors::DoorkeeperError, with: :handle_unauthorized
   rescue_from ActionController::ParameterMissing, with: :handle_bad_request
+  rescue_from Provider::Registry::Error, with: :handle_provider_registry_error
 
   private
 
@@ -215,6 +216,15 @@ class Api::V1::BaseController < ApplicationController
       render_json({ error: "bad_request", message: "Required parameters are missing or invalid" }, status: :bad_request)
     end
 
+    def handle_provider_registry_error(exception)
+      Rails.logger.warn "API Provider Registry Error: #{exception.message}"
+      render_json({
+        error: "provider_configuration_error",
+        message: "The AI provider is not configured correctly",
+        details: exception.message
+      }, status: :unprocessable_entity)
+    end
+
     # Log API access for monitoring and debugging
     def log_api_access
       return unless current_resource_owner
@@ -272,8 +282,12 @@ class Api::V1::BaseController < ApplicationController
 
     # Check if AI features are enabled for the current user
     def require_ai_enabled
-      unless current_resource_owner&.ai_enabled?
-        render_json({ error: "feature_disabled", message: "AI features are not enabled for this user" }, status: :forbidden)
-      end
+      return if current_resource_owner&.ai_enabled? && current_resource_owner.ai_available?
+
+      # No deployment default model exists, so there is nothing to validate
+      # here; missing credentials simply leave AI unavailable and return the
+      # ordinary feature-disabled response. Provider/selection errors raised
+      # downstream are surfaced safely via handle_provider_registry_error.
+      render_json({ error: "feature_disabled", message: "AI features are not enabled for this user" }, status: :forbidden)
     end
 end

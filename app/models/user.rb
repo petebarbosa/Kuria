@@ -88,7 +88,14 @@ class User < ApplicationRecord
   end
 
   def ai_available?
-    !Rails.application.config.app_mode.self_hosted? || Setting.opencode_server_url.present?
+    return true unless Rails.application.config.app_mode.self_hosted?
+
+    # RubyLLM is the only provider: self-hosted availability depends on the
+    # account credentials configured in the environment, with no legacy
+    # OpenCode Server URL fallback and no deployment default model.
+    Provider::Registry.get_provider(:ruby_llm).credentials_configured?
+  rescue Provider::Registry::Error
+    false
   end
 
   def ai_enabled?

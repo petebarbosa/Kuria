@@ -6,10 +6,16 @@ class Api::V1::MessagesController < Api::V1::BaseController
   before_action :set_chat
 
   def create
+    # An explicit model is required: there is no deployment default, so a
+    # missing reference fails validation and returns the standard
+    # provider_configuration_error envelope instead of defaulting silently.
+    ai_model = message_params[:model]
+    Provider::Registry.validate_llm_model!(ai_model)
+
     @message = @chat.messages.build(
       content: message_params[:content],
       type: "UserMessage",
-      ai_model: message_params[:model] || Setting.opencode_default_model
+      ai_model: ai_model
     )
 
     if @message.save
