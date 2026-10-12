@@ -15,6 +15,16 @@ class AssistantTest < ActiveSupport::TestCase
     def openai_api_base=(value)
       @openai_api_base = value
     end
+
+    # The OpenCode Go branch clears these so a Go request never inherits the
+    # deployment's OpenAI billing identity.
+    def openai_organization_id=(value)
+      @openai_organization_id = value
+    end
+
+    def openai_project_id=(value)
+      @openai_project_id = value
+    end
   end
 
   class FakeContext
@@ -76,14 +86,14 @@ class AssistantTest < ActiveSupport::TestCase
     @message = @chat.messages.create!(
       type: "UserMessage",
       content: "What is my net worth?",
-      ai_model: "opencode/minimax-m2.5-free"
+      ai_model: "openai/gpt-4o"
     )
     @assistant = Assistant.for_chat(@chat)
     @provider = mock
   end
 
   test "errors get added to chat" do
-    @assistant.expects(:get_model_provider).with("opencode/minimax-m2.5-free").returns(@provider)
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
 
     error = StandardError.new("test error")
     @provider.expects(:chat_response).returns(provider_error_response(error))
@@ -96,12 +106,12 @@ class AssistantTest < ActiveSupport::TestCase
   end
 
   test "responds to basic prompt" do
-    @assistant.expects(:get_model_provider).with("opencode/minimax-m2.5-free").returns(@provider)
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
 
     text_chunk = provider_text_chunk("Your net worth is $50,000.")
     response_data = Provider::LlmConcept::ChatResponse.new(
       id: "msg_1",
-      model: "opencode/minimax-m2.5-free",
+      model: "openai/gpt-4o",
       messages: [ provider_message(id: "msg_1", text: "Your net worth is $50,000.") ],
       function_requests: []
     )
@@ -144,7 +154,6 @@ class AssistantTest < ActiveSupport::TestCase
   end
 
   test "respond_to with an unsupported reference adds the registry error to the chat and persists no message" do
-    @message.update!(ai_model: "openai/gpt-4o")
     provider = mock
     provider.expects(:supports_model?).with("openai/gpt-4o").returns(false)
     @assistant.stubs(:registry).returns(stub(providers: [ provider ]))
@@ -155,76 +164,44 @@ class AssistantTest < ActiveSupport::TestCase
     end
   end
 
-  test "routes a supported openai reference through RubyLlm and persists one streamed message when the switch is enabled" do
+  test "respond_to fails closed for an uncatalogued reference without contacting a model API" do
+    # The real RubyLLM provider resolves manifest membership without a network
+    # call, so this exercises the registry routing end to end.
+    @message.update!(ai_model: "anthropic/claude-3-5-sonnet")
+    @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
+
+    assert_no_difference "AssistantMessage.count" do
+      @assistant.respond_to(@message)
+    end
+  end
+
+  test "routes a supported openai reference through RubyLlm and persists one streamed message" do
     @message.update!(ai_model: "openai/gpt-4o")
+    stub_live_catalog_admission
 
     final_message = FakeMessage.new(content: "Your net worth is $50,000.", id: "msg_ruby_1")
     chat_fake = FakeChat.new(final_message: final_message, chunks: [ FakeChunk.new(content: "Your net worth is $50,000.") ])
     RubyLLM.stubs(:context).yields(FakeConfig.new).returns(FakeContext.new(chat_fake))
 
     assert_assistant_message_persisted(
-      KURIA_LLM_PROVIDER: "ruby_llm",
       OPENAI_API_KEY: "test-openai-key",
       content: "Your net worth is $50,000.",
       ai_model: "openai/gpt-4o"
     )
   end
 
-  test "fails closed for an unsupported reference when RubyLlm is enabled" do
-    @message.update!(ai_model: "anthropic/claude-3-5-sonnet")
-    @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
-
-    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: "ruby_llm")
-  end
-
-  test "routes an opencode reference through OpenCode when the switch is unset" do
-    stub_opencode_routing(session_id: "sess_default", message_id: "msg_default", content: "OpenCode default answer.")
-
-    assert_assistant_message_persisted(
-      KURIA_LLM_PROVIDER: nil,
-      content: "OpenCode default answer.",
-      ai_model: "opencode/minimax-m2.5-free"
-    )
-  end
-
-  test "routes an opencode reference through OpenCode when the switch is set to opencode" do
-    stub_opencode_routing(session_id: "sess_explicit", message_id: "msg_explicit", content: "OpenCode explicit answer.")
-
-    assert_assistant_message_persisted(
-      KURIA_LLM_PROVIDER: "opencode",
-      content: "OpenCode explicit answer.",
-      ai_model: "opencode/minimax-m2.5-free"
-    )
-  end
-
-  test "fails closed for a foreign openai reference when the switch is unset" do
-    @message.update!(ai_model: "openai/gpt-4o")
-    stub_opencode_client
-    @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
-
-    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: nil)
-  end
-
-  test "fails closed for an opencode_go reference when the switch is unset" do
-    @message.update!(ai_model: "opencode_go/grok-4-fast")
-    stub_opencode_client
-    @chat.expects(:add_error).with(instance_of(Provider::Registry::Error)).once
-
-    assert_no_assistant_message_persisted(KURIA_LLM_PROVIDER: nil)
-  end
-
-  test "routes an opencode_go reference through RubyLlm and persists one streamed message when the switch is enabled" do
-    @message.update!(ai_model: "opencode_go/grok-4-fast")
+  test "routes a supported opencode_go reference through RubyLlm and persists one streamed message" do
+    @message.update!(ai_model: "opencode_go/glm-5.3-flash")
+    stub_live_catalog_admission
 
     final_message = FakeMessage.new(content: "Hello from Go.", id: "msg_go_1")
     chat_fake = FakeChat.new(final_message: final_message, chunks: [ FakeChunk.new(content: "Hello from Go.") ])
     RubyLLM.stubs(:context).yields(FakeConfig.new).returns(FakeContext.new(chat_fake))
 
     assert_assistant_message_persisted(
-      KURIA_LLM_PROVIDER: "ruby_llm",
       OPENCODE_GO_API_KEY: "test-go-key",
       content: "Hello from Go.",
-      ai_model: "opencode_go/grok-4-fast"
+      ai_model: "opencode_go/glm-5.3-flash"
     )
   end
 
@@ -237,34 +214,10 @@ class AssistantTest < ActiveSupport::TestCase
       Provider::LlmConcept::ChatStreamChunk.new(type: "output_text", data: text)
     end
 
-    def stub_opencode_client
-      client = mock("opencode_client")
-      Provider::Opencode::Client.stubs(:new).returns(client)
-      client
-    end
-
-    def stub_opencode_routing(session_id:, message_id:, content:)
-      client = stub_opencode_client
-      client.expects(:create_session).with(title: "What is my net worth?").returns({ "id" => session_id })
-      client.expects(:send_message).with(
-        session_id,
-        content: "What is my net worth?",
-        model: { providerID: "opencode", modelID: "minimax-m2.5-free" },
-        system: anything
-      ).returns(opencode_message_response(id: message_id, content: content))
-    end
-
-    def opencode_message_response(id:, content:)
-      {
-        "info" => {
-          "id" => id,
-          "role" => "assistant",
-          "model" => { "providerID" => "opencode", "modelID" => "minimax-m2.5-free" }
-        },
-        "parts" => [
-          { "type" => "text", "content" => content }
-        ]
-      }
+    # The catalog's live admission is the only network boundary on the RubyLLM
+    # path; stub it so the streamed-response tests stay offline/deterministic.
+    def stub_live_catalog_admission
+      Provider::RubyLlm::Catalog.any_instance.stubs(:available?).returns(true)
     end
 
     def assert_assistant_message_persisted(content:, ai_model:, **overrides)
@@ -277,13 +230,5 @@ class AssistantTest < ActiveSupport::TestCase
       message = @chat.messages.ordered.where(type: "AssistantMessage").last
       assert_equal content, message.content
       assert_equal ai_model, message.ai_model
-    end
-
-    def assert_no_assistant_message_persisted(**overrides)
-      with_env_overrides overrides do
-        assert_no_difference "AssistantMessage.count" do
-          @assistant.respond_to(@message)
-        end
-      end
     end
 end
