@@ -7,7 +7,7 @@ class Family::AutoCategorizerTest < ActiveSupport::TestCase
     @family = families(:dylan_family)
     @account = @family.accounts.create!(name: "Rule test", balance: 100, currency: "USD", accountable: Depository.new)
     @llm_provider = mock
-    Provider::Registry.stubs(:get_provider).with(:opencode).returns(@llm_provider)
+    Provider::Registry.stubs(:get_provider).with(:ruby_llm).returns(@llm_provider)
   end
 
   test "auto-categorizes transactions" do
@@ -35,6 +35,22 @@ class Family::AutoCategorizerTest < ActiveSupport::TestCase
 
     # After auto-categorization, all transactions are locked and no longer enrichable
     assert_equal 0, @account.transactions.reload.enrichable(:category_id).count
+  end
+
+  test "preserves safe failure when the provider returns an error response" do
+    txn = create_transaction(account: @account, name: "McDonalds").transaction
+
+    provider_response = provider_error_response(Provider::RubyLlm::Error.new("unsupported capability"))
+    @llm_provider.expects(:auto_categorize).returns(provider_response).once
+
+    assert_no_difference "DataEnrichment.count" do
+      Family::AutoCategorizer.new(@family, transaction_ids: [ txn.id ]).auto_categorize
+    end
+
+    # No fake success and no mutation: the transaction is neither categorized
+    # nor locked, so it stays enrichable for a later retry.
+    assert_nil txn.reload.category
+    assert_equal 1, @account.transactions.reload.enrichable(:category_id).count
   end
 
   private

@@ -22,6 +22,54 @@ class Provider::Registry
       region.to_sym == :us ? plaid_us : plaid_eu
     end
 
+    # Provider-independent supported-model surface for admin selection. RubyLLM
+    # is the only LLM provider now, so the supported-model catalog
+    # (Provider::RubyLlm::Catalog#manifest) is always exposed.
+    def llm_supported_models
+      Provider::RubyLlm.supported_models
+    end
+
+    # Provider-independent selectable AI model options for user-facing
+    # selectors: deterministic [label, canonical_reference] pairs built from
+    # the catalog's current live admission (manifest ∩ live /v1/models) for
+    # accounts whose credential is configured. Accounts without a configured
+    # key are skipped; catalog request/shape failures fail closed as
+    # Provider::Registry::Error so callers can surface a clear error.
+    def llm_selectable_models
+      Provider::RubyLlm.live_selectable_models
+    rescue Provider::RubyLlm::Error => error
+      raise Error, "Live AI model selection is unavailable: #{error.message}"
+    end
+
+    # There is no automatic, environment, or static deployment-level default:
+    # model selection is always explicit, so this stays nil. Callers must
+    # supply (or have persisted) a model of their own; an unavailable or stale
+    # selection requires reselection, never a silent replacement.
+    def llm_default_model
+      nil
+    end
+
+    # Validate an explicit model reference against the configured live model
+    # membership before a request is persisted. Rejects blank, uncatalogued,
+    # credential-less, unavailable, and stale references by raising Error; it
+    # never substitutes another model and never falls back to the static
+    # manifest when the live list omits it. A live catalog request or response
+    # shape failure also fails closed as Error so callers cannot proceed on an
+    # unverifiable selection.
+    def validate_llm_model!(model)
+      return if model.present? && valid_llm_model?(model)
+
+      raise Error, "Unsupported AI model reference #{model.inspect}."
+    rescue Provider::RubyLlm::Error => error
+      raise Error, "Live AI model validation is unavailable for #{model.inspect}: #{error.message}"
+    end
+
+    def valid_llm_model?(model)
+      return false if model.blank?
+
+      ruby_llm_model_available?(model)
+    end
+
     private
       def stripe
         secret_key = ENV["STRIPE_SECRET_KEY"]
@@ -75,22 +123,21 @@ class Provider::Registry
       end
 
       def ruby_llm
-        return nil unless ruby_llm_provider_enabled?
-
         Provider::RubyLlm.new
       end
 
-      def ruby_llm_provider_enabled?
-        value = ENV["KURIA_LLM_PROVIDER"].to_s.strip
+      # A RubyLLM reference is selectable only when it is catalogued, its
+      # account credential is configured, and it is currently admitted from
+      # that account's live model list (manifest ∩ live /v1/models). A failed
+      # or malformed live request propagates as Provider::RubyLlm::Error so
+      # callers fail closed; the static manifest is never a fallback.
+      def ruby_llm_model_available?(model)
+        metadata = Provider::RubyLlm::Catalog.metadata_for(model)
 
-        case value
-        when "", "opencode"
-          false
-        when "ruby_llm"
-          true
-        else
-          raise Error, "Unknown LLM provider '#{value}' for KURIA_LLM_PROVIDER. Use 'ruby_llm' to enable the RubyLLM proof of concept, or leave it unset (or set it to 'opencode') to keep the current OpenCode behavior."
-        end
+        return false unless metadata.present?
+        return false if Provider::RubyLlm::Catalog.api_key_for(metadata[:credential_source]).blank?
+
+        Provider::RubyLlm::Catalog.new.available?(model)
       end
   end
 
@@ -121,7 +168,7 @@ class Provider::Registry
       when :securities
         %i[synth]
       when :llm
-        self.class.send(:ruby_llm_provider_enabled?) ? %i[ruby_llm] : %i[opencode]
+        %i[ruby_llm]
       else
         %i[synth plaid_us plaid_eu github opencode]
       end

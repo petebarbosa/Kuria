@@ -5,6 +5,10 @@ class UserTest < ActiveSupport::TestCase
     @user = users(:family_admin)
   end
 
+  def teardown
+    Setting.clear_cache
+  end
+
   test "should be valid" do
     assert @user.valid?, @user.errors.full_messages.to_sentence
   end
@@ -137,5 +141,33 @@ class UserTest < ActiveSupport::TestCase
     assert_match %r{otpauth://totp/}, user.provisioning_uri
     assert_match %r{secret=#{user.otp_secret}}, user.provisioning_uri
     assert_match %r{issuer=Kuria}, user.provisioning_uri
+  end
+
+  test "ai_available? is true in managed mode regardless of provider configuration" do
+    Rails.configuration.stubs(:app_mode).returns("managed".inquiry)
+
+    with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+      assert @user.ai_available?
+    end
+  end
+
+  test "ai_available? is true in self-hosted mode when a RubyLLM credential is configured" do
+    with_self_hosting do
+      with_env_overrides OPENAI_API_KEY: "test-openai-key", OPENCODE_GO_API_KEY: nil do
+        assert @user.ai_available?
+      end
+
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: "test-go-key" do
+        assert @user.ai_available?
+      end
+    end
+  end
+
+  test "ai_available? is false in self-hosted mode when no RubyLLM credential is configured" do
+    with_self_hosting do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        refute @user.ai_available?
+      end
+    end
   end
 end

@@ -61,16 +61,32 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
     assert response_body["messages"].is_a?(Array)
   end
 
-  test "should create chat with write scope" do
-    assert_difference "Chat.count" do
+  test "should create a chat with an explicit live model and write scope" do
+    # The Registry validates live model membership; stub it so the test never
+    # reaches the network.
+    Provider::Registry.stubs(:validate_llm_model!)
+
+    assert_difference [ "Chat.count", "Message.count" ] do
       post "/api/v1/chats",
-        params: { title: "New chat", message: "Hello AI" },
+        params: { title: "New chat", message: "Hello AI", model: "openai/gpt-4o" },
         headers: bearer_auth_header(@write_token)
     end
 
     assert_response :created
     response_body = JSON.parse(response.body)
     assert_equal "New chat", response_body["title"]
+    assert_equal "openai/gpt-4o", Message.last.ai_model
+  end
+
+  test "should create a chat without an initial message" do
+    assert_difference "Chat.count" do
+      post "/api/v1/chats",
+        params: { title: "Empty chat" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :created
+    assert_equal "Empty chat", JSON.parse(response.body)["title"]
   end
 
   test "should not create chat with read scope" do
@@ -79,6 +95,36 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
       headers: bearer_auth_header(@read_token)
 
     assert_response :forbidden
+  end
+
+  test "rejects a missing model before creating a chat or message" do
+    assert_no_difference [ "Chat.count", "Message.count" ] do
+      post "/api/v1/chats",
+        params: { title: "New chat", message: "Hello AI" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    response_body = JSON.parse(response.body)
+    assert_equal "provider_configuration_error", response_body["error"]
+  end
+
+  test "rejects an unselectable explicit model before creating a chat or message" do
+    Provider::Registry.stubs(:validate_llm_model!).raises(
+      Provider::Registry::Error,
+      "Unsupported AI model reference \"openai/stale\"."
+    )
+
+    assert_no_difference [ "Chat.count", "Message.count" ] do
+      post "/api/v1/chats",
+        params: { title: "New chat", message: "Hello AI", model: "openai/stale" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    response_body = JSON.parse(response.body)
+    assert_equal "provider_configuration_error", response_body["error"]
+    assert_match(/openai\/stale/, response_body["details"])
   end
 
   test "should update chat" do
@@ -110,7 +156,6 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "should support API key authentication" do
-    # Remove any existing API keys for this user
     @user.api_keys.destroy_all
 
     plain_key = ApiKey.generate_secure_key
@@ -120,6 +165,11 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
     )
     api_key.key = plain_key
     api_key.save!
+
+    # API key auth consults the Redis-backed rate limiter; route to the real
+    # no-op limiter so this focused test runs without a Redis service while
+    # still exercising API key authentication.
+    ApiRateLimiter.stubs(:limit).returns(NoopApiRateLimiter.new(api_key))
 
     get "/api/v1/chats", headers: { "X-Api-Key" => plain_key }
     assert_response :success

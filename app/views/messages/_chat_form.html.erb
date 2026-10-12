@@ -1,23 +1,51 @@
 <%# locals: (chat: nil, message_hint: nil) %>
+<%
+  # RubyLLM is the only provider: the user must pick a model explicitly from
+  # the models currently live for their configured credentials, so no hidden or
+  # deployment default is ever rendered. These inputs are provided by the
+  # rendering controller (see ChatsController):
+  #   @ai_ruby_llm_mode          - true when the RubyLLM provider is active
+  #   @ai_selectable_models      - [[label, reference], ...] live selectable models
+  #   @ai_selectable_models_error- truthy when the live model listing failed
+  # They are read defensively so this partial never raises when absent.
+  ruby_llm_mode = defined?(@ai_ruby_llm_mode) && @ai_ruby_llm_mode
+  models = ruby_llm_mode ? Array(@ai_selectable_models) : []
+  listing_error = ruby_llm_mode && defined?(@ai_selectable_models_error) && @ai_selectable_models_error.present?
+  picker_available = ruby_llm_mode && !listing_error && models.any?
+  persisted_model = chat.respond_to?(:persisted?) && chat.persisted? ? chat.ai_model.presence : nil
+  stale_selection = picker_available && persisted_model.present? && !models.map(&:last).include?(persisted_model)
+  selected_model = stale_selection ? nil : persisted_model
+%>
 <div id="chat-form" class="space-y-2">
   <% model = chat && chat.persisted? ? [chat, Message.new] : Chat.new %>
   <%= form_with model: model,
                 class: "flex lg:flex-col gap-2 bg-container px-2 py-1.5 rounded-full lg:rounded-lg shadow-border-xs",
                 data: { chat_target: "form" } do |f| %>
-    <%= f.hidden_field :ai_model, value: Setting.opencode_default_model %>
     <%= f.text_area :content, placeholder: "Ask anything ...", value: message_hint,
                   class: "w-full border-0 focus:ring-0 text-sm resize-none px-1 bg-transparent",
                   data: { chat_target: "input", action: "input->chat#autoResize keydown->chat#handleInputKeyDown" },
                   rows: 1 %>
     <div class="flex items-center justify-between gap-1">
-      <div class="items-center gap-1 hidden lg:flex">
-        <%# These are disabled for now, but in the future, will all open specific menus with their own context and search %>
-        <% ["plus", "command", "at-sign", "mouse-pointer-click"].each do |icon| %>
-          <%= icon(icon, as_button: true, disabled: true, class: "cursor-not-allowed", title: "Coming soon") %>
+      <div class="flex items-center gap-1 min-w-0">
+        <% if picker_available %>
+          <%= f.label :ai_model, "Model", class: "sr-only" %>
+          <%= f.select :ai_model,
+                       options_for_select(models, selected_model),
+                       { include_blank: "Choose a model" },
+                       { required: true,
+                         title: "Choose the AI model for this conversation",
+                         class: "max-w-[8rem] lg:max-w-[12rem] truncate cursor-pointer border-0 bg-transparent py-0 pl-1 pr-6 text-xs text-secondary focus:ring-0" } %>
         <% end %>
       </div>
       <%= icon("arrow-up", as_button: true, type: "submit") %>
     </div>
+  <% end %>
+  <% if listing_error %>
+    <p class="text-xs text-secondary">AI models are unavailable right now. Check that your provider credentials are set in the environment, then reload.</p>
+  <% elsif ruby_llm_mode && models.empty? %>
+    <p class="text-xs text-secondary">No AI models are available. Add a provider credential to your environment to start chatting.</p>
+  <% elsif stale_selection %>
+    <p class="text-xs text-secondary">Your previously selected model is no longer available. Choose a model to continue.</p>
   <% end %>
   <p class="text-xs text-secondary">AI responses are informational only and are not financial advice.</p>
 </div>

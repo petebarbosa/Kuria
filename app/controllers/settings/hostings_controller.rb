@@ -6,10 +6,7 @@ class Settings::HostingsController < ApplicationController
   before_action :ensure_admin, only: :clear_cache
 
   def show
-    synth_provider = Provider::Registry.get_provider(:synth)
-    @synth_usage = synth_provider&.usage
-
-    load_ai_settings
+    load_show_data
   end
 
   def update
@@ -25,14 +22,9 @@ class Settings::HostingsController < ApplicationController
       Setting.synth_api_key = hosting_params[:synth_api_key]
     end
 
-    if hosting_params.key?(:opencode_default_model)
-      Setting.opencode_default_model = hosting_params[:opencode_default_model]
-    end
-
     redirect_to settings_hosting_path, notice: t(".success")
   rescue ActiveRecord::RecordInvalid => error
-    flash.now[:alert] = t(".failure")
-    render :show, status: :unprocessable_entity
+    render_update_failure
   end
 
   def clear_cache
@@ -45,8 +37,7 @@ class Settings::HostingsController < ApplicationController
       params.require(:setting).permit(
         :require_invite_for_signup,
         :require_email_confirmation,
-        :synth_api_key,
-        :opencode_default_model
+        :synth_api_key
       )
     end
 
@@ -54,56 +45,58 @@ class Settings::HostingsController < ApplicationController
       redirect_to settings_hosting_path, alert: t(".not_authorized") unless Current.user.admin?
     end
 
+    def load_show_data
+      synth_provider = Provider::Registry.get_provider(:synth)
+      @synth_usage = synth_provider&.usage
+
+      load_ai_settings
+    end
+
+    def render_update_failure
+      flash.now[:alert] = t(".failure")
+      load_show_data
+      render :show, status: :unprocessable_entity
+    end
+
     def load_ai_settings
+      @ai_ruby_llm_mode = true
       @ai_connected = false
       @ai_connected_providers = []
       @ai_available_models = []
-      @ai_default_model_valid = false
 
-      client = Provider::Opencode::Client.new(
-        base_url: Setting.opencode_server_url,
-        username: Setting.opencode_server_username,
-        password: Setting.opencode_server_password
-      )
-
-      provider_data = client.list_providers
-      @ai_connected = true
-      @ai_connected_providers = provider_data["connected"] || []
-
-      all_providers = provider_data["all"] || []
-      @ai_available_models = all_providers
-        .select { |p| @ai_connected_providers.include?(p["id"]) }
-        .flat_map do |provider|
-          (provider["models"] || []).map do |model|
-            [ "#{provider['name']} / #{model['name']}", "#{provider['id']}/#{model['id']}" ]
-          end
-        end
-
-      # Validate and auto-correct default model if needed
-      validate_and_correct_default_model
-    rescue Faraday::Error, StandardError
-      @ai_connected = false
+      load_ruby_llm_ai_settings
     end
 
-    def validate_and_correct_default_model
-      current_model = Setting.opencode_default_model
-      return if current_model.blank?
+    def load_ruby_llm_ai_settings
+      # Availability reflects the RubyLLM account credentials resolved for the
+      # deployment (environment first, then encrypted credentials). There is no
+      # deployment default model: the user picks a live model per chat, so the
+      # hosting page only reports configured accounts.
+      configured = Provider::RubyLlm.supported_models.select do |_reference, metadata|
+        Provider::RubyLlm::Catalog.api_key_for(metadata[:credential_source]).present?
+      end
 
-      # Check if current model is in the available models list
-      available_model_ids = @ai_available_models.map(&:last)
-      @ai_default_model_valid = available_model_ids.include?(current_model)
+      @ai_connected_providers = configured.values
+        .map { |metadata| metadata[:credential_source] }
+        .uniq
+        .map { |source| ruby_llm_account_label(source) }
 
-      # If model is invalid, try to auto-correct to a free model
-      unless @ai_default_model_valid
-        begin
-          free_model = OpencodeModelResolver.resolve
-          if free_model.present? && available_model_ids.include?(free_model)
-            Setting.opencode_default_model = free_model
-            @ai_default_model_valid = true
-          end
-        rescue OpencodeModelResolver::ResolutionError
-          # Could not resolve a free model, leave as is
-        end
+      @ai_connected = @ai_connected_providers.any?
+
+      # Live selectable models (manifest ∩ live /v1/models). A listing failure
+      # must not blank the hosting page, so it degrades to no models.
+      @ai_available_models = begin
+        Provider::Registry.llm_selectable_models
+      rescue Provider::Registry::Error
+        []
+      end
+    end
+
+    def ruby_llm_account_label(credential_source)
+      case credential_source
+      when "OPENAI_API_KEY" then "OpenAI"
+      when "OPENCODE_GO_API_KEY" then "OpenCode Go"
+      else credential_source
       end
     end
 end

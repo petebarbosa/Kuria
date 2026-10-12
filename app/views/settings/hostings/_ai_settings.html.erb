@@ -1,7 +1,7 @@
 <div class="space-y-4">
   <div>
     <h2 class="font-medium mb-1"><%= t(".title") %></h2>
-    <p class="text-secondary text-sm mb-4"><%= t(".description") %></p>
+    <p class="text-secondary text-sm mb-4"><%= t(".ruby_llm_description") %></p>
   </div>
   <div class="flex items-center gap-2 mb-4">
     <div class="w-2 h-2 rounded-full <%= @ai_connected ? 'bg-green-500' : 'bg-red-500' %>"></div>
@@ -16,28 +16,11 @@
       <% end %>
     </span>
   </div>
-  <% if @ai_connected && @ai_available_models.any? %>
-    <% if defined?(@ai_default_model_valid) && !@ai_default_model_valid %>
-      <div class="mb-4 p-3 bg-yellow-100 border border-yellow-400 rounded-lg">
-        <p class="text-sm text-yellow-800">
-          <strong>Model Updated:</strong> Your previous AI model was unavailable and has been automatically switched to a working free model.
-        </p>
-      </div>
-    <% end %>
-    <%= styled_form_with model: Setting.new,
-                         url: settings_hosting_path,
-                         method: :patch,
-                         data: {
-                           controller: "auto-submit-form",
-                           "auto-submit-form-trigger-event-value": "change"
-                         } do |form| %>
-      <%= form.select :opencode_default_model,
-                      options_for_select(@ai_available_models, Setting.opencode_default_model),
-                      { label: t(".model_label") },
-                      { class: "w-full rounded-lg border border-secondary bg-container text-sm py-2 px-3",
-                        data: { "auto-submit-form-target": "auto" } } %>
-    <% end %>
-  <% elsif @ai_connected %>
-    <p class="text-sm text-secondary"><%= t(".no_providers") %></p>
-  <% end %>
+  <%# RubyLLM is the only provider: credentials come from the environment and
+      each user picks an available model per chat, so report the configured
+      accounts instead of offering a deployment default-model selector. %>
+  <p class="text-sm text-secondary">
+    <%= t(@ai_connected ? ".ruby_llm_credentials_configured" : ".ruby_llm_no_credentials") %>
+  </p>
+  <p class="text-xs text-secondary mt-1"><%= t(".ruby_llm_environment_hint") %></p>
 </div>

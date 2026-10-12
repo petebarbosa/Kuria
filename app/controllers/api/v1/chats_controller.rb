@@ -19,12 +19,21 @@ class Api::V1::ChatsController < Api::V1::BaseController
   def create
     @chat = Current.user.chats.build(title: chat_params[:title])
 
+    # Require an explicit model before persisting anything so a missing or
+    # invalid reference leaves neither a Chat nor a Message and returns the
+    # standard provider_configuration_error envelope. There is no deployment
+    # default to fall back to.
+    if chat_params[:message].present?
+      ai_model = chat_params[:model]
+      Provider::Registry.validate_llm_model!(ai_model)
+    end
+
     if @chat.save
       if chat_params[:message].present?
         @message = @chat.messages.build(
           content: chat_params[:message],
           type: "UserMessage",
-          ai_model: chat_params[:model] || Setting.opencode_default_model
+          ai_model: ai_model
         )
 
         if @message.save

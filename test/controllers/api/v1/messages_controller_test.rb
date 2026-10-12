@@ -36,10 +36,14 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
     assert_response :forbidden
   end
 
-  test "should create message with write scope" do
+  test "should create a message with an explicit live model and write scope" do
+    # The Registry validates live model membership; stub it so the test never
+    # reaches the network.
+    Provider::Registry.stubs(:validate_llm_model!)
+
     assert_difference "Message.count" do
       post "/api/v1/chats/#{@chat.id}/messages",
-        params: { content: "Test message", model: "opencode/minimax-m2.5-free" },
+        params: { content: "Test message", model: "openai/gpt-4o" },
         headers: bearer_auth_header(@write_token)
     end
 
@@ -48,12 +52,15 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Test message", response_body["content"]
     assert_equal "user_message", response_body["type"]
     assert_equal "pending", response_body["ai_response_status"]
+    assert_equal "openai/gpt-4o", @chat.messages.last.ai_model
   end
 
   test "should enqueue assistant response job" do
+    Provider::Registry.stubs(:validate_llm_model!)
+
     assert_enqueued_with(job: AssistantResponseJob) do
       post "/api/v1/chats/#{@chat.id}/messages",
-        params: { content: "Test message" },
+        params: { content: "Test message", model: "openai/gpt-4o" },
         headers: bearer_auth_header(@write_token)
     end
   end
@@ -61,11 +68,10 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
   test "should retry last assistant message" do
     skip "Retry functionality needs debugging"
 
-    # Create an assistant message to retry
     assistant_message = @chat.messages.create!(
       type: "AssistantMessage",
       content: "Previous response",
-      ai_model: "opencode/minimax-m2.5-free"
+      ai_model: "openai/gpt-4o"
     )
 
     assert_enqueued_with(job: AssistantResponseJob) do
@@ -79,7 +85,6 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "should not retry if no assistant message exists" do
-    # Remove all assistant messages
     @chat.messages.where(type: "AssistantMessage").destroy_all
 
     post "/api/v1/chats/#{@chat.id}/messages/retry.json",
@@ -101,6 +106,36 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
       headers: bearer_auth_header(@write_token)
 
     assert_response :not_found
+  end
+
+  test "rejects a missing model before creating a message" do
+    assert_no_difference "Message.count" do
+      post "/api/v1/chats/#{@chat.id}/messages",
+        params: { content: "Hello" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    response_body = JSON.parse(response.body)
+    assert_equal "provider_configuration_error", response_body["error"]
+  end
+
+  test "rejects an unselectable explicit model before creating a message" do
+    Provider::Registry.stubs(:validate_llm_model!).raises(
+      Provider::Registry::Error,
+      "Unsupported AI model reference \"openai/stale\"."
+    )
+
+    assert_no_difference "Message.count" do
+      post "/api/v1/chats/#{@chat.id}/messages",
+        params: { content: "Hello", model: "openai/stale" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    response_body = JSON.parse(response.body)
+    assert_equal "provider_configuration_error", response_body["error"]
+    assert_match(/openai\/stale/, response_body["details"])
   end
 
   private

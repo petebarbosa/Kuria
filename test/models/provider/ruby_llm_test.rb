@@ -7,7 +7,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   # never leak RubyLLM objects, so these fakes only exercise the seam the
   # adapter is allowed to touch (RubyLLM.context / context.chat / chat.ask).
   class FakeConfig
-    attr_reader :openai_api_key, :openai_api_base
+    attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -15,6 +15,14 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def openai_api_base=(value)
       @openai_api_base = value
+    end
+
+    def openai_organization_id=(value)
+      @openai_organization_id = value
+    end
+
+    def openai_project_id=(value)
+      @openai_project_id = value
     end
   end
 
@@ -72,6 +80,9 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     end
   end
 
+  OPENAI_MODELS_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/models"
+  OPENCODE_GO_MODELS_URL = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+
   setup do
     @provider = Provider::RubyLlm.new
   end
@@ -82,22 +93,191 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     [ config, context ]
   end
 
-  test "supports only the canonical openai and opencode_go references" do
+  # Live catalog boundary: stub the authenticated `GET /v1/models` request for
+  # an account. Header expectations double as assertions that the correct
+  # account credential is sent.
+  def stub_live_models(account, entries:, auth_key:)
+    url = account == :openai ? OPENAI_MODELS_URL : OPENCODE_GO_MODELS_URL
+
+    stub_request(:get, url)
+      .with(headers: { "Accept" => "application/json", "Authorization" => "Bearer #{auth_key}" })
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { object: "list", data: entries }.to_json
+      )
+  end
+
+  def model_entry(id, shutdown_date: nil)
+    entry = { "id" => id, "object" => "model" }
+    entry["shutdown_date"] = shutdown_date if shutdown_date
+    entry
+  end
+
+  # Stub the encrypted-credentials boundary (never write real secrets) as a
+  # plain lookup keyed by the account credential identifier. ENV precedence is
+  # exercised separately via with_env_overrides.
+  def with_credentials(mapping)
+    Rails.application.stubs(:credentials).returns(mapping)
+    yield
+  ensure
+    Rails.application.unstub(:credentials)
+  end
+
+  test "supports only catalog-admitted openai and opencode_go references" do
+    assert @provider.supports_model?("openai/gpt-5-nano")
     assert @provider.supports_model?("openai/gpt-4o")
-    assert @provider.supports_model?("opencode_go/grok-4-fast")
+    assert @provider.supports_model?("opencode_go/glm-5.3-flash")
+    refute @provider.supports_model?("opencode_go/grok-4-fast")
     refute @provider.supports_model?("opencode/big-pickle")
     refute @provider.supports_model?("anthropic/claude-3-5-sonnet")
-    refute @provider.supports_model?("gpt-4o")
+    refute @provider.supports_model?("gpt-5-nano")
+    refute @provider.supports_model?("openai/")
+    refute @provider.supports_model?("openai/gpt-5-nano/extra")
+    refute @provider.supports_model?("https://api.openai.com/v1")
+    refute @provider.supports_model?("openai/does-not-exist")
+    refute @provider.supports_model?("openai/glm-5.3-flash")
+    refute @provider.supports_model?("opencode_go/gpt-5-nano")
     refute @provider.supports_model?(nil)
   end
 
-  test "normalizes a successful openai chat response through the provider contract" do
+  test "exposes the immutable positive catalog for admin selection" do
+    references = @provider.supported_references
+
+    assert_includes references, "openai/gpt-5-nano"
+    assert_includes references, "openai/gpt-4o"
+    assert_includes references, "opencode_go/glm-5.3-flash"
+    assert_includes references, "opencode_go/kimi-k3"
+    refute_includes references, "opencode_go/grok-4-fast"
+    refute_includes references, "opencode/big-pickle"
+    assert references.all? { |reference| reference.match?(%r{\A(openai|opencode_go)/[^/]+\z}) }
+
+    assert_equal Provider::RubyLlm::Catalog.manifest, Provider::RubyLlm.supported_models
+
+    # The catalog is immutable: neither the manifest nor its entries can be
+    # mutated after load.
+    assert_raises(FrozenError) { Provider::RubyLlm.supported_models["openai/gpt-5-nano"] = {} }
+    assert_raises(FrozenError) { Provider::RubyLlm.supported_models["openai/gpt-5-nano"][:billing_account] = "other" }
+    assert_raises(FrozenError) { Provider::RubyLlm::Catalog::ACCOUNTS[:openai][:manifest] << "backdoor-model" }
+  end
+
+  test "declares resolution metadata distinguishing account, model id, provider, protocol, api base, credential source, billing account, and admission" do
+    openai = Provider::RubyLlm.supported_models.fetch("openai/gpt-5-nano")
+    assert_equal :openai, openai[:account]
+    assert_equal "gpt-5-nano", openai[:model_id]
+    assert_equal :openai, openai[:provider]
+    assert_equal :chat_completions, openai[:protocol]
+    assert_equal Provider::RubyLlm::OPENAI_BASE_URL, openai[:api_base]
+    assert_equal "OPENAI_API_KEY", openai[:credential_source]
+    assert_equal "openai", openai[:billing_account]
+    assert_equal true, openai[:assume_model_exists]
+
+    opencode_go = Provider::RubyLlm.supported_models.fetch("opencode_go/glm-5.3-flash")
+    assert_equal :opencode_go, opencode_go[:account]
+    assert_equal "glm-5.3-flash", opencode_go[:model_id]
+    assert_equal :openai, opencode_go[:provider]
+    assert_equal :chat_completions, opencode_go[:protocol]
+    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, opencode_go[:api_base]
+    assert_equal "OPENCODE_GO_API_KEY", opencode_go[:credential_source]
+    assert_equal "opencode_go", opencode_go[:billing_account]
+    assert_equal true, opencode_go[:assume_model_exists]
+
+    # Billing identity, API-base identity, and credential source differ.
+    refute_equal openai[:billing_account], opencode_go[:billing_account]
+    refute_equal openai[:api_base], opencode_go[:api_base]
+    refute_equal openai[:credential_source], opencode_go[:credential_source]
+  end
+
+  test "credential_configured? reflects the presence of the required credential" do
+    with_env_overrides OPENAI_API_KEY: "k", OPENCODE_GO_API_KEY: nil do
+      assert @provider.credential_configured?("openai/gpt-5-nano")
+      refute @provider.credential_configured?("opencode_go/glm-5.3-flash")
+    end
+
+    with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+      refute @provider.credential_configured?("openai/gpt-5-nano")
+      refute @provider.credential_configured?("opencode_go/glm-5.3-flash")
+    end
+
+    refute @provider.credential_configured?("anthropic/claude-3-5-sonnet")
+  end
+
+  test "api_key_for prefers the environment when both the environment and encrypted credentials are present" do
+    with_credentials("OPENAI_API_KEY" => "credential-key") do
+      with_env_overrides OPENAI_API_KEY: "env-key" do
+        assert_equal "env-key", Provider::RubyLlm::Catalog.api_key_for("OPENAI_API_KEY")
+      end
+    end
+  end
+
+  test "api_key_for falls back to encrypted Rails credentials when the environment variable is absent" do
+    with_credentials("OPENAI_API_KEY" => "credential-key") do
+      with_env_overrides OPENAI_API_KEY: nil do
+        assert_equal "credential-key", Provider::RubyLlm::Catalog.api_key_for("OPENAI_API_KEY")
+      end
+    end
+  end
+
+  test "api_key_for returns nil when neither the environment nor encrypted credentials provide a key" do
+    with_credentials({}) do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        assert_nil Provider::RubyLlm::Catalog.api_key_for("OPENAI_API_KEY")
+      end
+    end
+  end
+
+  test "credential_configured? and credentials_configured? accept a key supplied only by encrypted Rails credentials" do
+    with_credentials("OPENAI_API_KEY" => "credential-key") do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        assert @provider.credential_configured?("openai/gpt-5-nano")
+        refute @provider.credential_configured?("opencode_go/glm-5.3-flash")
+        assert @provider.credentials_configured?
+      end
+    end
+  end
+
+  test "registry valid_llm_model? accepts a key supplied only by encrypted Rails credentials" do
+    Provider::RubyLlm::Catalog.any_instance.stubs(:available?).returns(true)
+
+    with_credentials("OPENAI_API_KEY" => "credential-key") do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        assert Provider::Registry.valid_llm_model?("openai/gpt-5-nano")
+      end
+    end
+  end
+
+  test "registry valid_llm_model? returns false without consulting the live catalog when no key is configured" do
+    Provider::RubyLlm::Catalog.any_instance.expects(:available?).never
+
+    with_credentials({}) do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        refute Provider::Registry.valid_llm_model?("openai/gpt-5-nano")
+      end
+    end
+  end
+
+  test "chat_response fails closed when neither the environment nor encrypted credentials provide a key" do
+    with_credentials({}) do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+      end
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/OPENAI_API_KEY/, @response.error.message)
+    refute_match(/credential-key/, @response.error.message)
+  end
+
+  test "admits openai/gpt-5-nano with a valid live model list and passes it to RubyLLM with assume_model_exists: true" do
     final_message = FakeMessage.new(content: "Your net worth is $50,000.", id: "msg_1")
     chat = FakeChat.new(final_message: final_message)
     config, context = stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano"), model_entry("gpt-4o") ], auth_key: "test-openai-key")
+
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-4o")
+      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano")
     end
 
     assert @response.success?
@@ -106,7 +286,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     data = @response.data
     assert_instance_of Provider::LlmConcept::ChatResponse, data
     assert_equal "msg_1", data.id
-    assert_equal "openai/gpt-4o", data.model
+    assert_equal "openai/gpt-5-nano", data.model
     assert_equal 1, data.messages.size
     assert_instance_of Provider::LlmConcept::ChatMessage, data.messages.first
     assert_equal "Your net worth is $50,000.", data.messages.first.output_text
@@ -116,28 +296,192 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     assert_equal "test-openai-key", config.openai_api_key
     assert_equal Provider::RubyLlm::OPENAI_BASE_URL, config.openai_api_base
 
-    # Openai references resolve through the normal registry (no assume_model_exists).
-    assert_equal({ model: "gpt-4o", provider: :openai, assume_model_exists: false }, context.chat_options)
+    # Catalog admission always passes assume_model_exists: true; RubyLLM's
+    # bundled 1.16 registry is never consulted for admission.
+    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, context.chat_options)
 
     assert_equal "What is my net worth?", chat.prompt
     assert_nil chat.instructions
   end
 
-  test "configures the OpenCode Go endpoint, key, and model admission for opencode_go references" do
-    final_message = FakeMessage.new(content: "Hello from Go.")
-    chat = FakeChat.new(final_message: final_message)
-    config, context = stub_ruby_llm_context(chat)
+  test "intersects the manifest with the live model list and rejects catalogued models missing from it" do
+    RubyLLM.expects(:context).never
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-4o") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+    end
+
+    refute @response.success?
+    assert_nil @response.data
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/openai\/gpt-5-nano/, @response.error.message)
+    assert_match(/live openai model list/, @response.error.message)
+    assert_equal "openai/gpt-5-nano", @response.error.details[:model]
+    assert_equal false, @response.error.details[:retryable]
+  end
+
+  test "never admits an ID merely because it appears in the live model list" do
+    RubyLLM.expects(:context).never
+
+    stub_live_models(:openai, entries: [ model_entry("o3-pro"), model_entry("made-up-live-model") ], auth_key: "test-openai-key")
+
+    [ "openai/o3-pro", "openai/made-up-live-model" ].each do |reference|
+      @response = @provider.chat_response("Hello", model: reference)
+
+      refute @response.success?, "expected #{reference.inspect} to be rejected"
+      assert_kind_of Provider::RubyLlm::Error, @response.error
+      assert_match(/#{Regexp.escape(reference)}/, @response.error.message)
+    end
+  end
+
+  test "excludes OpenAI models whose shutdown_date is in the past" do
+    past_shutdown_chat = FakeChat.new(final_message: FakeMessage.new(content: "Hi", id: "msg_past"))
+    past_config = FakeConfig.new
+    RubyLLM.stubs(:context).yields(past_config).returns(FakeContext.new(past_shutdown_chat))
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-4o", shutdown_date: (Date.current - 30).iso8601) ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-4o")
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/openai\/gpt-4o/, @response.error.message)
+    assert_match(/live openai model list/, @response.error.message)
+
+    # A future shutdown_date does not exclude the model, and a missing
+    # shutdown_date never excludes one.
+    [ Date.current + 365, nil ].each do |shutdown_date|
+      future_chat = FakeChat.new(final_message: FakeMessage.new(content: "Hi", id: "msg_future"))
+      future_config = FakeConfig.new
+      RubyLLM.stubs(:context).yields(future_config).returns(FakeContext.new(future_chat))
+
+      entry = shutdown_date ? model_entry("gpt-4o", shutdown_date: shutdown_date.iso8601) : model_entry("gpt-4o")
+      stub_live_models(:openai, entries: [ entry ], auth_key: "test-openai-key")
+
+      # Live availability is memoized per provider instance (one live request
+      # per admission cycle), so each case uses a fresh instance.
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        @response = Provider::RubyLlm.new.chat_response("Hello", model: "openai/gpt-4o")
+      end
+
+      assert @response.success?, "expected openai/gpt-4o with shutdown_date #{shutdown_date.inspect} to be admitted"
+    end
+  end
+
+  test "rejects the stale grok-4-fast reference even when the live Go list returns it" do
+    RubyLLM.expects(:context).never
+
+    stub_live_models(:opencode_go, entries: [ model_entry("grok-4-fast"), model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
 
     with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
       @response = @provider.chat_response("Hello", model: "opencode_go/grok-4-fast")
     end
 
+    refute @response.success?
+    assert_nil @response.data
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/opencode_go\/grok-4-fast/, @response.error.message)
+    assert_match(/opencode_go\/glm-5.3-flash/, @response.error.message)
+    assert_equal "opencode_go/grok-4-fast", @response.error.details[:model]
+    assert_equal "opencode_go", @response.error.details[:provider_reference]
+  end
+
+  test "sends the OpenCode Go Bearer key on the live catalog request for forward compatibility" do
+    final_message = FakeMessage.new(content: "Hello from Go.")
+    chat = FakeChat.new(final_message: final_message)
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
     assert @response.success?
-    assert_equal "test-go-key", config.openai_api_key
-    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, config.openai_api_base
-    assert_equal({ model: "grok-4-fast", provider: :openai, assume_model_exists: true }, context.chat_options)
-    assert_equal "opencode_go/grok-4-fast", @response.data.model
-    assert @response.data.id.present?
+  end
+
+  test "fails closed with a provider error when the live catalog request fails" do
+    RubyLLM.expects(:context).never
+
+    stub_request(:get, OPENAI_MODELS_URL)
+      .with(headers: { "Accept" => "application/json", "Authorization" => "Bearer test-openai-key" })
+      .to_return(status: 500, body: "boom")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+    end
+
+    refute @response.success?
+    assert_nil @response.data
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    # No silent fallback to the manifest: an admitted-in-manifest model is
+    # still rejected when the live catalog request fails.
+    assert_match(/catalog request for account 'openai' failed/i, @response.error.message)
+    assert_equal "openai/gpt-5-nano", @response.error.details[:model]
+    assert_equal "Provider::RubyLlm::Catalog::Error", @response.error.details[:error_class]
+    assert_equal false, @response.error.details[:retryable]
+  end
+
+  test "fails closed when the live catalog response has an unexpected shape" do
+    RubyLLM.expects(:context).never
+
+    stub_request(:get, OPENCODE_GO_MODELS_URL)
+      .with(headers: { "Accept" => "application/json", "Authorization" => "Bearer test-go-key" })
+      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: { object: "list" }.to_json)
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/unexpected model catalog response shape for account 'opencode_go'/i, @response.error.message)
+    assert_equal "Provider::RubyLlm::Catalog::Error", @response.error.details[:error_class]
+  end
+
+  test "keeps inherited OpenAI organization and project headers on normal OpenAI calls" do
+    final_message = FakeMessage.new(content: "Hi")
+    chat = FakeChat.new(final_message: final_message)
+
+    config = FakeConfig.new
+    config.openai_organization_id = "org-inherited"
+    config.openai_project_id = "proj-inherited"
+    stub_ruby_llm_context(chat, config: config)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    # Normal OpenAI calls keep the deployment's own billing identity.
+    assert_equal "org-inherited", config.openai_organization_id
+    assert_equal "proj-inherited", config.openai_project_id
+  end
+
+  test "clears inherited OpenAI organization and project headers only for OpenCode Go calls" do
+    final_message = FakeMessage.new(content: "Hi")
+    chat = FakeChat.new(final_message: final_message)
+
+    config = FakeConfig.new
+    config.openai_organization_id = "org-inherited"
+    config.openai_project_id = "proj-inherited"
+    stub_ruby_llm_context(chat, config: config)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert @response.success?
+    assert_nil config.openai_organization_id
+    assert_nil config.openai_project_id
   end
 
   test "forwards instructions to the RubyLLM chat as system instructions" do
@@ -145,8 +489,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     chat = FakeChat.new(final_message: final_message)
     stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @response = @provider.chat_response("Hello", model: "openai/gpt-4o", instructions: "You are a helpful assistant.")
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", instructions: "You are a helpful assistant.")
     end
 
     assert @response.success?
@@ -161,11 +507,13 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     )
     stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
     collected = []
     streamer = proc { |chunk| collected << chunk }
 
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @response = @provider.chat_response("Hello", model: "openai/gpt-4o", streamer: streamer)
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: streamer)
     end
 
     assert @response.success?
@@ -182,9 +530,11 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     chat = FakeChat.new(final_message: final_message)
     stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @first = @provider.chat_response("Hello", model: "openai/gpt-4o")
-      @second = @provider.chat_response("Hello", model: "openai/gpt-4o")
+      @first = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+      @second = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
     end
 
     assert @first.success?
@@ -209,21 +559,127 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
   test "returns a clear provider error envelope when credentials are missing" do
     with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
-      @response = @provider.chat_response("Hello", model: "openai/gpt-4o")
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
     end
 
     refute @response.success?
     assert_kind_of Provider::RubyLlm::Error, @response.error
     assert_match(/OPENAI_API_KEY/, @response.error.message)
-    assert_equal "openai/gpt-4o", @response.error.details[:model]
+    assert_equal "openai/gpt-5-nano", @response.error.details[:model]
 
     with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
-      @response = @provider.chat_response("Hello", model: "opencode_go/grok-4-fast")
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
     end
 
     refute @response.success?
     assert_match(/OPENCODE_GO_API_KEY/, @response.error.message)
-    assert_equal "opencode_go/grok-4-fast", @response.error.details[:model]
+    assert_equal "opencode_go/glm-5.3-flash", @response.error.details[:model]
+  end
+
+  test "rejects malformed, URL, extra-segment, unsupported, and unadmitted references before creating a chat" do
+    invalid_references = [
+      "gpt-5-nano",
+      "openai/",
+      "/gpt-5-nano",
+      "openai//gpt-5-nano",
+      "openai/gpt-5-nano/extra",
+      "opencode_go/glm-5.3-flash/",
+      "https://api.openai.com/v1",
+      "openai/https://example.com/gpt-5-nano",
+      "opencode_go://glm-5.3-flash",
+      "anthropic/claude-3-5-sonnet",
+      "opencode/big-pickle",
+      "openai/does-not-exist",
+      "opencode_go/grok-4-fast",
+      nil,
+      ""
+    ]
+
+    RubyLLM.expects(:context).never
+
+    invalid_references.each do |reference|
+      @response = @provider.chat_response("Hello", model: reference)
+
+      refute @response.success?, "expected #{reference.inspect} to be rejected"
+      assert_nil @response.data
+      assert_kind_of Provider::RubyLlm::Error, @response.error
+    end
+  end
+
+  test "keeps openai and opencode_go contexts isolated in one process" do
+    openai_chat = FakeChat.new(final_message: FakeMessage.new(content: "OpenAI answer.", id: "msg_openai"))
+    go_chat = FakeChat.new(final_message: FakeMessage.new(content: "Go answer.", id: "msg_go"))
+    openai_config = FakeConfig.new
+    go_config = FakeConfig.new
+    openai_context = FakeContext.new(openai_chat)
+    go_context = FakeContext.new(go_chat)
+
+    RubyLLM.stubs(:context)
+      .yields(openai_config).returns(openai_context)
+      .then.yields(go_config).returns(go_context)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "openai-key-1")
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "go-key-1")
+
+    with_env_overrides OPENAI_API_KEY: "openai-key-1", OPENCODE_GO_API_KEY: "go-key-1" do
+      @openai_response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+      @go_response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert @openai_response.success?
+    assert @go_response.success?
+
+    # The OpenAI call never sees the Go key/base and vice versa.
+    assert_equal "openai-key-1", openai_config.openai_api_key
+    assert_equal Provider::RubyLlm::OPENAI_BASE_URL, openai_config.openai_api_base
+    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, openai_context.chat_options)
+
+    assert_equal "go-key-1", go_config.openai_api_key
+    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
+    assert_equal({ model: "glm-5.3-flash", provider: :openai, assume_model_exists: true }, go_context.chat_options)
+
+    # Billing metadata never crosses: each reference resolves to its own
+    # account through the catalog.
+    assert_equal "openai", Provider::RubyLlm.supported_models.fetch("openai/gpt-5-nano")[:billing_account]
+    assert_equal "opencode_go", Provider::RubyLlm.supported_models.fetch("opencode_go/glm-5.3-flash")[:billing_account]
+  end
+
+  test "keeps per-call provider contexts isolated from the global RubyLLM config" do
+    final_message = FakeMessage.new(content: "Hi")
+    chat = FakeChat.new(final_message: final_message)
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert @response.success?
+    # The per-call context receives the Go key/base; the global config is never
+    # mutated, so its provider options stay at their defaults.
+    assert_nil RubyLLM.config.openai_api_key
+    assert_nil RubyLLM.config.openai_api_base
+  end
+
+  test "never refreshes or mutates the global RubyLLM model registry" do
+    RubyLLM::Models.expects(:refresh!).never
+
+    global_models = mock("ruby_llm_models")
+    global_models.expects(:refresh!).never
+    RubyLLM.stubs(:models).returns(global_models)
+
+    final_message = FakeMessage.new(content: "Hi")
+    chat = FakeChat.new(final_message: final_message)
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
   end
 
   test "maps RubyLLM API errors to a safe provider error without key or prompt leakage" do
@@ -231,15 +687,17 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     chat.stubs(:ask).raises(RubyLLM::UnauthorizedError, "Incorrect API key provided: sk-test-secret-123")
     stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-4o")
+      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano")
     end
 
     refute @response.success?
     assert_nil @response.data
     assert_kind_of Provider::RubyLlm::Error, @response.error
     assert_equal "openai", @response.error.details[:provider_reference]
-    assert_equal "openai/gpt-4o", @response.error.details[:model]
+    assert_equal "openai/gpt-5-nano", @response.error.details[:model]
     assert_equal "RubyLLM::UnauthorizedError", @response.error.details[:error_class]
     assert_equal false, @response.error.details[:retryable]
     refute_match(/sk-test-secret-123/, @response.error.message)
@@ -251,8 +709,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     chat.stubs(:ask).raises(RubyLLM::RateLimitError, "Rate limit exceeded")
     stub_ruby_llm_context(chat)
 
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
-      @response = @provider.chat_response("Hello", model: "openai/gpt-4o")
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano")
     end
 
     refute @response.success?
@@ -260,69 +720,53 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     assert_equal true, @response.error.details[:retryable]
   end
 
-  test "maps model-not-found errors into the provider error envelope" do
-    chat = FakeChat.new(final_message: nil)
-    chat.stubs(:ask).raises(RubyLLM::ModelNotFoundError, "Unknown model: 'nope'")
-    stub_ruby_llm_context(chat)
+  test "rejects uncatalogued OpenAI references with a clear error before any catalog request" do
+    RubyLLM.expects(:context).never
 
     with_env_overrides OPENAI_API_KEY: "test-openai-key" do
       @response = @provider.chat_response("Hello", model: "openai/does-not-exist")
     end
 
     refute @response.success?
+    assert_nil @response.data
     assert_kind_of Provider::RubyLlm::Error, @response.error
-    assert_equal "RubyLLM::ModelNotFoundError", @response.error.details[:error_class]
+    assert_match(/openai\/does-not-exist/, @response.error.message)
+    assert_match(/openai\/gpt-5-nano/, @response.error.message)
+    assert_equal "openai/does-not-exist", @response.error.details[:model]
+    assert_equal "openai", @response.error.details[:provider_reference]
+    assert_equal "Provider::RubyLlm::Error", @response.error.details[:error_class]
     assert_equal false, @response.error.details[:retryable]
-    assert_match(/model/, @response.error.message)
   end
 
-  test "registry keeps OpenCode as the default when the switch is unset" do
-    with_env_overrides KURIA_LLM_PROVIDER: nil do
-      provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
-      assert_includes provider_classes, Provider::Opencode
-      refute_includes provider_classes, Provider::RubyLlm
-    end
-  end
+  test "registry routes the llm concept to RubyLLM regardless of the legacy provider toggle" do
+    [ nil, "opencode", "ruby_llm" ].each do |value|
+      with_env_overrides KURIA_LLM_PROVIDER: value do
+        provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
 
-  test "registry keeps OpenCode for an explicit opencode switch value" do
-    with_env_overrides KURIA_LLM_PROVIDER: "opencode" do
-      provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
-      assert_includes provider_classes, Provider::Opencode
-      refute_includes provider_classes, Provider::RubyLlm
-    end
-  end
-
-  test "registry opts into the RubyLLM provider when the switch is set to ruby_llm" do
-    with_env_overrides KURIA_LLM_PROVIDER: "ruby_llm" do
-      provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
-      assert_equal [ Provider::RubyLlm ], provider_classes
-      assert_instance_of Provider::RubyLlm, Provider::Registry.get_provider(:ruby_llm)
-    end
-  end
-
-  test "registry fails clearly for unknown switch values" do
-    with_env_overrides KURIA_LLM_PROVIDER: "banana" do
-      assert_raises(Provider::Registry::Error) do
-        Provider::Registry.for_concept(:llm).providers
+        assert_equal [ Provider::RubyLlm ], provider_classes
       end
     end
   end
 
-  test "registry resolves for_concept(:llm).providers through the class-private switch helper" do
+  test "registry resolves the ruby_llm provider directly" do
     with_env_overrides KURIA_LLM_PROVIDER: nil do
-      provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
-      assert_includes provider_classes, Provider::Opencode
-    end
-
-    with_env_overrides KURIA_LLM_PROVIDER: "ruby_llm" do
-      provider_classes = Provider::Registry.for_concept(:llm).providers.map(&:class)
-      assert_equal [ Provider::RubyLlm ], provider_classes
+      assert_instance_of Provider::RubyLlm, Provider::Registry.get_provider(:ruby_llm)
     end
   end
 
-  test "registry returns nil for ruby_llm when the switch is off" do
-    with_env_overrides KURIA_LLM_PROVIDER: nil do
-      assert_nil Provider::Registry.get_provider(:ruby_llm)
+  test "enrichment methods return a safe unsupported-capability error instead of NotImplementedError" do
+    responses = {
+      auto_categorize: @provider.auto_categorize(transactions: [], user_categories: []),
+      auto_detect_merchants: @provider.auto_detect_merchants(transactions: [], user_merchants: []),
+      suggest_merchant: @provider.suggest_merchant(raw_name: "Acme", normalized_name: "acme", user_merchants: [])
+    }
+
+    responses.each do |capability, response|
+      refute response.success?, "expected ##{capability} to fail"
+      assert_nil response.data
+      assert_kind_of StandardError, response.error
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_match(/does not yet support ##{capability}/, response.error.message)
     end
   end
 end

@@ -7,7 +7,7 @@ class Family::AutoMerchantDetectorTest < ActiveSupport::TestCase
     @family = families(:dylan_family)
     @account = @family.accounts.create!(name: "Rule test", balance: 100, currency: "USD", accountable: Depository.new)
     @llm_provider = mock
-    Provider::Registry.stubs(:get_provider).with(:opencode).returns(@llm_provider)
+    Provider::Registry.stubs(:get_provider).with(:ruby_llm).returns(@llm_provider)
   end
 
   test "auto detects transaction merchants" do
