@@ -26,23 +26,18 @@ x-rails-env: &rails_env
   DB_HOST: db
   DB_PORT: 5432
   REDIS_URL: redis://redis:6379/1
-  OPENCODE_SERVER_URL: http://opencode:4096
-  OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
-  OPENCODE_DEFAULT_MODEL: ${OPENCODE_DEFAULT_MODEL:-opencode/minimax-m2.5-free}
   MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
   FREECRYPTO_API_KEY: ${FREECRYPTO_API_KEY}
-  # --- AI provider ---
-  # Unset (default) keeps the current OpenCode Server behavior. Set
-  # KURIA_LLM_PROVIDER=ruby_llm to opt into the RubyLLM provider.
-  KURIA_LLM_PROVIDER: ${KURIA_LLM_PROVIDER:-}
-  # RubyLLM provider API keys (used only when KURIA_LLM_PROVIDER=ruby_llm).
+  # --- AI (RubyLLM) ---
+  # AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go
+  # APIs directly. No OpenCode Server service is required or started. Set one or
+  # both provider keys. Keys are injected from the environment (or encrypted
+  # deployment credentials) and are never stored in ordinary application
+  # settings. Model selection is explicit per chat: the selectable models are
+  # listed from each configured provider, there is no default model or hardcoded
+  # list, and there is no automatic fallback.
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
-  # --- AI: OpenCode Server (transitional) ---
-  # OpenCode is the current default while the migration to RubyLLM is in
-  # progress. These variables and the `opencode` service are planned for
-  # removal after the migration; OpenCode is not intended as a maintained
-  # fallback.
 
 services:
   web:
@@ -74,8 +69,6 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      opencode:
         condition: service_healthy
     environment:
       <<: *rails_env
@@ -110,37 +103,17 @@ services:
     networks:
       - kuria_network
 
-  # Transitional: OpenCode Server (AI assistant backend). Planned for removal
-  # after the migration to RubyLLM; not a maintained fallback.
-  opencode:
-    image: ghcr.io/anomalyco/opencode:dev
-    container_name: maybe-opencode
-    command: ["serve", "--port", "4096", "--hostname", "0.0.0.0"]
-    restart: unless-stopped
-    volumes:
-      - opencode-config:/root/.config/opencode
-    environment:
-      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD}
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          'wget -q -O /dev/null --header "Authorization: Basic $$(printf ''opencode:%s'' "$$OPENCODE_SERVER_PASSWORD" | base64)" http://127.0.0.1:4096/global/health',
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - kuria_network
-    depends_on:
-      web:
-        condition: service_started
+  # OpenCode Server (AI assistant backend) is retired as the LLM provider; AI
+  # now runs through RubyLLM (see the AI section above). The `opencode` service
+  # is intentionally absent and is no longer required or started. Any historical
+  # OpenCode volume is retained below for non-destructive migration.
 
 volumes:
   app-storage:
   postgres-data:
   redis-data:
+  # Retained for non-destructive migration; no service mounts it now. Do not
+  # delete — historical OpenCode data is preserved.
   opencode-config:
 
 networks:

@@ -16,7 +16,7 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 - **Transaction management** — categorization, tagging, bulk editing, auto-classification rules, and merchant resolution with aliases
 - **Budgets** — monthly budget planning and tracking
 - **Investment portfolio** — holdings, valuations, and performance tracking
-- **AI financial assistant** — conversational assistant with access to your financial data. OpenCode Server remains the current backend (transitional, being migrated away); set `KURIA_LLM_PROVIDER=ruby_llm` to opt into the RubyLLM provider (OpenAI or OpenCode Go)
+- **AI financial assistant** — conversational assistant with access to your financial data. AI runs exclusively through RubyLLM against hosted OpenAI and OpenCode Go APIs (no OpenCode Server). The model is chosen explicitly per chat from the models currently available for your configured credentials — there is no default and no automatic fallback.
 - **Merchant intelligence** — automatic merchant name normalization, tiered matching resolver, and AI-powered merchant suggestions
 - **Imports** — CSV import, Plaid bank sync, and Mint data migration
 - **Data exports** — export your data at any time
@@ -29,7 +29,7 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 
 ### Requirements
 
-- Ruby 4.0.2 (see `.ruby-version`)
+- Ruby 4.0.7 (see `.ruby-version`)
 - Docker (for running dependencies)
 - Bundler (`gem install bundler`)
 
@@ -37,11 +37,10 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 
 The app requires the following external services:
 
-| Service         | Purpose                                                         | Port |
-| --------------- | --------------------------------------------------------------- | ---- |
-| PostgreSQL      | Primary database                                                | 5432 |
-| Redis           | Action Cable (WebSockets) + Sidekiq (background jobs)           | 6379 |
-| OpenCode Server | AI assistant backend (transitional — being migrated to RubyLLM) | 4096 |
+| Service    | Purpose                                               | Port |
+| ---------- | ----------------------------------------------------- | ---- |
+| PostgreSQL | Primary database                                      | 5432 |
+| Redis      | Action Cable (WebSockets) + Sidekiq (background jobs) | 6379 |
 
 Start the infrastructure with Docker:
 
@@ -49,7 +48,7 @@ Start the infrastructure with Docker:
 docker compose -f compose.dev.yml up -d
 ```
 
-This starts PostgreSQL, Redis, and OpenCode Server containers. To stop them:
+This starts PostgreSQL and Redis containers. To stop them:
 
 ```sh
 docker compose -f compose.dev.yml down
@@ -62,7 +61,7 @@ git clone https://github.com/petebarbosa/maybe.git
 cd maybe
 cp .env.development .env.local   # or create your own .env.local
 bin/setup                         # installs gems, creates DB, runs migrations
-bin/rails opencode:config:generate # generates OpenCode MCP config
+bin/rails opencode:config:generate # (optional) writes MCP client config for this app
 bin/dev                           # starts Rails, Tailwind, and Sidekiq
 ```
 
@@ -113,35 +112,50 @@ See [`docs/hosting/docker.md`](docs/hosting/docker.md) for the full guide.
 
 The production compose file (`compose.example.yml`) includes:
 
-| Service    | Description                                                                           |
-| ---------- | ------------------------------------------------------------------------------------- |
-| `web`      | Rails app (port 3000)                                                                 |
-| `worker`   | Sidekiq background jobs                                                               |
-| `db`       | PostgreSQL 16                                                                         |
-| `redis`    | Redis 7                                                                               |
-| `opencode` | OpenCode Server for AI assistant (transitional — planned for removal after migration) |
+| Service  | Description             |
+| -------- | ----------------------- |
+| `web`    | Rails app (port 3000)   |
+| `worker` | Sidekiq background jobs |
+| `db`     | PostgreSQL 16           |
+| `redis`  | Redis 7                 |
 
 All services run on the `kuria_network` bridge network.
 
-> **AI provider (transitional):** OpenCode Server remains the default/current compose service for the AI assistant while the migration to the RubyLLM provider is in progress. Set `KURIA_LLM_PROVIDER=ruby_llm` to opt into RubyLLM (OpenAI or OpenCode Go). OpenCode is being migrated away and is **not** intended as a maintained fallback; its service and variables are planned for removal after the migration.
+> **AI provider:** AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go APIs directly (`OPENAI_API_KEY` and/or `OPENCODE_GO_API_KEY`). Provider keys are supplied through the environment (or encrypted deployment credentials) and are never stored in ordinary application settings. No OpenCode Server container is required or started. The selectable models are listed from each configured provider at configuration/selection time; there is no default model and no hardcoded list, the model is selected explicitly per chat, and an unavailable selection requires reselection rather than silent replacement. Historical OpenCode data is retained and no history is deleted. Features still deferred to their tracked issues are listed in [Known capability gaps](#known-capability-gaps-deferred).
 
 At minimum you will need to set the following environment variables:
 
-| Variable                   | Description                                                                                                                                                 |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SECRET_KEY_BASE`          | Required. Generate with `openssl rand -hex 64`.                                                                                                             |
-| `SELF_HOSTED`              | Set to `true` to enable self-hosting mode.                                                                                                                  |
-| `PAYMENTS_ENABLED`         | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                                                       |
-| `SYNTH_API_KEY`            | Security market data provider (optional).                                                                                                                   |
-| `FREECRYPTO_API_KEY`       | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                                                    |
-| `KURIA_LLM_PROVIDER`       | LLM provider selector. Leave unset (or set to `opencode`) to keep the current OpenCode Server behavior; set to `ruby_llm` to opt into the RubyLLM provider. |
-| `OPENAI_API_KEY`           | Required for RubyLLM `openai/<model>` references (e.g. `openai/gpt-4o`).                                                                                    |
-| `OPENCODE_GO_API_KEY`      | Required for RubyLLM `opencode_go/<model>` references (e.g. `opencode_go/grok-4-fast`).                                                                     |
-| `OPENCODE_SERVER_URL`      | URL for OpenCode Server (AI assistant) — **transitional**, planned for removal.                                                                             |
-| `OPENCODE_SERVER_PASSWORD` | Password for OpenCode Server authentication — **transitional**, planned for removal.                                                                        |
-| `OPENCODE_DEFAULT_MODEL`   | Default model for AI assistant (e.g. `opencode/minimax-m2.5-free`) — **transitional**, planned for removal.                                                 |
-| `MCP_AUTH_TOKEN`           | Authentication token for MCP endpoint — **transitional**, planned for removal.                                                                              |
-| `SMTP_*`                   | Mail delivery configuration (optional).                                                                                                                     |
+| Variable              | Description                                                                                                                |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `SECRET_KEY_BASE`     | Required. Generate with `openssl rand -hex 64`.                                                                            |
+| `SELF_HOSTED`         | Set to `true` to enable self-hosting mode.                                                                                 |
+| `PAYMENTS_ENABLED`    | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                      |
+| `SYNTH_API_KEY`       | Security market data provider (optional).                                                                                  |
+| `FREECRYPTO_API_KEY`  | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                   |
+| `OPENAI_API_KEY`      | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.        |
+| `OPENCODE_GO_API_KEY` | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.   |
+| `MCP_AUTH_TOKEN`      | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path. |
+| `SMTP_*`              | Mail delivery configuration (optional).                                                                                    |
+
+### Known capability gaps (deferred)
+
+The RubyLLM-only cutover is **not complete**. The capabilities below are explicitly deferred to their tracked issues and are **not** claimed as working parity with the former OpenCode Server path:
+
+| Issue | Deferred capability                                                         |
+| ----- | --------------------------------------------------------------------------- |
+| #10   | Guarantee ordered RubyLLM streaming and reload parity                       |
+| #11   | Read Family accounts through an audited direct tool                         |
+| #12   | Reconstruct three-turn conversations from persisted history                 |
+| #13   | Propose a Transaction without mutating financial data                       |
+| #14   | Confirm a proposed Transaction exactly once                                 |
+| #15   | Run one categorization workflow through RubyLLM Schema                      |
+| #16   | Recover safely from RubyLLM provider failures                               |
+| #17   | Rate-limit authenticated Assistant requests per user                        |
+| #18   | Emit privacy-safe Assistant telemetry                                       |
+| #19   | Add optional live OpenAI and OpenCode Go compatibility smoke tests          |
+| #30   | Migrate merchant detection and suggestions to the RubyLLM provider contract |
+
+Unsupported capabilities fail safely: they surface through the existing provider response/error path — a failed response, a form alert, or a rejected model selection — and never report placeholder success or silently substitute a model. Financial enrichment that is not yet migrated (auto-categorization, merchant detection, and merchant suggestion) currently returns a failed provider response rather than performing the work.
 
 ---
 
