@@ -213,7 +213,14 @@ class Settings::HostingsControllerTest < ActionDispatch::IntegrationTest
       patch settings_hosting_url, params: { setting: { opencode_default_model: "opencode/other-model" } }
 
       assert_redirected_to settings_hosting_url
-      assert_equal original, Setting.opencode_default_model
+
+      # The value is unchanged: nil when no default is stored, otherwise the
+      # previously stored value.
+      if original.nil?
+        assert_nil Setting.opencode_default_model
+      else
+        assert_equal original, Setting.opencode_default_model
+      end
     end
   end
 
