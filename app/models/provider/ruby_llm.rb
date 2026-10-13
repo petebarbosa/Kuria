@@ -10,6 +10,11 @@ class Provider::RubyLlm < Provider
 
   SUPPORTED_PROVIDER_REFERENCES = %w[openai opencode_go].freeze
 
+  # Legacy structured-output enrichment guard: the workflows this provider
+  # replaces cap a single request at 25 transactions. Preserved so an
+  # over-sized enrichment batch fails closed instead of silently growing.
+  MAX_ENRICHMENT_TRANSACTIONS = 25
+
   class << self
     # The immutable positive catalog (Provider::RubyLlm::Catalog#manifest) is
     # the supported-model source for admin selection. Admission authority is
@@ -73,20 +78,7 @@ class Provider::RubyLlm < Provider
   def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
-
-      context = RubyLLM.context do |config|
-        config.openai_api_key = reference[:api_key]
-        config.openai_api_base = reference[:api_base]
-
-        # The per-call context duplicates the global configuration, which may
-        # carry OpenAI organization/project headers. Clear them ONLY for
-        # OpenCode Go so a Go request never inherits the normal OpenAI billing
-        # identity; normal OpenAI calls keep the deployment's own identity.
-        if reference[:account] == :opencode_go
-          config.openai_organization_id = nil
-          config.openai_project_id = nil
-        end
-      end
+      context = ruby_llm_context(reference)
 
       # The catalog is the admission authority: every admitted model is passed
       # with assume_model_exists: true (RubyLLM 1.16's bundled registry may be
@@ -112,21 +104,72 @@ class Provider::RubyLlm < Provider
     end
   end
 
-  # Enrichment capabilities (auto-categorization, merchant detection, merchant
-  # suggestion) are tracked gaps deferred to their issues; RubyLLM does not
-  # implement parity here yet. These return the existing failed-Response
-  # contract carrying a Provider::RubyLlm::Error (a StandardError) rather than
-  # the inherited NotImplementedError crash or any placeholder success.
-  def auto_categorize(transactions: [], user_categories: [])
-    unsupported_capability_response(:auto_categorize)
+  # Auto-categorization (#15) through RubyLLM structured output. The model
+  # reference is explicit and travels in from the caller (the saved
+  # Family#enrichment_model); there is no default, so a blank or unavailable
+  # selection fails closed. The returned data are provider-independent
+  # Provider::LlmConcept::AutoCategorization values — no RubyLLM object
+  # escapes the adapter.
+  def auto_categorize(transactions: [], user_categories: [], model:)
+    with_provider_response(error_transformer: error_transformer_for(model)) do
+      ensure_enrichment_transaction_limit!(transactions, "auto-categorize")
+
+      categorizer = AutoCategorizer.new(transactions: transactions, user_categories: user_categories)
+      final_message = structured_completion(
+        model: model,
+        instructions: categorizer.instructions,
+        prompt: categorizer.prompt,
+        schema: categorizer.schema
+      )
+
+      categorizer.build_results(final_message)
+    end
   end
 
-  def auto_detect_merchants(transactions: [], user_merchants: [])
-    unsupported_capability_response(:auto_detect_merchants)
+  # Merchant detection (#30) through RubyLLM structured output. The model
+  # reference is explicit and travels in from the caller (the saved
+  # Family#enrichment_model); there is no default, so a blank or unavailable
+  # selection fails closed. The returned data are provider-independent
+  # Provider::LlmConcept::AutoDetectedMerchant values — no RubyLLM object
+  # escapes the adapter.
+  def auto_detect_merchants(transactions: [], user_merchants: [], model:)
+    with_provider_response(error_transformer: error_transformer_for(model)) do
+      ensure_enrichment_transaction_limit!(transactions, "auto-detect merchants")
+
+      detector = AutoMerchantDetector.new(transactions: transactions, user_merchants: user_merchants)
+      final_message = structured_completion(
+        model: model,
+        instructions: detector.instructions,
+        prompt: detector.prompt,
+        schema: detector.schema
+      )
+
+      detector.build_results(final_message)
+    end
   end
 
-  def suggest_merchant(raw_name:, normalized_name:, user_merchants:)
-    unsupported_capability_response(:suggest_merchant)
+  # Merchant suggestion (#30) through RubyLLM structured output. The model
+  # reference is explicit and travels in from the caller (the saved
+  # Family#enrichment_model); there is no default, so a blank or unavailable
+  # selection fails closed. The returned data is a provider-independent
+  # Provider::LlmConcept::MerchantSuggestion — no RubyLLM object escapes the
+  # adapter — and a missing merchant_id is a legitimate "no suggestion".
+  def suggest_merchant(raw_name:, normalized_name:, user_merchants:, model:)
+    with_provider_response(error_transformer: error_transformer_for(model)) do
+      suggester = MerchantSuggester.new(
+        raw_name: raw_name,
+        normalized_name: normalized_name,
+        user_merchants: user_merchants
+      )
+      final_message = structured_completion(
+        model: model,
+        instructions: suggester.instructions,
+        prompt: suggester.prompt,
+        schema: suggester.schema
+      )
+
+      suggester.build_result(final_message)
+    end
   end
 
   private
@@ -136,6 +179,48 @@ class Provider::RubyLlm < Provider
 
     def catalog
       @catalog ||= Catalog.new
+    end
+
+    # Isolated per-call RubyLLM context carrying the resolved account's key and
+    # API base. The per-call context duplicates the global configuration, which
+    # may carry OpenAI organization/project headers; these are cleared ONLY for
+    # OpenCode Go so a Go request never inherits the normal OpenAI billing
+    # identity, while normal OpenAI calls keep the deployment's own identity.
+    def ruby_llm_context(reference)
+      RubyLLM.context do |config|
+        config.openai_api_key = reference[:api_key]
+        config.openai_api_base = reference[:api_base]
+
+        if reference[:account] == :opencode_go
+          config.openai_organization_id = nil
+          config.openai_project_id = nil
+        end
+      end
+    end
+
+    # Runs a single non-streaming structured-output chat against the explicit
+    # model reference and returns the final RubyLLM message. The caller's
+    # helper normalizes its `.content` into provider-independent values; the
+    # RubyLLM message itself never leaves the adapter.
+    def structured_completion(model:, instructions:, prompt:, schema:)
+      reference = resolve_reference(model)
+      context = ruby_llm_context(reference)
+
+      chat = context.chat(
+        model: reference[:model_id],
+        provider: reference[:provider],
+        assume_model_exists: reference[:assume_model_exists]
+      )
+      chat = chat.with_instructions(instructions) if instructions.present?
+      chat = chat.with_schema(schema)
+
+      chat.ask(prompt)
+    end
+
+    def ensure_enrichment_transaction_limit!(transactions, capability)
+      return if transactions.size <= MAX_ENRICHMENT_TRANSACTIONS
+
+      raise Error, "Too many transactions to #{capability}. Max is #{MAX_ENRICHMENT_TRANSACTIONS} per request."
     end
 
     def resolve_reference(model)
@@ -230,16 +315,6 @@ class Provider::RubyLlm < Provider
 
     def synthetic_response_id
       "ruby_llm_#{SecureRandom.hex(8)}"
-    end
-
-    # Safe unsupported-capability failure: the existing failed-Response
-    # contract with a StandardError, so callers keep their `success?` handling
-    # and never see the inherited NotImplementedError (a ScriptError) or a
-    # fabricated success.
-    def unsupported_capability_response(capability)
-      with_provider_response do
-        raise Error, "The RubyLLM provider does not yet support ##{capability}; this capability is deferred to its tracked issue."
-      end
     end
 
     def error_transformer_for(model)

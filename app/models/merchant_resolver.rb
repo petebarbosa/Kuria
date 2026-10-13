@@ -29,18 +29,22 @@ class MerchantResolver
     response = llm_provider.suggest_merchant(
       raw_name: raw_name,
       normalized_name: normalized,
-      user_merchants: user_merchants
+      user_merchants: user_merchants,
+      model: @family.enrichment_model
     )
 
     return nil unless response && response.success?
 
-    merchant = @family.merchants.find_by(id: response.data[:merchant_id])
+    suggestion = response.data
+    return nil unless suggestion
+
+    merchant = @family.merchants.find_by(id: suggestion.merchant_id)
     return nil unless merchant
 
     Result.new(
       merchant: merchant,
       method: :ai_suggested,
-      confidence: response.data[:confidence] || 0.0
+      confidence: suggestion.confidence || 0.0
     )
   rescue => e
     Rails.logger.error("AI merchant suggestion failed: #{e.message}")
