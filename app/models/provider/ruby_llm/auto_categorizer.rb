@@ -94,12 +94,21 @@ class Provider
         content = StructuredOutput.content_hash!(final_message, "auto-categorize")
         entries = StructuredOutput.array_of_hashes!(content, RESULT_KEY, "auto-categorize")
 
-        entries.map do |entry|
+        permitted_categories = [ *user_categories.map { |category| category[:name] }, NIL_ENUM_VALUE ]
+
+        results = entries.map do |entry|
+          transaction_id = StructuredOutput.required_id!(entry, "transaction_id", "auto-categorize")
+          category_name = StructuredOutput.required_member!(entry, "category_name", permitted_categories, "auto-categorize")
+
           Provider::LlmConcept::AutoCategorization.new(
-            transaction_id: entry["transaction_id"],
-            category_name: StructuredOutput.nullable(entry["category_name"])
+            transaction_id: transaction_id,
+            category_name: StructuredOutput.nullable(category_name)
           )
         end
+
+        StructuredOutput.reject_duplicate_ids!(entries.map { |entry| entry["transaction_id"] }, "auto-categorize")
+
+        results
       end
 
       private

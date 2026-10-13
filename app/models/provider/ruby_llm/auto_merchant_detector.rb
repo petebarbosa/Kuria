@@ -95,13 +95,21 @@ class Provider
         content = StructuredOutput.content_hash!(final_message, "auto-detect-merchants")
         entries = StructuredOutput.array_of_hashes!(content, RESULT_KEY, "auto-detect-merchants")
 
-        entries.map do |entry|
+        results = entries.map do |entry|
+          transaction_id = StructuredOutput.required_id!(entry, "transaction_id", "auto-detect-merchants")
+          business_name = StructuredOutput.nullable_string!(entry, "business_name", "auto-detect-merchants")
+          business_url = StructuredOutput.nullable_string!(entry, "business_url", "auto-detect-merchants")
+
           Provider::LlmConcept::AutoDetectedMerchant.new(
-            transaction_id: entry["transaction_id"],
-            business_name: StructuredOutput.nullable(entry["business_name"]),
-            business_url: StructuredOutput.nullable(entry["business_url"])
+            transaction_id: transaction_id,
+            business_name: business_name,
+            business_url: business_url
           )
         end
+
+        StructuredOutput.reject_duplicate_ids!(entries.map { |entry| entry["transaction_id"] }, "auto-detect-merchants")
+
+        results
       end
 
       private

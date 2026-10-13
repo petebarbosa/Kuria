@@ -71,10 +71,12 @@ class Provider
       def build_result(final_message)
         content = StructuredOutput.content_hash!(final_message, "suggest-merchant")
 
+        permitted_ids = user_merchants.map { |merchant| merchant[:id].to_s }
+
         Provider::LlmConcept::MerchantSuggestion.new(
-          merchant_id: content["merchant_id"],
-          confidence: (content["confidence"] || 0.0).to_f,
-          rationale: content["rationale"] || ""
+          merchant_id: StructuredOutput.suggestion_merchant_id!(content, permitted_ids, "suggest-merchant"),
+          confidence: StructuredOutput.suggestion_confidence!(content, "suggest-merchant"),
+          rationale: StructuredOutput.required_string!(content, "rationale", "suggest-merchant")
         )
       end
 
