@@ -205,7 +205,149 @@ class AssistantTest < ActiveSupport::TestCase
     )
   end
 
+  # --- Observable streaming contract (issue #10) -------------------------
+  # These exercise the Chat/Assistant boundary through provider-independent
+  # ChatStreamChunks: the broadcast order the user sees and the single message
+  # that survives a reload. No RubyLLM internals or prompt prose are asserted.
+
+  test "broadcasts provider chunks in order and persists one authoritative message with completed metadata" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_completed", text: "Alpha Beta Gamma")
+    @provider.expects(:chat_response).with do |_message, **options|
+      options[:streamer].call(provider_text_chunk("Alpha"))
+      options[:streamer].call(provider_text_chunk(" Beta"))
+      options[:streamer].call(provider_text_chunk(" Gamma"))
+      options[:streamer].call(provider_stream_chunk(completed))
+      true
+    end.returns(provider_success_response(completed))
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_difference "AssistantMessage.count", 1 do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    visible = assistant_message_contents(streams)
+
+    # Provider order, appended once: every broadcast extends the previous one.
+    assert_equal [ "Alpha", "Alpha Beta", "Alpha Beta Gamma" ], visible.uniq
+    visible.uniq.each_cons(2) do |previous, current|
+      assert current.start_with?(previous), "expected #{current.inspect} to extend #{previous.inspect}"
+    end
+
+    # Reload parity: the single persisted message equals the final visible text.
+    persisted = Chat.find(@chat.id).messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "Alpha Beta Gamma", persisted.content
+    assert_equal persisted.content, visible.last
+
+    # Final metadata comes from the completed provider message, not a chunk.
+    assert_equal "msg_completed", persisted.provider_id
+    assert_equal "complete", persisted.status
+  end
+
+  test "finalizes content from the completed provider message when it extends the streamed chunks" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_final", text: "Alpha Beta Gamma")
+    @provider.expects(:chat_response).with do |_message, **options|
+      options[:streamer].call(provider_text_chunk("Alpha"))
+      options[:streamer].call(provider_text_chunk(" Beta"))
+      true
+    end.returns(provider_success_response(completed))
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_difference "AssistantMessage.count", 1 do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "Alpha Beta Gamma", persisted.content
+    assert_equal persisted.content, assistant_message_contents(streams).last
+  end
+
+  test "removes the thinking indicator once, before any streamed content, on success" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_1", text: "Alpha Beta")
+    @provider.expects(:chat_response).with do |_message, **options|
+      options[:streamer].call(provider_text_chunk("Alpha"))
+      options[:streamer].call(provider_text_chunk(" Beta"))
+      true
+    end.returns(provider_success_response(completed))
+
+    streams = capture_turbo_stream_broadcasts(@chat) { @assistant.respond_to(@message) }
+
+    removes = thinking_indicator_removes(streams)
+    assert_equal 1, removes.size
+
+    remove_index = streams.index(removes.first)
+    first_content_index = streams.index { |stream| stream["action"] != "remove" }
+    assert remove_index < first_content_index, "thinking must stop before visible content is broadcast"
+  end
+
+  test "removes the thinking indicator and persists no message when the provider fails" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    error = StandardError.new("provider failure")
+    @provider.expects(:chat_response).returns(provider_error_response(error))
+    @chat.expects(:add_error).with(error).once
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    assert_equal 1, thinking_indicator_removes(streams).size
+  end
+
+  test "persists the completed message and stops thinking when the provider streams no chunks" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_only", text: "Complete answer")
+    @provider.expects(:chat_response).returns(provider_success_response(completed))
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_difference "AssistantMessage.count", 1 do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "Complete answer", persisted.content
+    assert_equal "msg_only", persisted.provider_id
+    assert_equal [ "Complete answer" ], assistant_message_contents(streams).uniq
+    assert_equal 1, thinking_indicator_removes(streams).size
+  end
+
   private
+    # The visible text of every partial the assistant message broadcasts, in
+    # broadcast order (thinking/remove frames excluded).
+    def assistant_message_contents(streams)
+      streams
+        .reject { |stream| stream["action"] == "remove" }
+        .map { |stream| Nokogiri::HTML5.fragment(stream.at("template")&.content.to_s).text.squish }
+    end
+
+    def thinking_indicator_removes(streams)
+      streams.select { |stream| stream["action"] == "remove" && stream["target"] == "thinking-indicator" }
+    end
+
+    def provider_response(id:, text:, model: "openai/gpt-4o")
+      Provider::LlmConcept::ChatResponse.new(
+        id: id,
+        model: model,
+        messages: [ provider_message(id: id, text: text) ],
+        function_requests: []
+      )
+    end
+
+    def provider_stream_chunk(response)
+      Provider::LlmConcept::ChatStreamChunk.new(type: "response", data: response)
+    end
+
     def provider_message(id:, text:)
       Provider::LlmConcept::ChatMessage.new(id: id, output_text: text)
     end
