@@ -18,29 +18,39 @@ class Api::V1::ChatsController < Api::V1::BaseController
 
   def create
     @chat = Current.user.chats.build(title: chat_params[:title])
+    ai_model = chat_params[:model]
 
-    # Require an explicit model before persisting anything so a missing or
-    # invalid reference leaves neither a Chat nor a Message and returns the
-    # standard provider_configuration_error envelope. There is no deployment
-    # default to fall back to.
-    if chat_params[:message].present?
-      ai_model = chat_params[:model]
-      Provider::Registry.validate_llm_model!(ai_model)
+    # Local validity: a blank title cannot persist, so reject it before Redis,
+    # the model catalog, or the allowance. Chat's own validation is reused.
+    unless @chat.valid?
+      return render json: { error: "Failed to create chat", details: @chat.errors.full_messages }, status: :unprocessable_entity
     end
 
-    # Count the request against the authenticated user's allowance before any
-    # storage mutation. A rejection returns 429/503 without creating a Chat or
-    # Message and without queuing provider work.
-    return unless admit_assistant_request!
+    # An initial message is the only part that queues provider work, so an
+    # empty chat is created normally without consuming the allowance.
+    if chat_params[:message].present?
+      @message = @chat.messages.build(
+        content: chat_params[:message],
+        type: "UserMessage",
+        ai_model: ai_model
+      )
+
+      # Read-only preflight before live catalog work so an exhausted caller
+      # never triggers provider validation; the atomic admit below makes the
+      # final, race-safe decision.
+      return unless preflight_assistant_request!
+
+      # Require an explicit model before persisting anything so a missing or
+      # invalid reference leaves neither a Chat nor a Message and returns the
+      # standard provider_configuration_error envelope. There is no deployment
+      # default to fall back to.
+      Provider::Registry.validate_llm_model!(ai_model)
+
+      return unless admit_assistant_request!
+    end
 
     if @chat.save
-      if chat_params[:message].present?
-        @message = @chat.messages.build(
-          content: chat_params[:message],
-          type: "UserMessage",
-          ai_model: ai_model
-        )
-
+      if @message
         if @message.save
           # UserMessage's after_create_commit callback enqueues the assistant
           # response exactly once; do not enqueue a second job here.

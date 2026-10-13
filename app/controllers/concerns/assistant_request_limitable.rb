@@ -1,10 +1,13 @@
 # Admission gate for the authenticated Assistant request boundary.
 #
-# Controllers call `admit_assistant_request!` after authentication,
-# authorization, and (where applicable) model validation, but before persisting
-# a Chat/Message or enqueuing provider work. Each accepted request is
-# attributed to the authenticated user — never to request parameters — and
-# counted exactly once by AssistantRequestLimiter.
+# Controllers call `preflight_assistant_request!` after authentication,
+# authorization, and local input validity but before any remote model-catalog
+# work, then `admit_assistant_request!` after model validation and before
+# persisting a Chat/Message or enqueuing provider work. The preflight is
+# read-only and never consumes the allowance; the atomic admit makes the final,
+# race-safe decision. Each accepted request is attributed to the authenticated
+# user — never to request parameters — and counted exactly once by
+# AssistantRequestLimiter.
 #
 # The default rejection response is the web shape: a retry-later flash aimed
 # back at the chat surface. Api::V1::BaseController overrides both the
@@ -30,14 +33,31 @@ module AssistantRequestLimitable
       false
     end
 
+    # Read-only preflight for the authenticated Assistant request boundary.
+    #
+    # Call this after authentication, authorization, and local input validity
+    # but BEFORE any remote model-catalog work, so an already-exhausted or
+    # unavailable caller never reaches a provider. It never consumes the
+    # allowance; the atomic admit that follows model validation still makes the
+    # final, race-safe decision, so two requests for the last slot may both
+    # pass preflight while only one is admitted.
+    def preflight_assistant_request!
+      result = AssistantRequestLimiter.check(assistant_request_user)
+      return true if result.allowed?
+
+      render_assistant_request_rejection(result)
+      false
+    end
+
     # Web rejection: a clear retry-later flash. A Redis outage is reported as a
-    # 503 so a caller can distinguish "try later" from their own quota, and the
-    # service failure is never detailed to the client.
+    # redirect back with an outage flash — a redirect must carry a 3xx status,
+    # so a 503 with a Location header is not a valid response; the API keeps its
+    # JSON 503 envelope. The service failure is never detailed to the client.
     def render_assistant_request_rejection(result)
       if result.reason == :unavailable
         redirect_back fallback_location: assistant_request_fallback_location,
           alert: "AI is temporarily unavailable. Please try again later.",
-          status: :service_unavailable
+          status: :see_other
       else
         redirect_back fallback_location: assistant_request_fallback_location,
           alert: assistant_request_limit_alert(result)

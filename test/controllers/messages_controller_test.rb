@@ -68,7 +68,7 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "rejects message creation once the hourly allowance is exhausted" do
-    Provider::Registry.stubs(:validate_llm_model!)
+    Provider::Registry.expects(:validate_llm_model!).never
     exhaust_assistant_limit!(@user)
 
     with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
@@ -83,8 +83,20 @@ class MessagesControllerTest < ActionDispatch::IntegrationTest
     assert_match(/hourly AI request limit/, flash[:alert])
   end
 
+  test "does not consume the allowance when the message is blank" do
+    Provider::Registry.expects(:validate_llm_model!).never
+
+    assert_no_difference "Message.count" do
+      post chat_messages_url(@chat), params: { message: { content: "", ai_model: "openai/gpt-4o" } }
+    end
+
+    assert_redirected_to chat_path(@chat)
+    assert flash[:alert].present?
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
   test "enforces the allowance in self-hosted mode when AI is available" do
-    Provider::Registry.stubs(:validate_llm_model!)
+    Provider::Registry.expects(:validate_llm_model!).never
     User.any_instance.stubs(:ai_available?).returns(true)
     exhaust_assistant_limit!(@user)
 

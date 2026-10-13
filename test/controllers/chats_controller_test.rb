@@ -135,7 +135,7 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "rejects chat creation once the hourly allowance is exhausted" do
-    Provider::Registry.stubs(:validate_llm_model!)
+    Provider::Registry.expects(:validate_llm_model!).never
     exhaust_assistant_limit!(@user)
 
     with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
@@ -148,6 +148,18 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
 
     assert_redirected_to chats_url
     assert_match(/hourly AI request limit/, flash[:alert])
+  end
+
+  test "does not consume the allowance when the message is blank" do
+    Provider::Registry.expects(:validate_llm_model!).never
+
+    assert_no_difference [ -> { Chat.count }, -> { Message.count } ] do
+      post chats_url, params: { chat: { content: "", ai_model: "openai/gpt-4o" } }
+    end
+
+    assert_response :unprocessable_entity
+    assert flash[:alert].present?
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
   end
 
   test "does not consume the allowance when the model cannot be validated" do
@@ -191,6 +203,9 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "rejects a retry without enqueuing when the allowance is exhausted" do
+    # Make the chat end with a user message so the retry would queue work and
+    # therefore be chargeable.
+    chats(:one).messages.where(type: "AssistantMessage").destroy_all
     exhaust_assistant_limit!(@user)
 
     with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
@@ -203,9 +218,40 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
     assert_match(/hourly AI request limit/, flash[:alert])
   end
 
-  test "reports a service error without any work when the limiter is unavailable" do
-    Provider::Registry.stubs(:validate_llm_model!)
-    AssistantRequestLimiter.stubs(:admit).returns(
+  test "counts one accepted retry against the allowance" do
+    chats(:one).messages.where(type: "AssistantMessage").destroy_all
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      assert_enqueued_jobs 1, only: AssistantResponseJob do
+        post retry_chat_url(chats(:one))
+      end
+    end
+
+    assert_redirected_to chat_path(chats(:one), thinking: true)
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "does not consume the allowance for a no-op retry" do
+    # chats(:one) ends with an assistant message, so a retry queues no work and
+    # must not be charged.
+    assert_no_enqueued_jobs only: AssistantResponseJob do
+      post retry_chat_url(chats(:one))
+    end
+
+    assert_redirected_to chat_path(chats(:one), thinking: true)
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "does not consume the allowance for another user's chat retry" do
+    post retry_chat_url(chats(:two))
+
+    assert_response :not_found
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "redirects with feedback without any work when the limiter is unavailable" do
+    Provider::Registry.expects(:validate_llm_model!).never
+    AssistantRequestLimiter.stubs(:check).returns(
       AssistantRequestLimiter::Result.new(
         allowed: false, limit: 5, remaining: 0, retry_after: nil, reset_at: nil, reason: :unavailable
       )
@@ -217,7 +263,11 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
       end
     end
 
-    assert_response :service_unavailable
+    assert_response :see_other
+    assert_redirected_to chats_url
+    follow_redirect!
+    assert_response :success
+    assert_match(/temporarily unavailable/, flash[:alert])
     assert_no_match(/redis/i, response.body)
   end
 

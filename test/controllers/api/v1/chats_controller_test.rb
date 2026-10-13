@@ -94,6 +94,22 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
 
     assert_response :created
     assert_equal "Empty chat", JSON.parse(response.body)["title"]
+    # An empty chat queues no provider work, so it must not be charged.
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "does not consume the allowance when the title is blank" do
+    Provider::Registry.expects(:validate_llm_model!).never
+
+    assert_no_difference [ "Chat.count", "Message.count" ] do
+      post "/api/v1/chats",
+        params: { title: "", message: "Hello AI", model: "openai/gpt-4o" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    assert_equal "Failed to create chat", JSON.parse(response.body)["error"]
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
   end
 
   test "should not create chat with read scope" do
@@ -219,7 +235,7 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "rejects chat creation with a 429 and no work once the allowance is exhausted" do
-    Provider::Registry.stubs(:validate_llm_model!)
+    Provider::Registry.expects(:validate_llm_model!).never
     exhaust_assistant_limit!(@user)
 
     with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
@@ -271,8 +287,8 @@ class Api::V1::ChatsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "reports a 503 without work when the limiter is unavailable" do
-    Provider::Registry.stubs(:validate_llm_model!)
-    AssistantRequestLimiter.stubs(:admit).returns(
+    Provider::Registry.expects(:validate_llm_model!).never
+    AssistantRequestLimiter.stubs(:check).returns(
       AssistantRequestLimiter::Result.new(
         allowed: false, limit: 5, remaining: 0, retry_after: nil, reset_at: nil, reason: :unavailable
       )

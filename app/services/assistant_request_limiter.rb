@@ -50,6 +50,14 @@ class AssistantRequestLimiter
     new(redis: redis, limit: limit).admit(user)
   end
 
+  # Read-only preflight: report the current allowance without consuming it.
+  # Controllers call this before expensive remote model-catalog work so an
+  # already-exhausted or unavailable caller never reaches a provider. It is
+  # advisory only — the atomic admit still makes the final, race-safe decision.
+  def self.check(user, redis: nil, limit: nil)
+    new(redis: redis, limit: limit).check(user)
+  end
+
   def self.configured_limit
     raw = ENV[CONFIG_KEY]
     return DEFAULT_HOURLY_LIMIT if raw.nil? || raw.strip.empty?
@@ -100,6 +108,43 @@ class AssistantRequestLimiter
   rescue Redis::BaseError => e
     # Fail closed: a Redis outage must never widen the allowance. Log only the
     # error class so no connection details or credentials reach the logs.
+    Rails.logger.warn("[AssistantRequestLimiter] Redis unavailable (#{e.class}); failing closed")
+    unavailable_result
+  end
+
+  # Non-consuming counterpart to admit/1. Reads the current count and window
+  # TTL and returns the same Result shape, but never INCRs or starts a window.
+  # A Redis outage is reported as :unavailable so callers still fail closed.
+  def check(user)
+    raise ArgumentError, "a user is required" if user.nil?
+
+    window_limit = limit
+    key = self.class.redis_key_for(user)
+    current = redis.get(key).to_i
+    ttl = redis.ttl(key).to_i
+
+    if current >= window_limit
+      retry_after = ttl.positive? ? ttl : WINDOW_SECONDS
+      return Result.new(
+        allowed: false,
+        limit: window_limit,
+        remaining: 0,
+        retry_after: retry_after,
+        reset_at: Time.current + retry_after,
+        reason: :limit_exceeded
+      )
+    end
+
+    retry_after = ttl.positive? ? ttl : nil
+    Result.new(
+      allowed: true,
+      limit: window_limit,
+      remaining: [ window_limit - current, 0 ].max,
+      retry_after: retry_after,
+      reset_at: retry_after ? Time.current + retry_after : nil,
+      reason: nil
+    )
+  rescue Redis::BaseError => e
     Rails.logger.warn("[AssistantRequestLimiter] Redis unavailable (#{e.class}); failing closed")
     unavailable_result
   end

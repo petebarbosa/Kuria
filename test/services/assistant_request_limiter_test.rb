@@ -208,4 +208,78 @@ class AssistantRequestLimiterTest < ActiveSupport::TestCase
     assert_respond_to result, :allowed?
     assert_equal 2, result.limit
   end
+
+  test "preflight allows a request within the allowance without consuming it" do
+    subject = limiter(limit: 3)
+
+    result = subject.check(@user)
+
+    assert result.allowed?
+    assert_nil result.reason
+    assert_equal 3, result.limit
+    assert_equal 3, result.remaining
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "preflight does not consume the allowance on repeated calls" do
+    subject = limiter(limit: 2)
+
+    5.times { assert subject.check(@user).allowed? }
+
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "preflight reports the remaining allowance without changing it" do
+    subject = limiter(limit: 3)
+    2.times { subject.admit(@user) }
+
+    result = subject.check(@user)
+
+    assert result.allowed?
+    assert_equal 1, result.remaining
+    assert_equal "2", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "preflight rejects once the allowance is exhausted without incrementing" do
+    subject = limiter(limit: 2)
+    2.times { subject.admit(@user) }
+
+    rejected = subject.check(@user)
+
+    assert_not rejected.allowed?
+    assert_equal :limit_exceeded, rejected.reason
+    assert_equal 0, rejected.remaining
+    assert rejected.retry_after.positive?
+    assert_equal "2", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "preflight is isolated per user" do
+    subject = limiter(limit: 1)
+    subject.admit(@user)
+
+    assert_not subject.check(@user).allowed?
+    assert subject.check(@other_user).allowed?
+  end
+
+  test "preflight fails closed when Redis is unavailable" do
+    failing = Redis.new
+    failing.stubs(:get).raises(Redis::CannotConnectError.new("connection refused"))
+
+    result = AssistantRequestLimiter.new(redis: failing, limit: 5).check(@user)
+
+    assert_not result.allowed?
+    assert_equal :unavailable, result.reason
+    assert_equal 5, result.limit
+  end
+
+  test "class level check returns the same result shape" do
+    result = AssistantRequestLimiter.check(@user, redis: @redis, limit: 2)
+
+    assert_respond_to result, :allowed?
+    assert_equal 2, result.limit
+  end
+
+  test "requires a user for preflight" do
+    assert_raises(ArgumentError) { limiter(limit: 1).check(nil) }
+  end
 end
