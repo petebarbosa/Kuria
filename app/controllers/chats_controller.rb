@@ -1,5 +1,6 @@
 class ChatsController < ApplicationController
   include ActionView::RecordIdentifier
+  include AssistantRequestLimitable
 
   before_action :set_chat, only: [ :show, :edit, :update, :destroy ]
   before_action :load_ai_model_options, only: [ :index, :new, :show ]
@@ -19,6 +20,12 @@ class ChatsController < ApplicationController
 
   def create
     begin
+      # Validate the explicit selection first so a missing, invalid, or
+      # no-longer-selectable model never consumes the caller's allowance.
+      Provider::Registry.validate_llm_model!(chat_params[:ai_model])
+
+      return unless admit_assistant_request!
+
       @chat = Current.user.chats.start!(chat_params[:content], model: chat_params[:ai_model])
     rescue Provider::Registry::Error, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved
       # start! is transactional, so a rejected model (missing, invalid, or no
@@ -54,6 +61,8 @@ class ChatsController < ApplicationController
   end
 
   def retry
+    return unless admit_assistant_request!
+
     @chat.retry_last_message!
     redirect_to chat_path(@chat, thinking: true)
   end

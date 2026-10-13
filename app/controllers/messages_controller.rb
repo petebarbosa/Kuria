@@ -1,4 +1,6 @@
 class MessagesController < ApplicationController
+  include AssistantRequestLimitable
+
   guard_feature unless: -> { Current.user.ai_enabled? }
 
   before_action :set_chat
@@ -9,6 +11,8 @@ class MessagesController < ApplicationController
     # assistant response. UserMessage.create! alone would accept any model on
     # presence and fail later, asynchronously.
     Provider::Registry.validate_llm_model!(message_params[:ai_model])
+
+    return unless admit_assistant_request!
 
     @message = UserMessage.create!(
       chat: @chat,

@@ -11,6 +11,13 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
     # The controller populates the picker through the Registry; stub the live
     # catalog call so these tests never hit the network.
     Provider::Registry.stubs(:llm_selectable_models).returns(@selectable_models)
+
+    @redis = Redis.new
+    clear_assistant_limits
+  end
+
+  teardown do
+    clear_assistant_limits
   end
 
   test "gets index" do
@@ -115,4 +122,115 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
     delete chat_url(other_chat)
     assert_response :not_found
   end
+
+  test "counts one accepted chat request against the hourly allowance" do
+    Provider::Registry.stubs(:validate_llm_model!)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      post chats_url, params: { chat: { content: "Hello", ai_model: "openai/gpt-4o" } }
+    end
+
+    assert_redirected_to chat_path(Chat.order(created_at: :desc).first, thinking: true)
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "rejects chat creation once the hourly allowance is exhausted" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    exhaust_assistant_limit!(@user)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+      assert_no_difference [ -> { Chat.count }, -> { Message.count } ] do
+        assert_no_enqueued_jobs only: AssistantResponseJob do
+          post chats_url, params: { chat: { content: "Hello", ai_model: "openai/gpt-4o" } }
+        end
+      end
+    end
+
+    assert_redirected_to chats_url
+    assert_match(/hourly AI request limit/, flash[:alert])
+  end
+
+  test "does not consume the allowance when the model cannot be validated" do
+    Provider::Registry.stubs(:validate_llm_model!).raises(
+      Provider::Registry::Error,
+      "Unsupported AI model reference \"openai/stale\"."
+    )
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      post chats_url, params: { chat: { content: "Hello", ai_model: "openai/stale" } }
+    end
+
+    assert_response :unprocessable_entity
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "attributes the allowance to the authenticated user, not another user" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    exhaust_assistant_limit!(users(:family_member))
+
+    assert_difference "Chat.count" do
+      with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+        post chats_url, params: { chat: { content: "Hello", ai_model: "openai/gpt-4o" } }
+      end
+    end
+
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(users(:family_member)))
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "allows a request again once the window resets" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    exhaust_assistant_limit!(@user)
+    @redis.del(AssistantRequestLimiter.redis_key_for(@user))
+
+    assert_difference "Chat.count" do
+      with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+        post chats_url, params: { chat: { content: "Hello", ai_model: "openai/gpt-4o" } }
+      end
+    end
+  end
+
+  test "rejects a retry without enqueuing when the allowance is exhausted" do
+    exhaust_assistant_limit!(@user)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+      assert_no_enqueued_jobs only: AssistantResponseJob do
+        post retry_chat_url(chats(:one))
+      end
+    end
+
+    assert_redirected_to chats_url
+    assert_match(/hourly AI request limit/, flash[:alert])
+  end
+
+  test "reports a service error without any work when the limiter is unavailable" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    AssistantRequestLimiter.stubs(:admit).returns(
+      AssistantRequestLimiter::Result.new(
+        allowed: false, limit: 5, remaining: 0, retry_after: nil, reset_at: nil, reason: :unavailable
+      )
+    )
+
+    assert_no_difference [ -> { Chat.count }, -> { Message.count } ] do
+      assert_no_enqueued_jobs only: AssistantResponseJob do
+        post chats_url, params: { chat: { content: "Hello", ai_model: "openai/gpt-4o" } }
+      end
+    end
+
+    assert_response :service_unavailable
+    assert_no_match(/redis/i, response.body)
+  end
+
+  private
+    def clear_assistant_limits
+      [ @user, users(:family_member) ].each do |user|
+        @redis.del(AssistantRequestLimiter.redis_key_for(user))
+      end
+    end
+
+    def exhaust_assistant_limit!(user, limit: 1)
+      key = AssistantRequestLimiter.redis_key_for(user)
+      @redis.set(key, limit.to_s)
+      @redis.expire(key, AssistantRequestLimiter::WINDOW_SECONDS)
+    end
 end
