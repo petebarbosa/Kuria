@@ -121,7 +121,7 @@ The production compose file (`compose.example.yml`) includes:
 
 All services run on the `kuria_network` bridge network.
 
-> **AI provider:** AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go APIs directly (`OPENAI_API_KEY` and/or `OPENCODE_GO_API_KEY`). Provider keys are supplied through the environment (or encrypted deployment credentials) and are never stored in ordinary application settings. No OpenCode Server container is required or started. The selectable models are listed from each configured provider at configuration/selection time; there is no default model and no hardcoded list, the model is selected explicitly per chat, and an unavailable selection requires reselection rather than silent replacement. Historical OpenCode data is retained and no history is deleted. Features still deferred to their tracked issues are listed in [Known capability gaps](#known-capability-gaps-deferred).
+> **AI provider:** AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go APIs directly (`OPENAI_API_KEY` and/or `OPENCODE_GO_API_KEY`). Provider keys are supplied through the environment (or encrypted deployment credentials) and are never stored in ordinary application settings. No OpenCode Server container is required or started. The selectable models are listed from each configured provider at configuration/selection time; there is no default model and no hardcoded list, the model is selected explicitly per chat, and an unavailable selection requires reselection rather than silent replacement. Assistant requests are rate limited per authenticated user (web and API) at `ASSISTANT_REQUESTS_PER_HOUR` requests per hour, defaulting to 100 in both managed and self-hosted modes; over-limit requests are rejected before any provider work. Historical OpenCode data is retained and no history is deleted. Features still deferred to their tracked issues are listed in [Known capability gaps](#known-capability-gaps-deferred).
 
 At minimum you will need to set the following environment variables:
 
@@ -134,6 +134,7 @@ At minimum you will need to set the following environment variables:
 | `FREECRYPTO_API_KEY`  | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                   |
 | `OPENAI_API_KEY`      | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.        |
 | `OPENCODE_GO_API_KEY` | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.   |
+| `ASSISTANT_REQUESTS_PER_HOUR` | Optional. Per-authenticated-user assistant request allowance (web and API), in requests per hour, enforced in both modes; defaults to `100`. |
 | `MCP_AUTH_TOKEN`      | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path. |
 | `SMTP_*`              | Mail delivery configuration (optional).                                                                                    |
 
