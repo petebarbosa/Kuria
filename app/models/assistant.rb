@@ -53,7 +53,7 @@ class Assistant
       model: message.ai_model,
       instructions: instructions,
       streamer: streamer,
-      previous_response_id: chat.opencode_session_id
+      previous_response_id: legacy_opencode_session_id(llm)
     )
 
     unless response.success?
@@ -62,9 +62,14 @@ class Assistant
 
     completed = response.data
 
+    # A successful provider response that carries no completed message is not a
+    # success for this chat: there is nothing to finalize or persist, so fail
+    # closed through the same error path rather than returning a false success.
+    raise Provider::Error, "#{llm.class.name} returned success without a completed response" if completed.nil?
+
     stop_thinking_once.call
-    finalize_assistant_message(assistant_message, completed) if completed
-    persist_provider_response!(completed) if completed
+    finalize_assistant_message(assistant_message, completed)
+    persist_provider_response!(completed, provider: llm)
 
     completed
   rescue => e
@@ -84,12 +89,27 @@ class Assistant
       assistant_message.save!
     end
 
-    def persist_provider_response!(completed)
+    def persist_provider_response!(completed, provider:)
       id = completed_id(completed)
       return if id.blank?
 
       chat.update_latest_response!(id)
-      chat.update!(opencode_session_id: id) if chat.opencode_session_id.blank?
+      return unless legacy_opencode_provider?(provider)
+      return if chat.opencode_session_id.present?
+
+      chat.update!(opencode_session_id: id)
+    end
+
+    # The legacy OpenCode provider threads its session id through
+    # `previous_response_id`. RubyLLM owns its own conversation state, so a
+    # legacy OpenCode session id must never cross into a RubyLLM request. The
+    # provider the registry resolved decides this — no model-reference parsing.
+    def legacy_opencode_session_id(provider)
+      chat.opencode_session_id if legacy_opencode_provider?(provider)
+    end
+
+    def legacy_opencode_provider?(provider)
+      provider.is_a?(Provider::Opencode)
     end
 
     def completed_text(completed)

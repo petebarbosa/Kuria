@@ -228,13 +228,14 @@ class AssistantTest < ActiveSupport::TestCase
       end
     end
 
-    visible = assistant_message_contents(streams)
+    # Exact broadcast sequence: the thinking indicator stops once, the message
+    # is appended once, then updated once per appended chunk, then replaced by
+    # the finalization broadcast.
+    assert_equal %w[remove append update update update], streams.map { |stream| stream["action"] }
 
-    # Provider order, appended once: every broadcast extends the previous one.
-    assert_equal [ "Alpha", "Alpha Beta", "Alpha Beta Gamma" ], visible.uniq
-    visible.uniq.each_cons(2) do |previous, current|
-      assert current.start_with?(previous), "expected #{current.inspect} to extend #{previous.inspect}"
-    end
+    visible = assistant_message_contents(streams)
+    assert_equal [ "Alpha", "Alpha Beta", "Alpha Beta Gamma", "Alpha Beta Gamma" ], visible
+    assert_streamed_in_order(visible)
 
     # Reload parity: the single persisted message equals the final visible text.
     persisted = Chat.find(@chat.id).messages.ordered.where(type: "AssistantMessage").sole
@@ -262,9 +263,15 @@ class AssistantTest < ActiveSupport::TestCase
       end
     end
 
+    visible = assistant_message_contents(streams)
+    # The provided chunks stop at "Alpha Beta"; the final broadcast replaces
+    # them with the completed message's text.
+    assert_equal [ "Alpha", "Alpha Beta", "Alpha Beta Gamma" ], visible
+    assert_streamed_in_order(visible)
+
     persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
     assert_equal "Alpha Beta Gamma", persisted.content
-    assert_equal persisted.content, assistant_message_contents(streams).last
+    assert_equal persisted.content, visible.last
   end
 
   test "removes the thinking indicator once, before any streamed content, on success" do
@@ -318,17 +325,158 @@ class AssistantTest < ActiveSupport::TestCase
     persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
     assert_equal "Complete answer", persisted.content
     assert_equal "msg_only", persisted.provider_id
-    assert_equal [ "Complete answer" ], assistant_message_contents(streams).uniq
+    assert_equal [ "Complete answer" ], assistant_message_contents(streams)
     assert_equal 1, thinking_indicator_removes(streams).size
   end
 
+  test "fails closed when a successful provider response carries no completed message" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    @provider.expects(:chat_response).returns(
+      Provider::Response.new(success?: true, data: nil, error: nil)
+    )
+    @chat.expects(:add_error).with(instance_of(Provider::Error)).once
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    assert_equal 1, thinking_indicator_removes(streams).size
+  end
+
+  test "preserves newlines and repeated spaces in streamed and persisted content" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_ws", text: "Line one\nLine two  spaced")
+    @provider.expects(:chat_response).with do |_message, **options|
+      options[:streamer].call(provider_text_chunk("Line one"))
+      options[:streamer].call(provider_text_chunk("\nLine two  spaced"))
+      true
+    end.returns(provider_success_response(completed))
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_difference "AssistantMessage.count", 1 do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "Line one\nLine two  spaced", persisted.content
+
+    visible = assistant_message_contents(streams)
+    assert_equal [ "Line one", "Line one\nLine two  spaced", "Line one\nLine two  spaced" ], visible
+    # Rendering must not collapse the newline or the repeated space.
+    assert_includes visible.last, "\n"
+    assert_includes visible.last, "  "
+  end
+
+  test "records a RubyLLM response id as the latest response only, never as an opencode session" do
+    @chat.update!(opencode_session_id: "legacy_sess_123")
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "ruby_llm_deadbeef", text: "Answer")
+    captured_options = nil
+    @provider.expects(:chat_response).with do |_message, **options|
+      captured_options = options
+      options[:streamer].call(provider_text_chunk("Answer"))
+      options[:streamer].call(provider_stream_chunk(completed))
+      true
+    end.returns(provider_success_response(completed))
+
+    @assistant.respond_to(@message)
+
+    assert_nil captured_options[:previous_response_id],
+      "a RubyLLM request must not inherit a legacy opencode session id"
+
+    @chat.reload
+    assert_equal "ruby_llm_deadbeef", @chat.latest_assistant_response_id
+    assert_equal "legacy_sess_123", @chat.opencode_session_id,
+      "RubyLLM must not overwrite the legacy opencode session"
+  end
+
+  test "writes a legacy OpenCode response id as the opencode session and latest response" do
+    opencode = build_opencode_provider
+    @message.update!(ai_model: "opencode/big-pickle")
+    @assistant.expects(:get_model_provider).with("opencode/big-pickle").returns(opencode)
+
+    completed = provider_response(id: "msg_legacy", text: "Legacy answer", model: "opencode/big-pickle")
+    captured_options = nil
+    opencode.expects(:chat_response).with do |_message, **options|
+      captured_options = options
+      options[:streamer].call(provider_text_chunk("Legacy answer"))
+      options[:streamer].call(provider_stream_chunk(completed))
+      true
+    end.returns(provider_success_response(completed))
+
+    @assistant.respond_to(@message)
+
+    assert_nil captured_options[:previous_response_id],
+      "a fresh legacy OpenCode chat starts a new session"
+
+    @chat.reload
+    assert_equal "msg_legacy", @chat.opencode_session_id
+    assert_equal "msg_legacy", @chat.latest_assistant_response_id
+  end
+
+  test "threads and preserves an existing opencode session for the legacy OpenCode provider" do
+    opencode = build_opencode_provider
+    @message.update!(ai_model: "opencode/big-pickle")
+    @assistant.expects(:get_model_provider).with("opencode/big-pickle").returns(opencode)
+    @chat.update!(opencode_session_id: "legacy_sess_9")
+
+    completed = provider_response(id: "msg_legacy_2", text: "More", model: "opencode/big-pickle")
+    captured_options = nil
+    opencode.expects(:chat_response).with do |_message, **options|
+      captured_options = options
+      true
+    end.returns(provider_success_response(completed))
+
+    @assistant.respond_to(@message)
+
+    assert_equal "legacy_sess_9", captured_options[:previous_response_id]
+
+    @chat.reload
+    assert_equal "legacy_sess_9", @chat.opencode_session_id,
+      "the historical opencode session must be preserved"
+    assert_equal "msg_legacy_2", @chat.latest_assistant_response_id
+  end
+
   private
-    # The visible text of every partial the assistant message broadcasts, in
-    # broadcast order (thinking/remove frames excluded).
+    # The visible assistant body of every broadcast, in broadcast order
+    # (thinking/remove frames excluded). Text is read from the rendered
+    # paragraph without squish or uniq, so duplicate and whitespace-corrupted
+    # broadcasts stay observable to the assertions.
     def assistant_message_contents(streams)
       streams
         .reject { |stream| stream["action"] == "remove" }
-        .map { |stream| Nokogiri::HTML5.fragment(stream.at("template")&.content.to_s).text.squish }
+        .map { |stream| rendered_assistant_text(stream) }
+    end
+
+    def rendered_assistant_text(stream)
+      fragment = Nokogiri::HTML5.fragment(stream.at("template")&.inner_html.to_s)
+      fragment.at_css(".prose > p")&.text
+    end
+
+    # Partial broadcasts must strictly extend each other and never repeat. The
+    # final entry is the finalization broadcast and may intentionally replace
+    # the streamed partial with the completed message's text.
+    def assert_streamed_in_order(contents)
+      partials = contents[0...-1]
+      assert_equal partials, partials.uniq, "partial broadcasts must not repeat"
+      partials.each_cons(2) do |previous, current|
+        assert current.start_with?(previous), "expected #{current.inspect} to extend #{previous.inspect}"
+      end
+      assert contents.last.start_with?(partials.last), "expected the final broadcast to extend #{partials.last.inspect}"
+    end
+
+    # A real legacy OpenCode provider with its HTTP client stubbed, so
+    # provider-identity checks (is_a?) see the genuine class without a network
+    # dependency.
+    def build_opencode_provider
+      Provider::Opencode::Client.stubs(:new).returns(mock("opencode_client"))
+      Provider::Opencode.new
     end
 
     def thinking_indicator_removes(streams)
