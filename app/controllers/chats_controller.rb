@@ -68,12 +68,20 @@ class ChatsController < ApplicationController
 
   def retry
     # Ownership is enforced by set_chat: a foreign or missing chat is a 404
-    # before any allowance is touched. Only a retry that will actually queue
-    # provider work consumes the allowance — a no-op retry (no trailing user
-    # message) neither debits nor enqueues.
-    if retryable_last_message?
-      return unless admit_assistant_request!
+    # before any allowance is touched. A retry only queues provider work when
+    # the chat's last conversation message is from the user, so a no-op retry
+    # neither debits nor enqueues: it clears any stale error and returns without
+    # ever calling the enqueue-capable retry_last_message!. Calling that method
+    # on the no-op path would re-read the latest message and could enqueue
+    # uncharged if a user message landed between this check and the call.
+    unless retryable_last_message?
+      @chat.clear_error
+      return redirect_to chat_path(@chat, thinking: true)
     end
+
+    # A retryable attempt is admitted (debits the allowance) before the retry
+    # method runs, so provider work is never queued without successful admission.
+    return unless admit_assistant_request!
 
     @chat.retry_last_message!
     redirect_to chat_path(@chat, thinking: true)

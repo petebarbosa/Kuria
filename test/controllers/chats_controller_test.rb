@@ -242,6 +242,32 @@ class ChatsControllerTest < ActionDispatch::IntegrationTest
     assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
   end
 
+  test "does not enqueue or charge a no-op retry when the last message changes under it" do
+    # Deterministic race at the request seam: the retryability check observes an
+    # assistant last message (a no-op that takes no allowance), but the chat's
+    # latest message is a user message by the time the action would re-read it.
+    # The no-op branch must clear the error and redirect without ever reaching
+    # the enqueue-capable retry_last_message!, so nothing is enqueued or charged.
+    chats(:one).update_column(:error, "boom")
+    concurrent_user_message = chats(:one).messages.create!(
+      type: "UserMessage", content: "a concurrent user message", ai_model: "opencode/minimax-m2.5-free"
+    )
+
+    ordered = mock("ordered_messages")
+    ordered.stubs(:last).returns(stub(role: "assistant"), concurrent_user_message)
+    conversation = mock("conversation_messages")
+    conversation.stubs(:ordered).returns(ordered)
+    Chat.any_instance.stubs(:conversation_messages).returns(conversation)
+
+    assert_no_enqueued_jobs only: AssistantResponseJob do
+      post retry_chat_url(chats(:one))
+    end
+
+    assert_redirected_to chat_path(chats(:one), thinking: true)
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+    assert_nil chats(:one).reload.error
+  end
+
   test "does not consume the allowance for another user's chat retry" do
     post retry_chat_url(chats(:two))
 
