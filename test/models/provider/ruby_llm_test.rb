@@ -40,7 +40,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   end
 
   class FakeChat
-    attr_reader :prompt, :instructions
+    attr_reader :prompt, :instructions, :schema
 
     def initialize(final_message:, chunks: [])
       @final_message = final_message
@@ -49,6 +49,11 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def with_instructions(instructions)
       @instructions = instructions
+      self
+    end
+
+    def with_schema(schema)
+      @schema = schema
       self
     end
 
@@ -754,19 +759,473 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     end
   end
 
-  test "enrichment methods return a safe unsupported-capability error instead of NotImplementedError" do
-    responses = {
-      auto_categorize: @provider.auto_categorize(transactions: [], user_categories: []),
-      auto_detect_merchants: @provider.auto_detect_merchants(transactions: [], user_merchants: []),
-      suggest_merchant: @provider.suggest_merchant(raw_name: "Acme", normalized_name: "acme", user_merchants: [])
+  # --- merchant detection and suggestion (#30) structured output -----------
+
+  test "auto_detect_merchants sends the strict JSON schema with preserved enums and normalizes valid results" do
+    content = {
+      "merchants" => [
+        { "transaction_id" => "1", "business_name" => "McDonald's", "business_url" => "mcdonalds.com" },
+        { "transaction_id" => "2", "business_name" => "null", "business_url" => "null" }
+      ]
+    }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    transactions = [ { id: "1", description: "McDonalds" }, { id: "2", description: "generic" } ]
+    user_merchants = [ { id: "m1", name: "Shooters" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_detect_merchants(
+        transactions: transactions, user_merchants: user_merchants, model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert @response.success?
+    assert_nil @response.error
+
+    results = @response.data
+    assert_equal 2, results.size
+    assert_instance_of Provider::LlmConcept::AutoDetectedMerchant, results.first
+    assert_equal "McDonald's", results.first.business_name
+    assert_equal "mcdonalds.com", results.first.business_url
+    # Explicit null is encoded as the enum member "null" and normalizes to nil.
+    assert_nil results.last.business_name
+    assert_nil results.last.business_url
+
+    wrapper = chat.schema
+    assert_equal "auto_detect_merchants", wrapper[:name]
+    assert_equal true, wrapper[:strict]
+
+    schema = wrapper[:schema]
+    refute schema.key?(:strict)
+    assert_equal %w[merchants], schema[:required]
+    assert_equal false, schema[:additionalProperties]
+
+    items = schema.dig(:properties, :merchants, :items)
+    assert_equal %w[transaction_id business_name business_url], items[:required]
+    assert_equal false, items[:additionalProperties]
+    assert_equal %w[1 2], items.dig(:properties, :transaction_id, :enum)
+    assert_equal %w[string null], items.dig(:properties, :business_name, :type)
+    assert_equal %w[string null], items.dig(:properties, :business_url, :type)
+  end
+
+  test "auto_detect_merchants preserves unknown and extra transaction ids for the domain to ignore" do
+    content = {
+      "merchants" => [
+        { "transaction_id" => "unknown", "business_name" => "Ghost", "business_url" => "ghost.com" },
+        { "transaction_id" => "1", "business_name" => "McDonald's", "business_url" => "mcdonalds.com" }
+      ]
+    }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_detect_merchants(
+        transactions: [ { id: "1" } ], user_merchants: [], model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert @response.success?
+    assert_equal [ "unknown", "1" ], @response.data.map(&:transaction_id)
+    assert @response.data.all? { |result| result.is_a?(Provider::LlmConcept::AutoDetectedMerchant) }
+  end
+
+  test "auto_detect_merchants fails closed on malformed, refused, or shapeless structured output" do
+    cases = {
+      malformed_json: FakeMessage.new(content: "this is not json"),
+      provider_refusal: FakeMessage.new(content: nil),
+      missing_array: FakeMessage.new(content: { "unexpected" => [] }),
+      non_array: FakeMessage.new(content: { "merchants" => "nope" }),
+      non_object_entries: FakeMessage.new(content: { "merchants" => [ "nope" ] })
     }
 
-    responses.each do |capability, response|
-      refute response.success?, "expected ##{capability} to fail"
+    cases.each do |label, final_message|
+      stub_ruby_llm_context(FakeChat.new(final_message: final_message))
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+      response = nil
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        response = Provider::RubyLlm.new.auto_detect_merchants(
+          transactions: [ { id: "1" } ], user_merchants: [], model: "openai/gpt-5-nano"
+        )
+      end
+
+      refute response.success?, "expected #{label} to fail closed"
       assert_nil response.data
-      assert_kind_of StandardError, response.error
       assert_kind_of Provider::RubyLlm::Error, response.error
-      assert_match(/does not yet support ##{capability}/, response.error.message)
+    end
+  end
+
+  test "auto_detect_merchants fails closed when the batch exceeds the legacy limit" do
+    RubyLLM.expects(:context).never
+
+    transactions = Array.new(Provider::RubyLlm::MAX_ENRICHMENT_TRANSACTIONS + 1) { |i| { id: i.to_s } }
+
+    response = @provider.auto_detect_merchants(transactions: transactions, user_merchants: [], model: "openai/gpt-5-nano")
+
+    refute response.success?
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+    assert_match(/Too many transactions to auto-detect merchants/, response.error.message)
+  end
+
+  test "auto_detect_merchants fails closed without touching RubyLLM when the explicit model reference is blank or unsupported" do
+    RubyLLM.expects(:context).never
+
+    [ nil, "", "openai/does-not-exist", "anthropic/claude-3-5-sonnet" ].each do |reference|
+      response = @provider.auto_detect_merchants(transactions: [ { id: "1" } ], user_merchants: [], model: reference)
+
+      refute response.success?, "expected #{reference.inspect} to fail"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+    end
+  end
+
+  test "suggest_merchant sends the strict JSON schema and normalizes a structured suggestion" do
+    content = { "merchant_id" => "m1", "confidence" => 0.82, "rationale" => "Matches the normalized name." }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    user_merchants = [ { id: "m1", name: "Shooters" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.suggest_merchant(
+        raw_name: "SHOOTERS BAR", normalized_name: "shooters bar", user_merchants: user_merchants, model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert @response.success?
+    assert_instance_of Provider::LlmConcept::MerchantSuggestion, @response.data
+    assert_equal "m1", @response.data.merchant_id
+    assert_in_delta 0.82, @response.data.confidence, 0.0001
+    assert_equal "Matches the normalized name.", @response.data.rationale
+
+    wrapper = chat.schema
+    assert_equal "suggest_merchant", wrapper[:name]
+    assert_equal true, wrapper[:strict]
+
+    schema = wrapper[:schema]
+    refute schema.key?(:strict)
+    assert_equal %w[merchant_id confidence rationale], schema[:required]
+    assert_equal false, schema[:additionalProperties]
+    assert_equal %w[string null], schema.dig(:properties, :merchant_id, :type)
+    assert_equal "number", schema.dig(:properties, :confidence, :type)
+    assert_equal "string", schema.dig(:properties, :rationale, :type)
+
+    assert_includes chat.prompt, "SHOOTERS BAR"
+    assert_includes chat.prompt, user_merchants.to_json
+  end
+
+  test "suggest_merchant normalizes a null merchant_id and defaults missing numeric fields" do
+    chat = FakeChat.new(final_message: FakeMessage.new(content: { "merchant_id" => "null" }))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.suggest_merchant(
+        raw_name: "UNKNOWN", normalized_name: "unknown", user_merchants: [], model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert @response.success?
+    assert_equal "null", @response.data.merchant_id
+    assert_equal 0.0, @response.data.confidence
+    assert_equal "", @response.data.rationale
+  end
+
+  test "suggest_merchant fails closed on malformed or refused structured output" do
+    cases = {
+      malformed_json: FakeMessage.new(content: "this is not json"),
+      provider_refusal: FakeMessage.new(content: nil),
+      non_object: FakeMessage.new(content: [ "nope" ])
+    }
+
+    cases.each do |label, final_message|
+      stub_ruby_llm_context(FakeChat.new(final_message: final_message))
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+      response = nil
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        response = Provider::RubyLlm.new.suggest_merchant(
+          raw_name: "Acme", normalized_name: "acme", user_merchants: [], model: "openai/gpt-5-nano"
+        )
+      end
+
+      refute response.success?, "expected #{label} to fail closed"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+    end
+  end
+
+  test "suggest_merchant fails closed without touching RubyLLM when the explicit model reference is blank or unsupported" do
+    RubyLLM.expects(:context).never
+
+    [ nil, "", "opencode_go/grok-4-fast", "anthropic/claude-3-5-sonnet" ].each do |reference|
+      response = @provider.suggest_merchant(
+        raw_name: "Acme", normalized_name: "acme", user_merchants: [], model: reference
+      )
+
+      refute response.success?, "expected #{reference.inspect} to fail"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+    end
+  end
+
+  test "auto_detect_merchants sends the strict JSON schema over HTTP and parses the structured response through the real RubyLLM SDK" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+    structured = { "merchants" => [ { "transaction_id" => "1", "business_name" => "McDonald's", "business_url" => "mcdonalds.com" } ] }
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          id: "chatcmpl-2",
+          object: "chat.completion",
+          created: 1,
+          model: "gpt-5-nano",
+          choices: [
+            { index: 0, message: { role: "assistant", content: structured.to_json }, finish_reason: "stop" }
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+        }.to_json
+      )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_detect_merchants(
+        transactions: [ { id: "1", description: "McDonalds" } ], user_merchants: [], model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal "McDonald's", @response.data.first.business_name
+
+    assert_requested(:post, chat_url) do |request|
+      body = JSON.parse(request.body)
+      json_schema = body.dig("response_format", "json_schema")
+
+      json_schema["name"] == "auto_detect_merchants" &&
+        json_schema["strict"] == true &&
+        json_schema["schema"]["additionalProperties"] == false &&
+        json_schema["schema"]["properties"]["merchants"]["items"]["properties"]["business_name"]["type"] == %w[string null] &&
+        json_schema["schema"]["properties"]["merchants"]["items"]["properties"]["transaction_id"]["enum"] == [ "1" ]
+    end
+  end
+
+  # --- auto-categorization (#15) structured output -------------------------
+
+  test "auto_categorize sends the strict JSON schema with preserved enums and normalizes valid results" do
+    content = {
+      "categorizations" => [
+        { "transaction_id" => "1", "category_name" => "Groceries" },
+        { "transaction_id" => "2", "category_name" => "null" }
+      ]
+    }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    config, context = stub_ruby_llm_context(chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    transactions = [ { id: "1", description: "Whole Foods" }, { id: "2", description: "Mystery" } ]
+    categories = [ { name: "Groceries" }, { name: "Dining" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: transactions, user_categories: categories, model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    assert_nil @response.error
+
+    results = @response.data
+    assert_equal 2, results.size
+    assert_instance_of Provider::LlmConcept::AutoCategorization, results.first
+    assert_equal "1", results.first.transaction_id
+    assert_equal "Groceries", results.first.category_name
+    # Explicit null is encoded as the enum member "null" and normalizes to nil.
+    assert_nil results.last.category_name
+
+    # The explicit model reference resolves to the OpenAI account.
+    assert_equal "test-openai-key", config.openai_api_key
+    assert_equal Provider::RubyLlm::OPENAI_BASE_URL, config.openai_api_base
+    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, context.chat_options)
+
+    # Strict wrapper: name + schema + strict live at the wrapper level, never
+    # `strict` inside the JSON schema definition.
+    wrapper = chat.schema
+    assert_equal "auto_categorize", wrapper[:name]
+    assert_equal true, wrapper[:strict]
+
+    schema = wrapper[:schema]
+    refute schema.key?(:strict)
+    assert_equal "object", schema[:type]
+    assert_equal %w[categorizations], schema[:required]
+    assert_equal false, schema[:additionalProperties]
+
+    items = schema.dig(:properties, :categorizations, :items)
+    assert_equal %w[transaction_id category_name], items[:required]
+    assert_equal false, items[:additionalProperties]
+    assert_equal %w[1 2], items.dig(:properties, :transaction_id, :enum)
+    assert_equal [ "Groceries", "Dining", "null" ], items.dig(:properties, :category_name, :enum)
+
+    assert_includes chat.instructions, "Return 1 result per transaction"
+    assert_includes chat.prompt, transactions.to_json
+    assert_includes chat.prompt, categories.to_json
+  end
+
+  test "auto_categorize preserves unknown and extra transaction ids for the domain to ignore" do
+    content = {
+      "categorizations" => [
+        { "transaction_id" => "unknown", "category_name" => "Groceries" },
+        { "transaction_id" => "1", "category_name" => "Dining" }
+      ]
+    }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [], model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    assert_equal [ "unknown", "1" ], @response.data.map(&:transaction_id)
+    assert_equal [ "Groceries", "Dining" ], @response.data.map(&:category_name)
+    assert @response.data.all? { |result| result.is_a?(Provider::LlmConcept::AutoCategorization) }
+  end
+
+  test "auto_categorize fails closed on malformed, refused, or shapeless structured output" do
+    cases = {
+      malformed_json: FakeMessage.new(content: "this is not json"),
+      provider_refusal: FakeMessage.new(content: nil),
+      missing_array: FakeMessage.new(content: { "unexpected" => [] }),
+      non_array: FakeMessage.new(content: { "categorizations" => "nope" }),
+      non_object_entries: FakeMessage.new(content: { "categorizations" => [ "nope" ] })
+    }
+
+    cases.each do |label, final_message|
+      stub_ruby_llm_context(FakeChat.new(final_message: final_message))
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+      response = nil
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        response = Provider::RubyLlm.new.auto_categorize(
+          transactions: [ { id: "1" } ], user_categories: [], model: "openai/gpt-5-nano"
+        )
+      end
+
+      refute response.success?, "expected #{label} to fail closed"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+    end
+  end
+
+  test "auto_categorize fails closed without touching RubyLLM when the explicit model reference is blank or unsupported" do
+    RubyLLM.expects(:context).never
+
+    [ nil, "", "opencode_go/grok-4-fast", "openai/does-not-exist", "anthropic/claude-3-5-sonnet" ].each do |reference|
+      response = @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [], model: reference)
+
+      refute response.success?, "expected #{reference.inspect} to fail"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+    end
+  end
+
+  test "auto_categorize fails closed when a catalogued model is not live-admitted" do
+    RubyLLM.expects(:context).never
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-4o") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [], model: "openai/gpt-5-nano")
+    end
+
+    refute response.success?
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+    assert_match(/live openai model list/, response.error.message)
+  end
+
+  test "auto_categorize fails closed when the credential is missing" do
+    response = nil
+    with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+      response = @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [], model: "openai/gpt-5-nano")
+    end
+
+    refute response.success?
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+    assert_match(/OPENAI_API_KEY/, response.error.message)
+  end
+
+  test "auto_categorize fails closed when the batch exceeds the legacy limit" do
+    RubyLLM.expects(:context).never
+
+    transactions = Array.new(Provider::RubyLlm::MAX_ENRICHMENT_TRANSACTIONS + 1) { |i| { id: i.to_s } }
+
+    response = @provider.auto_categorize(transactions: transactions, user_categories: [], model: "openai/gpt-5-nano")
+
+    refute response.success?
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+    assert_match(/Too many transactions to auto-categorize/, response.error.message)
+  end
+
+  test "auto_categorize sends the strict JSON schema over HTTP and parses the structured response through the real RubyLLM SDK" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+    structured = { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          id: "chatcmpl-1",
+          object: "chat.completion",
+          created: 1,
+          model: "gpt-5-nano",
+          choices: [
+            { index: 0, message: { role: "assistant", content: structured.to_json }, finish_reason: "stop" }
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+        }.to_json
+      )
+
+    transactions = [ { id: "1", description: "Whole Foods" } ]
+    categories = [ { name: "Groceries" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: transactions, user_categories: categories, model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal 1, @response.data.size
+    assert_equal "1", @response.data.first.transaction_id
+    assert_equal "Groceries", @response.data.first.category_name
+
+    assert_requested(:post, chat_url) do |request|
+      body = JSON.parse(request.body)
+      json_schema = body.dig("response_format", "json_schema")
+
+      json_schema["name"] == "auto_categorize" &&
+        json_schema["strict"] == true &&
+        json_schema["schema"]["additionalProperties"] == false &&
+        json_schema["schema"]["properties"]["categorizations"]["items"]["additionalProperties"] == false &&
+        json_schema["schema"]["properties"]["categorizations"]["items"]["properties"]["transaction_id"]["enum"] == [ "1" ] &&
+        json_schema["schema"]["properties"]["categorizations"]["items"]["properties"]["category_name"]["enum"] == [ "Groceries", "null" ]
     end
   end
 end

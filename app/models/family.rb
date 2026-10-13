@@ -37,6 +37,15 @@ class Family < ApplicationRecord
   validates :locale, inclusion: { in: I18n.available_locales.map(&:to_s) }
   validates :date_format, inclusion: { in: DATE_FORMATS.map(&:last) }
 
+  # A blank reference and an empty string both mean "no model chosen"; store a
+  # single representation (NULL) so the unconfigured state is unambiguous.
+  before_validation :normalize_enrichment_model
+
+  # An explicitly chosen enrichment model is revalidated against the live
+  # catalog when it changes. An unavailable reference is rejected so callers
+  # must reselect; it is never replaced with another model.
+  validate :validate_enrichment_model, if: -> { enrichment_model_changed? && enrichment_model.present? }
+
   def assigned_merchants
     merchant_ids = transactions.where.not(merchant_id: nil).pluck(:merchant_id).uniq
     Merchant.where(id: merchant_ids)
@@ -118,4 +127,15 @@ class Family < ApplicationRecord
   def self_hoster?
     Rails.application.config.app_mode.self_hosted?
   end
+
+  private
+    def normalize_enrichment_model
+      self.enrichment_model = enrichment_model.presence
+    end
+
+    def validate_enrichment_model
+      Provider::Registry.validate_llm_model!(enrichment_model)
+    rescue Provider::Registry::Error => error
+      errors.add(:enrichment_model, error.message)
+    end
 end
