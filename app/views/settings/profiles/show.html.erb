@@ -126,8 +126,10 @@
   <%# Family-scoped transaction enrichment model. The options are the models
       currently selectable for the configured credentials; the saved reference
       is always shown, and an unavailable one is surfaced as such so the admin
-      reselects rather than the value being replaced silently. A blank
-      selection means enrichment is unconfigured. %>
+      reselects rather than the value being replaced silently. When no selector
+      can be offered the saved reference is still displayed, with an
+      unavailable/unverified explanation, so it is never silently dropped or
+      cleared. A blank selection means enrichment is unconfigured. %>
   <%= settings_section title: t(".enrichment_model_title"), subtitle: t(".enrichment_model_description") do %>
     <% if @ai_available_models.any? %>
       <%= styled_form_with model: Current.family,
@@ -147,9 +149,19 @@
         <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_unavailable") %></p>
       <% end %>
     <% elsif @ai_available_models_error %>
-      <p class="text-sm text-secondary"><%= t(".enrichment_model_listing_error") %></p>
+      <% if @enrichment_model.present? %>
+        <p class="text-sm text-secondary">
+          <%= t(".enrichment_model_saved_unverified", model: @enrichment_model) %>
+        </p>
+      <% end %>
+      <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_listing_error") %></p>
     <% else %>
-      <p class="text-sm text-secondary"><%= t(".enrichment_model_none_available") %></p>
+      <% if @enrichment_model.present? %>
+        <p class="text-sm text-secondary">
+          <%= t(".enrichment_model_saved_unavailable", model: @enrichment_model) %>
+        </p>
+      <% end %>
+      <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_none_available") %></p>
     <% end %>
   <% end %>
 <% end %>

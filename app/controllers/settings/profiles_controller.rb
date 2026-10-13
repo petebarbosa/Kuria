@@ -17,7 +17,7 @@ class Settings::ProfilesController < ApplicationController
   # must reselect; the saved value is never replaced silently and a no-op save
   # reports an error rather than success.
   def enrichment_model
-    model = enrichment_model_params[:enrichment_model].presence
+    model = requested_enrichment_model
     Provider::Registry.validate_llm_model!(model) if model
 
     Current.family.update!(enrichment_model: model)
@@ -57,8 +57,18 @@ class Settings::ProfilesController < ApplicationController
       redirect_to settings_profile_path, alert: t(".enrichment_model_not_authorized") unless Current.user.admin?
     end
 
-    def enrichment_model_params
-      params.require(:family).permit(:enrichment_model)
+    # The request must name the field. An omitted family or enrichment_model
+    # key, or a malformed (non-string) value, is rejected through the same
+    # failure shape as an invalid model rather than being read as a clear, so
+    # the saved choice can never be dropped by omission. An explicitly supplied
+    # empty string remains a legitimate clear to unconfigured.
+    def requested_enrichment_model
+      family_params = params[:family]
+      value = family_params[:enrichment_model] if family_params.respond_to?(:key?) && family_params.key?(:enrichment_model)
+
+      raise ActiveRecord::RecordInvalid.new(Current.family) unless value.is_a?(String)
+
+      value.presence
     end
 
     # Family-scoped enrichment model selection. The saved reference is shown
