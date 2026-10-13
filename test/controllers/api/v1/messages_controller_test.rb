@@ -20,6 +20,13 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
     )
 
     @chat = chats(:one)
+
+    @redis = Redis.new
+    clear_assistant_limits
+  end
+
+  teardown do
+    clear_assistant_limits
   end
 
   test "should require authentication" do
@@ -63,6 +70,21 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
         params: { content: "Test message", model: "openai/gpt-4o" },
         headers: bearer_auth_header(@write_token)
     end
+  end
+
+  test "enqueues the assistant response exactly once per accepted request" do
+    Provider::Registry.stubs(:validate_llm_model!)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      assert_enqueued_jobs 1, only: AssistantResponseJob do
+        post "/api/v1/chats/#{@chat.id}/messages",
+          params: { content: "Test message", model: "openai/gpt-4o" },
+          headers: bearer_auth_header(@write_token)
+      end
+    end
+
+    assert_response :created
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
   end
 
   test "should retry last assistant message" do
@@ -138,9 +160,104 @@ class Api::V1::MessagesControllerTest < ActionDispatch::IntegrationTest
     assert_match(/openai\/stale/, response_body["details"])
   end
 
+  test "rejects message creation with a 429 and no work once the allowance is exhausted" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    exhaust_assistant_limit!(@user)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+      assert_no_difference "Message.count" do
+        assert_no_enqueued_jobs only: AssistantResponseJob do
+          post "/api/v1/chats/#{@chat.id}/messages",
+            params: { content: "Test message", model: "openai/gpt-4o" },
+            headers: bearer_auth_header(@write_token)
+        end
+      end
+    end
+
+    assert_response :too_many_requests
+    assert response.headers["Retry-After"].present?
+    body = JSON.parse(response.body)
+    assert_equal "rate_limit_exceeded", body["error"]
+  end
+
+  test "does not consume the allowance when the model cannot be validated" do
+    Provider::Registry.stubs(:validate_llm_model!).raises(
+      Provider::Registry::Error,
+      "Unsupported AI model reference \"openai/stale\"."
+    )
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      post "/api/v1/chats/#{@chat.id}/messages",
+        params: { content: "Hello", model: "openai/stale" },
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_response :unprocessable_entity
+    assert_nil @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "counts one accepted retry against the allowance" do
+    # The retry action is gated before any storage mutation. Its own persistence
+    # path is covered elsewhere; here we assert the admission is attributed and
+    # counted once even though the request proceeds to the existing retry logic.
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "5" do
+      post "/api/v1/chats/#{@chat.id}/messages/retry",
+        headers: bearer_auth_header(@write_token)
+    end
+
+    assert_equal "1", @redis.get(AssistantRequestLimiter.redis_key_for(@user))
+  end
+
+  test "rejects retry with a 429 and no work once the allowance is exhausted" do
+    exhaust_assistant_limit!(@user)
+
+    with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+      assert_no_difference "Message.count" do
+        assert_no_enqueued_jobs only: AssistantResponseJob do
+          post "/api/v1/chats/#{@chat.id}/messages/retry",
+            headers: bearer_auth_header(@write_token)
+        end
+      end
+    end
+
+    assert_response :too_many_requests
+    body = JSON.parse(response.body)
+    assert_equal "rate_limit_exceeded", body["error"]
+  end
+
+  test "enforces the allowance in self-hosted mode when AI is available" do
+    Provider::Registry.stubs(:validate_llm_model!)
+    User.any_instance.stubs(:ai_available?).returns(true)
+    exhaust_assistant_limit!(@user)
+
+    with_self_hosting do
+      with_env_overrides ASSISTANT_REQUESTS_PER_HOUR: "1" do
+        assert_no_difference "Message.count" do
+          post "/api/v1/chats/#{@chat.id}/messages",
+            params: { content: "Test message", model: "openai/gpt-4o" },
+            headers: bearer_auth_header(@write_token)
+        end
+      end
+    end
+
+    assert_response :too_many_requests
+  end
+
   private
 
     def bearer_auth_header(token)
       { "Authorization" => "Bearer #{token.token}" }
+    end
+
+    def clear_assistant_limits
+      [ @user, users(:family_member) ].each do |user|
+        @redis.del(AssistantRequestLimiter.redis_key_for(user))
+      end
+    end
+
+    def exhaust_assistant_limit!(user, limit: 1)
+      key = AssistantRequestLimiter.redis_key_for(user)
+      @redis.set(key, limit.to_s)
+      @redis.expire(key, AssistantRequestLimiter::WINDOW_SECONDS)
     end
 end

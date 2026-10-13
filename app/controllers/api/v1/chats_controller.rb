@@ -28,6 +28,11 @@ class Api::V1::ChatsController < Api::V1::BaseController
       Provider::Registry.validate_llm_model!(ai_model)
     end
 
+    # Count the request against the authenticated user's allowance before any
+    # storage mutation. A rejection returns 429/503 without creating a Chat or
+    # Message and without queuing provider work.
+    return unless admit_assistant_request!
+
     if @chat.save
       if chat_params[:message].present?
         @message = @chat.messages.build(
@@ -37,7 +42,8 @@ class Api::V1::ChatsController < Api::V1::BaseController
         )
 
         if @message.save
-          AssistantResponseJob.perform_later(@message)
+          # UserMessage's after_create_commit callback enqueues the assistant
+          # response exactly once; do not enqueue a second job here.
           render :show, status: :created
         else
           @chat.destroy

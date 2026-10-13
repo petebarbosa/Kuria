@@ -2,6 +2,7 @@
 
 class Api::V1::BaseController < ApplicationController
   include Doorkeeper::Rails::Helpers
+  include AssistantRequestLimitable
 
   # Skip regular session-based authentication for API
   skip_authentication
@@ -156,6 +157,42 @@ class Api::V1::BaseController < ApplicationController
     # Returns the user that owns the access token or API key
     def current_resource_owner
       @current_user
+    end
+
+    # Attribute Assistant requests to the authenticated token/key owner — never
+    # to request parameters. Overrides AssistantRequestLimitable's session-user
+    # default.
+    def assistant_request_user
+      current_resource_owner
+    end
+
+    # API rejection: the existing 429 envelope with Retry-After for a quota
+    # rejection, and a generic 503 for a Redis outage. The service failure is
+    # never detailed to the client.
+    def render_assistant_request_rejection(result)
+      if result.reason == :unavailable
+        response.headers["Retry-After"] = "60"
+        render_json({
+          error: "service_unavailable",
+          message: "AI is temporarily unavailable. Please try again later."
+        }, status: :service_unavailable)
+      else
+        retry_after = result.retry_after.to_i
+        response.headers["Retry-After"] = retry_after.to_s
+        response.headers["X-RateLimit-Limit"] = result.limit.to_s
+        response.headers["X-RateLimit-Remaining"] = "0"
+        response.headers["X-RateLimit-Reset"] = retry_after.to_s
+
+        render_json({
+          error: "rate_limit_exceeded",
+          message: "Assistant request limit exceeded. Try again in #{retry_after} seconds.",
+          details: {
+            limit: result.limit,
+            remaining: 0,
+            reset_in_seconds: retry_after
+          }
+        }, status: :too_many_requests)
+      end
     end
 
     # Get current scopes from either authentication method
