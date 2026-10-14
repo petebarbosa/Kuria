@@ -863,6 +863,54 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     end
   end
 
+  test "auto_detect_merchants fails closed when transaction_id is an Integer instead of a String" do
+    content = { "merchants" => [ { "transaction_id" => 1, "business_name" => "McDonald's", "business_url" => "mcdonalds.com" } ] }
+
+    stub_ruby_llm_context(FakeChat.new(final_message: FakeMessage.new(content: content)))
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = Provider::RubyLlm.new.auto_detect_merchants(
+        transactions: [ { id: "1" } ], user_merchants: [], model: "openai/gpt-5-nano"
+      )
+    end
+
+    refute response.success?, "expected an Integer transaction_id to fail closed"
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+  end
+
+  test "auto_detect_merchants canonicalizes integer input ids outbound and restores original ids in results" do
+    content = { "merchants" => [ { "transaction_id" => "42", "business_name" => "McDonald's", "business_url" => "mcdonalds.com" } ] }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    transactions = [ { id: 42, description: "McDonalds" } ]
+    user_merchants = [ { id: 7, name: "Shooters" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_detect_merchants(transactions: transactions, user_merchants: user_merchants, model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    assert_equal 42, @response.data.first.transaction_id
+    assert_kind_of Integer, @response.data.first.transaction_id
+
+    enum = chat.schema.dig(:schema, :properties, :merchants, :items, :properties, :transaction_id, :enum)
+    assert_equal [ "42" ], enum
+    assert enum.all? { |value| value.is_a?(String) }
+
+    assert_includes chat.prompt, "\"id\":\"42\""
+    refute_includes chat.prompt, "\"id\":42"
+    # Detection prompt lists user merchants with canonical String ids too.
+    assert_includes chat.prompt, "\"id\":\"7\""
+
+    assert_equal 42, transactions.first[:id]
+    assert_equal 7, user_merchants.first[:id]
+  end
+
   test "auto_detect_merchants fails closed on malformed, refused, or shapeless structured output" do
     cases = {
       malformed_json: FakeMessage.new(content: "this is not json"),
@@ -1017,6 +1065,67 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     end
   end
 
+  test "suggest_merchant fails closed when merchant_id is an Integer instead of a String" do
+    # "7" is admitted, but the response's integer 7 must not be coerced to it.
+    merchants = [ { id: 7, name: "Shooters" } ]
+    content = { "merchant_id" => 7, "confidence" => 0.9, "rationale" => "x" }
+
+    stub_ruby_llm_context(FakeChat.new(final_message: FakeMessage.new(content: content)))
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = Provider::RubyLlm.new.suggest_merchant(
+        raw_name: "Acme", normalized_name: "acme", user_merchants: merchants, model: "openai/gpt-5-nano"
+      )
+    end
+
+    refute response.success?, "expected an Integer merchant_id to fail closed"
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+  end
+
+  test "suggest_merchant keeps an admitted String merchant id unchanged" do
+    merchants = [ { id: "merchant-uuid", name: "Shooters" } ]
+    content = { "merchant_id" => "merchant-uuid", "confidence" => 0.9, "rationale" => "x" }
+
+    stub_ruby_llm_context(FakeChat.new(final_message: FakeMessage.new(content: content)))
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = Provider::RubyLlm.new.suggest_merchant(
+        raw_name: "Acme", normalized_name: "acme", user_merchants: merchants, model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert response.success?
+    assert_equal "merchant-uuid", response.data.merchant_id
+    assert_kind_of String, response.data.merchant_id
+  end
+
+  test "suggest_merchant canonicalizes integer merchant ids outbound and restores the original id in the result" do
+    content = { "merchant_id" => "7", "confidence" => 0.9, "rationale" => "x" }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    merchants = [ { id: 7, name: "Shooters" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.suggest_merchant(raw_name: "Acme", normalized_name: "acme", user_merchants: merchants, model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    assert_equal 7, @response.data.merchant_id
+    assert_kind_of Integer, @response.data.merchant_id
+
+    # Outbound prompt lists the merchant with a canonical String id.
+    assert_includes chat.prompt, "\"id\":\"7\""
+    refute_includes chat.prompt, "\"id\":7"
+    assert_equal 7, merchants.first[:id]
+  end
+
   test "provider validation errors never echo raw response values" do
     content = {
       "merchant_id" => "SECRET-MERCHANT-ID",
@@ -1146,6 +1255,51 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
   # --- auto-categorization (#15) structured output -------------------------
 
+  test "auto_detect_merchants canonicalizes integer ids over HTTP with a strict String schema and restores the original id" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+    structured = { "merchants" => [ { "transaction_id" => "42", "business_name" => "McDonald's", "business_url" => "mcdonalds.com" } ] }
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          id: "chatcmpl-intmerchant",
+          object: "chat.completion",
+          created: 1,
+          model: "gpt-5-nano",
+          choices: [
+            { index: 0, message: { role: "assistant", content: structured.to_json }, finish_reason: "stop" }
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+        }.to_json
+      )
+
+    transactions = [ { id: 42, description: "McDonalds" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_detect_merchants(transactions: transactions, user_merchants: [], model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal 42, @response.data.first.transaction_id
+    assert_kind_of Integer, @response.data.first.transaction_id
+
+    assert_requested(:post, chat_url) do |request|
+      body = JSON.parse(request.body)
+      json_schema = body.dig("response_format", "json_schema")
+      enum = json_schema.dig("schema", "properties", "merchants", "items", "properties", "transaction_id", "enum")
+
+      json_schema["strict"] == true &&
+        enum == [ "42" ] &&
+        enum.all? { |value| value.is_a?(String) } &&
+        !request.body.match?(/"enum":\[\s*\d/)
+    end
+  end
+
   test "auto_categorize sends the strict JSON schema with preserved enums and normalizes valid results" do
     content = {
       "categorizations" => [
@@ -1261,6 +1415,101 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
       assert_nil response.data
       assert_kind_of Provider::RubyLlm::Error, response.error
     end
+  end
+
+  test "auto_categorize fails closed when transaction_id is an Integer instead of a String" do
+    content = { "categorizations" => [ { "transaction_id" => 1, "category_name" => "Groceries" } ] }
+
+    stub_ruby_llm_context(FakeChat.new(final_message: FakeMessage.new(content: content)))
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = Provider::RubyLlm.new.auto_categorize(
+        transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano"
+      )
+    end
+
+    refute response.success?, "expected an Integer transaction_id to fail closed"
+    assert_nil response.data
+    assert_kind_of Provider::RubyLlm::Error, response.error
+  end
+
+  test "auto_categorize still accepts legitimate String transaction ids and nulls" do
+    content = { "categorizations" => [ { "transaction_id" => "1", "category_name" => "null" } ] }
+
+    stub_ruby_llm_context(FakeChat.new(final_message: FakeMessage.new(content: content)))
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    response = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      response = Provider::RubyLlm.new.auto_categorize(
+        transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano"
+      )
+    end
+
+    assert response.success?
+    assert_equal "1", response.data.first.transaction_id
+    assert_nil response.data.first.category_name
+  end
+
+  test "auto_categorize canonicalizes integer input ids to strings outbound and restores the original ids in results" do
+    content = { "categorizations" => [ { "transaction_id" => "42", "category_name" => "Groceries" } ] }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    transactions = [ { id: 42, description: "Whole Foods" } ]
+    categories = [ { name: "Groceries" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: transactions, user_categories: categories, model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+
+    # The domain id is restored to its original Integer type so Family integer
+    # equality still matches.
+    assert_equal 42, @response.data.first.transaction_id
+    assert_kind_of Integer, @response.data.first.transaction_id
+
+    # Outbound schema enum uses canonical Strings only (no mixed types).
+    enum = chat.schema.dig(:schema, :properties, :categorizations, :items, :properties, :transaction_id, :enum)
+    assert_equal [ "42" ], enum
+    assert enum.all? { |value| value.is_a?(String) }
+
+    # Outbound prompt carries the String id, never the Integer form.
+    assert_includes chat.prompt, "\"id\":\"42\""
+    refute_includes chat.prompt, "\"id\":42"
+
+    # Caller input hashes are not mutated.
+    assert_equal 42, transactions.first[:id]
+    assert_equal [ { id: 42, description: "Whole Foods" } ], transactions
+  end
+
+  test "auto_categorize keeps String/UUID input ids unchanged and tolerates unknown String ids" do
+    content = {
+      "categorizations" => [
+        { "transaction_id" => "abcd-uuid", "category_name" => "Groceries" },
+        { "transaction_id" => "unknown-extra", "category_name" => "Groceries" }
+      ]
+    }
+    chat = FakeChat.new(final_message: FakeMessage.new(content: content))
+    stub_ruby_llm_context(chat)
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    transactions = [ { id: "abcd-uuid", description: "Whole Foods" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: transactions, user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?
+    assert_equal [ "abcd-uuid", "unknown-extra" ], @response.data.map(&:transaction_id)
+    assert @response.data.all? { |result| result.transaction_id.is_a?(String) }
+
+    enum = chat.schema.dig(:schema, :properties, :categorizations, :items, :properties, :transaction_id, :enum)
+    assert_equal [ "abcd-uuid" ], enum
   end
 
   test "auto_categorize fails closed on malformed, refused, or shapeless structured output" do
@@ -1387,6 +1636,52 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
         json_schema["schema"]["properties"]["categorizations"]["items"]["additionalProperties"] == false &&
         json_schema["schema"]["properties"]["categorizations"]["items"]["properties"]["transaction_id"]["enum"] == [ "1" ] &&
         json_schema["schema"]["properties"]["categorizations"]["items"]["properties"]["category_name"]["enum"] == [ "Groceries", "null" ]
+    end
+  end
+
+  test "auto_categorize canonicalizes integer ids over HTTP with a strict String schema and restores the original id" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+    structured = { "categorizations" => [ { "transaction_id" => "42", "category_name" => "Groceries" } ] }
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          id: "chatcmpl-intcat",
+          object: "chat.completion",
+          created: 1,
+          model: "gpt-5-nano",
+          choices: [
+            { index: 0, message: { role: "assistant", content: structured.to_json }, finish_reason: "stop" }
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+        }.to_json
+      )
+
+    transactions = [ { id: 42, description: "Whole Foods" } ]
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(transactions: transactions, user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano")
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal 42, @response.data.first.transaction_id
+    assert_kind_of Integer, @response.data.first.transaction_id
+    assert_equal "Groceries", @response.data.first.category_name
+
+    assert_requested(:post, chat_url) do |request|
+      body = JSON.parse(request.body)
+      json_schema = body.dig("response_format", "json_schema")
+      enum = json_schema.dig("schema", "properties", "categorizations", "items", "properties", "transaction_id", "enum")
+
+      json_schema["strict"] == true &&
+        enum == [ "42" ] &&
+        enum.all? { |value| value.is_a?(String) } &&
+        !request.body.match?(/"enum":\[\s*\d/)
     end
   end
 end
