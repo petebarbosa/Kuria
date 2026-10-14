@@ -61,7 +61,7 @@ class Provider
           Normalized: #{normalized_name}
 
           Available merchants:
-          #{user_merchants.to_json}
+          #{user_merchants_for_prompt.to_json}
 
           Suggest the best matching merchant from the list above, or null if uncertain.
           Return confidence between 0.0 and 1.0.
@@ -71,10 +71,11 @@ class Provider
       def build_result(final_message)
         content = StructuredOutput.content_hash!(final_message, "suggest-merchant")
 
-        permitted_ids = user_merchants.map { |merchant| merchant[:id].to_s }
+        permitted_ids = StructuredOutput.string_ids(user_merchants.map { |merchant| merchant[:id] })
+        merchant_id = StructuredOutput.suggestion_merchant_id!(content, permitted_ids, "suggest-merchant")
 
         Provider::LlmConcept::MerchantSuggestion.new(
-          merchant_id: StructuredOutput.suggestion_merchant_id!(content, permitted_ids, "suggest-merchant"),
+          merchant_id: StructuredOutput.original_id_for(merchant_id, user_merchants.map { |merchant| merchant[:id] }),
           confidence: StructuredOutput.suggestion_confidence!(content, "suggest-merchant"),
           rationale: StructuredOutput.required_string!(content, "rationale", "suggest-merchant")
         )
@@ -82,6 +83,10 @@ class Provider
 
       private
         attr_reader :raw_name, :normalized_name, :user_merchants
+
+        def user_merchants_for_prompt
+          StructuredOutput.stringify_record_ids(user_merchants)
+        end
     end
   end
 end

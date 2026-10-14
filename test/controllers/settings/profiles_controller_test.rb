@@ -205,7 +205,7 @@ class Settings::ProfilesControllerTest < ActionDispatch::IntegrationTest
     assert_equal "openai/retired-model", families(:dylan_family).reload.enrichment_model
   end
 
-  test "show flags an unverified enrichment list when the live listing fails" do
+  test "show keeps the saved model visible when the live listing fails" do
     families(:dylan_family).update_column(:enrichment_model, "openai/gpt-5-nano")
     stub_request(:get, OPENAI_MODELS_URL).to_return(status: 500, body: "boom")
     sign_in @admin
@@ -217,7 +217,43 @@ class Settings::ProfilesControllerTest < ActionDispatch::IntegrationTest
     end
 
     assert_response :success
+    # No selector can be offered, but the saved canonical reference is still
+    # displayed, with an unverified explanation, and never dropped or replaced.
+    assert_select "select[name='family[enrichment_model]']", count: 0
+    assert_match I18n.t("settings.profiles.show.enrichment_model_saved_unverified", model: "openai/gpt-5-nano"), response.body
     assert_match I18n.t("settings.profiles.show.enrichment_model_listing_error"), response.body
+    assert_equal "openai/gpt-5-nano", families(:dylan_family).reload.enrichment_model
+  end
+
+  test "show keeps the saved model visible when no models are available" do
+    families(:dylan_family).update_column(:enrichment_model, "openai/gpt-5-nano")
+    sign_in @admin
+
+    with_managed_hosting do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        get settings_profile_path
+      end
+    end
+
+    assert_response :success
+    assert_select "select[name='family[enrichment_model]']", count: 0
+    assert_match I18n.t("settings.profiles.show.enrichment_model_saved_unavailable", model: "openai/gpt-5-nano"), response.body
+    assert_match I18n.t("settings.profiles.show.enrichment_model_none_available"), response.body
+    assert_equal "openai/gpt-5-nano", families(:dylan_family).reload.enrichment_model
+  end
+
+  test "show explains the absence of models without a saved-model line when unconfigured" do
+    sign_in @admin
+
+    with_managed_hosting do
+      with_env_overrides OPENAI_API_KEY: nil, OPENCODE_GO_API_KEY: nil do
+        get settings_profile_path
+      end
+    end
+
+    assert_response :success
+    assert_match I18n.t("settings.profiles.show.enrichment_model_none_available"), response.body
+    assert_no_match "Saved model:", response.body
   end
 
   test "admin can clear the enrichment model to unconfigured" do
@@ -259,6 +295,45 @@ class Settings::ProfilesControllerTest < ActionDispatch::IntegrationTest
       with_env_overrides OPENAI_API_KEY: "test-openai-key", OPENCODE_GO_API_KEY: nil do
         patch enrichment_model_settings_profile_path, params: enrichment_model_path_params("openai/gpt-5-nano")
       end
+    end
+
+    assert_redirected_to settings_profile_path
+    assert_equal I18n.t(ENRICHMENT_FAILURE), flash[:alert]
+    assert_equal "openai/gpt-5-nano", families(:dylan_family).reload.enrichment_model
+  end
+
+  test "rejects an omitted enrichment_model parameter without changing the saved value" do
+    families(:dylan_family).update_column(:enrichment_model, "openai/gpt-5-nano")
+    sign_in @admin
+
+    with_managed_hosting do
+      patch enrichment_model_settings_profile_path, params: { family: { name: "Renamed" } }
+    end
+
+    assert_redirected_to settings_profile_path
+    assert_equal I18n.t(ENRICHMENT_FAILURE), flash[:alert]
+    assert_equal "openai/gpt-5-nano", families(:dylan_family).reload.enrichment_model
+  end
+
+  test "rejects a request without a family parameter without changing the saved value" do
+    families(:dylan_family).update_column(:enrichment_model, "openai/gpt-5-nano")
+    sign_in @admin
+
+    with_managed_hosting do
+      patch enrichment_model_settings_profile_path, params: { enrichment_model: "openai/gpt-4.1" }
+    end
+
+    assert_redirected_to settings_profile_path
+    assert_equal I18n.t(ENRICHMENT_FAILURE), flash[:alert]
+    assert_equal "openai/gpt-5-nano", families(:dylan_family).reload.enrichment_model
+  end
+
+  test "rejects a malformed enrichment_model value without changing the saved value" do
+    families(:dylan_family).update_column(:enrichment_model, "openai/gpt-5-nano")
+    sign_in @admin
+
+    with_managed_hosting do
+      patch enrichment_model_settings_profile_path, params: { family: { enrichment_model: [ "openai/gpt-4.1" ] } }
     end
 
     assert_redirected_to settings_profile_path

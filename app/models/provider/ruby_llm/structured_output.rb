@@ -47,17 +47,19 @@ class Provider
         entries
       end
 
-      # A required transaction id: present, and a non-blank String or an Integer
-      # JSON scalar. Membership in the request's input ids is deliberately NOT
-      # enforced — the whole-result contract tolerates a well-formed entry for an
-      # unknown/extra id (the domain ignores it), a policy covered by tests.
+      # A required transaction id: present, and a non-blank String (the schema
+      # types transaction_id as a String). Integer or any other type fails
+      # closed — there is no numeric coercion. Membership in the request's
+      # input ids is deliberately NOT enforced — the whole-result contract
+      # tolerates a well-formed entry for an unknown/extra String id (the
+      # domain ignores it), a policy covered by tests.
       def required_id!(entry, key, capability)
         unless entry.key?(key)
           raise Error, "RubyLLM #{capability} returned an entry missing '#{key}'; failing closed."
         end
 
         value = entry[key]
-        return value if (value.is_a?(String) && value.present?) || value.is_a?(Integer)
+        return value if value.is_a?(String) && value.present?
 
         raise Error, "RubyLLM #{capability} returned an entry with an invalid '#{key}' type; failing closed."
       end
@@ -103,8 +105,10 @@ class Provider
       end
 
       # A suggested merchant id: explicit null (or the sentinel) means "no
-      # suggestion"; otherwise the id must be one of the request's admitted
-      # merchant ids. Returns a normalized String id or nil.
+      # suggestion"; otherwise the id must be a String that is one of the
+      # request's admitted merchant ids (the schema types merchant_id as
+      # string|null). Integers and other types fail closed — no
+      # numeric-to-string coercion. Returns the admitted String id or nil.
       def suggestion_merchant_id!(content, permitted_ids, capability)
         unless content.key?("merchant_id")
           raise Error, "RubyLLM #{capability} response is missing 'merchant_id'; failing closed."
@@ -112,10 +116,7 @@ class Provider
 
         value = content["merchant_id"]
         return nil if value.nil? || value == NULL_SENTINEL
-
-        if (value.is_a?(String) || value.is_a?(Integer)) && permitted_ids.include?(value.to_s)
-          return value.to_s
-        end
+        return value if value.is_a?(String) && permitted_ids.include?(value)
 
         raise Error, "RubyLLM #{capability} response has an invalid 'merchant_id'; failing closed."
       end
@@ -141,6 +142,40 @@ class Provider
         return unless duplicated
 
         raise Error, "RubyLLM #{capability} returned duplicate transaction ids; failing closed."
+      end
+
+      # --- adapter-boundary id type normalization ---------------------------
+      #
+      # The domain stores and correlates bigint (Integer) ids while the provider
+      # schemas type their id fields as Strings. The adapter canonicalizes ids
+      # to Strings on the way out and restores the original input id type on the
+      # way back, so no domain caller has to change and no malformed provider
+      # value is ever coerced.
+
+      # Canonical String forms of an input id set, for outbound schema enums.
+      # Returns a new array; the caller's collection is never mutated.
+      def string_ids(ids)
+        ids.map(&:to_s)
+      end
+
+      # New copies of the given record hashes with only the :id value
+      # canonicalized to a String, for outbound prompts. The caller's hashes are
+      # never mutated.
+      def stringify_record_ids(records)
+        records.map { |record| record.merge(id: record[:id].to_s) }
+      end
+
+      # Map a provider-returned String id back to the original input id
+      # value/type when it matches an input id by String form, so domain
+      # equality against the original (e.g. Integer bigint) id still holds. A
+      # well-formed id that matches no input (unknown/extra) is returned
+      # unchanged (String), non-String values pass through untouched, and no
+      # type coercion is performed (malformed provider Integers are rejected by
+      # the String validators before reaching here).
+      def original_id_for(returned, input_ids)
+        return returned unless returned.is_a?(String)
+
+        input_ids.find { |id| id.to_s == returned } || returned
       end
     end
   end

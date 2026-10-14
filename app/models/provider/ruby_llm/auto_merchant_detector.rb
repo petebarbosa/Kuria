@@ -30,7 +30,7 @@ class Provider
                     transaction_id: {
                       type: "string",
                       description: "The internal ID of the original transaction",
-                      enum: transactions.map { |transaction| transaction[:id] }
+                      enum: transaction_ids
                     },
                     business_name: {
                       type: %w[string null],
@@ -78,13 +78,13 @@ class Provider
           Here are the user's available merchants in JSON format:
 
           ```json
-          #{user_merchants.to_json}
+          #{user_merchants_for_prompt.to_json}
           ```
 
           Use BOTH your knowledge AND the user-generated merchants to auto-detect the following transactions:
 
           ```json
-          #{transactions.to_json}
+          #{transactions_for_prompt.to_json}
           ```
 
           Return "null" if you are not 80%+ confident in your answer.
@@ -95,13 +95,15 @@ class Provider
         content = StructuredOutput.content_hash!(final_message, "auto-detect-merchants")
         entries = StructuredOutput.array_of_hashes!(content, RESULT_KEY, "auto-detect-merchants")
 
+        input_ids = transactions.map { |transaction| transaction[:id] }
+
         results = entries.map do |entry|
           transaction_id = StructuredOutput.required_id!(entry, "transaction_id", "auto-detect-merchants")
           business_name = StructuredOutput.nullable_string!(entry, "business_name", "auto-detect-merchants")
           business_url = StructuredOutput.nullable_string!(entry, "business_url", "auto-detect-merchants")
 
           Provider::LlmConcept::AutoDetectedMerchant.new(
-            transaction_id: transaction_id,
+            transaction_id: StructuredOutput.original_id_for(transaction_id, input_ids),
             business_name: business_name,
             business_url: business_url
           )
@@ -114,6 +116,18 @@ class Provider
 
       private
         attr_reader :transactions, :user_merchants
+
+        def transaction_ids
+          StructuredOutput.string_ids(transactions.map { |transaction| transaction[:id] })
+        end
+
+        def transactions_for_prompt
+          StructuredOutput.stringify_record_ids(transactions)
+        end
+
+        def user_merchants_for_prompt
+          StructuredOutput.stringify_record_ids(user_merchants)
+        end
     end
   end
 end

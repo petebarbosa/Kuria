@@ -58,6 +58,8 @@ en:
         enrichment_model_listing_error: Available models could not be loaded. Check your provider credentials and reload.
         enrichment_model_none_available: No models are available yet. Ask your deployment administrator to configure provider credentials, then choose a model.
         enrichment_model_save: Save
+        enrichment_model_saved_unavailable: "Saved model: %{model} (not currently available)"
+        enrichment_model_saved_unverified: "Saved model: %{model} (could not be verified)"
         enrichment_model_title: Transaction enrichment model
         enrichment_model_unavailable: The saved model is no longer available. Choose an available model to continue.
         enrichment_model_unconfigured: Not configured

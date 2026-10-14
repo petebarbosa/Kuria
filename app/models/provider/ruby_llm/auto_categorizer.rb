@@ -34,7 +34,7 @@ class Provider
                     transaction_id: {
                       type: "string",
                       description: "The internal ID of the original transaction",
-                      enum: transactions.map { |transaction| transaction[:id] }
+                      enum: transaction_ids
                     },
                     category_name: {
                       type: "string",
@@ -85,7 +85,7 @@ class Provider
           Use the available categories to auto-categorize the following transactions:
 
           ```json
-          #{transactions.to_json}
+          #{transactions_for_prompt.to_json}
           ```
         PROMPT
       end
@@ -95,13 +95,14 @@ class Provider
         entries = StructuredOutput.array_of_hashes!(content, RESULT_KEY, "auto-categorize")
 
         permitted_categories = [ *user_categories.map { |category| category[:name] }, NIL_ENUM_VALUE ]
+        input_ids = transactions.map { |transaction| transaction[:id] }
 
         results = entries.map do |entry|
           transaction_id = StructuredOutput.required_id!(entry, "transaction_id", "auto-categorize")
           category_name = StructuredOutput.required_member!(entry, "category_name", permitted_categories, "auto-categorize")
 
           Provider::LlmConcept::AutoCategorization.new(
-            transaction_id: transaction_id,
+            transaction_id: StructuredOutput.original_id_for(transaction_id, input_ids),
             category_name: StructuredOutput.nullable(category_name)
           )
         end
@@ -113,6 +114,14 @@ class Provider
 
       private
         attr_reader :transactions, :user_categories
+
+        def transaction_ids
+          StructuredOutput.string_ids(transactions.map { |transaction| transaction[:id] })
+        end
+
+        def transactions_for_prompt
+          StructuredOutput.stringify_record_ids(transactions)
+        end
     end
   end
 end
