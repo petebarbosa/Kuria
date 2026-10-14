@@ -28,6 +28,10 @@ en:
         member_removal_failed: There was a problem removing the member.
         member_removed: Member was successfully removed.
         not_authorized: You are not authorized to remove members.
+      enrichment_model_failure: That model is not available. Choose an available model and try again.
+      enrichment_model_not_authorized: Only administrators can change the enrichment model.
+      enrichment_model_success: Enrichment model saved
+      enrichment_model_unavailable_option: "%{model} (no longer available)"
       show:
         confirm_delete:
           body: Are you sure you want to permanently delete your account? This action
@@ -49,6 +53,16 @@ en:
         reset_account: Reset account
         reset_account_warning: Resetting your account will delete all your accounts, categories, merchants, tags, and other data, but keep your user account intact.
         email: Email
+        enrichment_model_description: The model used to categorize transactions and detect merchants. Choose a model available for your configured provider credentials.
+        enrichment_model_label: Model
+        enrichment_model_listing_error: Available models could not be loaded. Check your provider credentials and reload.
+        enrichment_model_none_available: No models are available yet. Ask your deployment administrator to configure provider credentials, then choose a model.
+        enrichment_model_save: Save
+        enrichment_model_saved_unavailable: "Saved model: %{model} (not currently available)"
+        enrichment_model_saved_unverified: "Saved model: %{model} (could not be verified)"
+        enrichment_model_title: Transaction enrichment model
+        enrichment_model_unavailable: The saved model is no longer available. Choose an available model to continue.
+        enrichment_model_unconfigured: Not configured
         first_name: First Name
         household_form_input_placeholder: Enter household name
         household_form_label: Household name

@@ -18,7 +18,8 @@ class Family::AutoMerchantDetector
 
     result = llm_provider.auto_detect_merchants(
       transactions: transactions_input,
-      user_merchants: user_merchants_input
+      user_merchants: user_merchants_input,
+      model: family.enrichment_model
     )
 
     unless result.success?
@@ -61,9 +62,10 @@ class Family::AutoMerchantDetector
     attr_reader :family, :transaction_ids
 
     # The registry's llm concept resolves to RubyLLM only; there is no
-    # OpenCode Server fallback. RubyLLM currently returns a failed
-    # Provider::Response for this capability (deferred to #30), which the
-    # caller treats as a safe no-op.
+    # OpenCode Server fallback. The model is the explicit saved
+    # Family#enrichment_model reference (never an implicit or default model),
+    # and a blank or unavailable selection fails closed as a failed response,
+    # which the caller treats as a safe no-op.
     def llm_provider
       Provider::Registry.get_provider(:ruby_llm)
     end

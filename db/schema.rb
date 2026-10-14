@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_10_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_13_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pgcrypto"
@@ -258,6 +258,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_10_000000) do
     t.boolean "data_enrichment_enabled", default: false
     t.string "date_format", default: "%m-%d-%Y"
     t.boolean "early_access", default: false
+    t.string "enrichment_model"
     t.datetime "latest_sync_activity_at", default: -> { "CURRENT_TIMESTAMP" }
     t.datetime "latest_sync_completed_at", default: -> { "CURRENT_TIMESTAMP" }
     t.string "locale", default: "en"

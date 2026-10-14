@@ -123,6 +123,50 @@
 <% end %>
 
 <% if Current.user.admin? %>
+  <%# Family-scoped transaction enrichment model. The options are the models
+      currently selectable for the configured credentials; the saved reference
+      is always shown, and an unavailable one is surfaced as such so the admin
+      reselects rather than the value being replaced silently. When no selector
+      can be offered the saved reference is still displayed, with an
+      unavailable/unverified explanation, so it is never silently dropped or
+      cleared. A blank selection means enrichment is unconfigured. %>
+  <%= settings_section title: t(".enrichment_model_title"), subtitle: t(".enrichment_model_description") do %>
+    <% if @ai_available_models.any? %>
+      <%= styled_form_with model: Current.family,
+                           url: enrichment_model_settings_profile_path,
+                           method: :patch,
+                           class: "space-y-4" do |form| %>
+        <%= form.select :enrichment_model,
+                        options_for_select(@enrichment_model_choices, @enrichment_model),
+                        { label: t(".enrichment_model_label"),
+                          include_blank: t(".enrichment_model_unconfigured") } %>
+        <div class="flex justify-end">
+          <%= render DS::Button.new(text: t(".enrichment_model_save"), class: "md:w-auto w-full justify-center") %>
+        </div>
+      <% end %>
+
+      <% if @enrichment_model_stale %>
+        <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_unavailable") %></p>
+      <% end %>
+    <% elsif @ai_available_models_error %>
+      <% if @enrichment_model.present? %>
+        <p class="text-sm text-secondary">
+          <%= t(".enrichment_model_saved_unverified", model: @enrichment_model) %>
+        </p>
+      <% end %>
+      <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_listing_error") %></p>
+    <% else %>
+      <% if @enrichment_model.present? %>
+        <p class="text-sm text-secondary">
+          <%= t(".enrichment_model_saved_unavailable", model: @enrichment_model) %>
+        </p>
+      <% end %>
+      <p class="text-xs text-secondary mt-2"><%= t(".enrichment_model_none_available") %></p>
+    <% end %>
+  <% end %>
+<% end %>
+
+<% if Current.user.admin? %>
   <%= settings_section title: "Data Import/Export" do %>
     <div class="space-y-4">
       <div class="flex gap-4 items-center">

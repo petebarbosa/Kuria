@@ -55,7 +55,9 @@ Rails.application.routes.draw do
   end
 
   namespace :settings do
-    resource :profile, only: [ :show, :destroy ]
+    resource :profile, only: [ :show, :destroy ] do
+      patch :enrichment_model, on: :member
+    end
     resource :preferences, only: :show
     resource :hosting, only: %i[show update] do
       delete :clear_cache, on: :collection

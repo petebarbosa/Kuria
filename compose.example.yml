@@ -38,6 +38,9 @@ x-rails-env: &rails_env
   # list, and there is no automatic fallback.
   OPENAI_API_KEY: ${OPENAI_API_KEY:-}
   OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+  # Per-authenticated-user assistant request allowance (requests per hour),
+  # enforced in both managed and self-hosted modes. Defaults to 100 when unset.
+  ASSISTANT_REQUESTS_PER_HOUR: ${ASSISTANT_REQUESTS_PER_HOUR:-}
 
 services:
   web:

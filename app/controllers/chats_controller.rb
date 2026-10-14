@@ -1,7 +1,8 @@
 class ChatsController < ApplicationController
   include ActionView::RecordIdentifier
+  include AssistantRequestLimitable
 
-  before_action :set_chat, only: [ :show, :edit, :update, :destroy ]
+  before_action :set_chat, only: [ :show, :edit, :update, :destroy, :retry ]
   before_action :load_ai_model_options, only: [ :index, :new, :show ]
 
   def index
@@ -19,15 +20,27 @@ class ChatsController < ApplicationController
 
   def create
     begin
+      # Local input validity: a blank message cannot start a chat, so reject it
+      # without consuming the allowance or reaching the model catalog.
+      return render_new_chat_error if chat_params[:content].blank?
+
+      # Read-only preflight before live catalog work so an exhausted caller
+      # never triggers provider validation; the atomic admit below makes the
+      # final, race-safe decision.
+      return unless preflight_assistant_request!
+
+      # Validate the explicit selection so a missing, invalid, or
+      # no-longer-selectable model never consumes the caller's allowance.
+      Provider::Registry.validate_llm_model!(chat_params[:ai_model])
+
+      return unless admit_assistant_request!
+
       @chat = Current.user.chats.start!(chat_params[:content], model: chat_params[:ai_model])
     rescue Provider::Registry::Error, ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved
       # start! is transactional, so a rejected model (missing, invalid, or no
       # longer selectable) persists neither the chat nor its first message.
       # Re-render the form with a clear alert instead of reporting success.
-      @chat = Current.user.chats.new(title: new_chat_title)
-      load_ai_model_options
-      flash.now[:alert] = "Could not start the chat. Check the message and select an available AI model, then try again."
-      render :new, status: :unprocessable_entity
+      render_new_chat_error
     else
       set_last_viewed_chat(@chat)
       redirect_to chat_path(@chat, thinking: true)
@@ -54,6 +67,22 @@ class ChatsController < ApplicationController
   end
 
   def retry
+    # Ownership is enforced by set_chat: a foreign or missing chat is a 404
+    # before any allowance is touched. A retry only queues provider work when
+    # the chat's last conversation message is from the user, so a no-op retry
+    # neither debits nor enqueues: it clears any stale error and returns without
+    # ever calling the enqueue-capable retry_last_message!. Calling that method
+    # on the no-op path would re-read the latest message and could enqueue
+    # uncharged if a user message landed between this check and the call.
+    unless retryable_last_message?
+      @chat.clear_error
+      return redirect_to chat_path(@chat, thinking: true)
+    end
+
+    # A retryable attempt is admitted (debits the allowance) before the retry
+    # method runs, so provider work is never queued without successful admission.
+    return unless admit_assistant_request!
+
     @chat.retry_last_message!
     redirect_to chat_path(@chat, thinking: true)
   end
@@ -61,6 +90,22 @@ class ChatsController < ApplicationController
   private
     def set_chat
       @chat = Current.user.chats.find(params[:id])
+    end
+
+    # Re-render the chat form with a clear alert. Used for a locally invalid
+    # input (blank message) and for a rejected model selection; in both cases
+    # nothing was persisted, enqueued, or charged.
+    def render_new_chat_error
+      @chat = Current.user.chats.new(title: new_chat_title)
+      load_ai_model_options
+      flash.now[:alert] = "Could not start the chat. Check the message and select an available AI model, then try again."
+      render :new, status: :unprocessable_entity
+    end
+
+    # A retry only queues provider work when the chat's last conversation
+    # message is from the user; otherwise retry_last_message! is a no-op.
+    def retryable_last_message?
+      @chat.conversation_messages.ordered.last&.role == "user"
     end
 
     # Populates the model picker for every render of the chat form. RubyLLM is

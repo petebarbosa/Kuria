@@ -1,15 +1,19 @@
 module Provider::LlmConcept
   extend ActiveSupport::Concern
 
+  # Capability interface for LLM enrichment. Callers must pass an explicit
+  # canonical model reference (e.g. "openai/gpt-5-nano"); there is no default
+  # model, so an unavailable selection fails closed rather than substituting
+  # another provider or model.
   AutoCategorization = Data.define(:transaction_id, :category_name)
 
-  def auto_categorize(transactions)
+  def auto_categorize(transactions: [], user_categories: [], model:)
     raise NotImplementedError, "Subclasses must implement #auto_categorize"
   end
 
   AutoDetectedMerchant = Data.define(:transaction_id, :business_name, :business_url)
 
-  def auto_detect_merchants(transactions)
+  def auto_detect_merchants(transactions: [], user_merchants: [], model:)
     raise NotImplementedError, "Subclasses must implement #auto_detect_merchants"
   end
 
@@ -24,7 +28,7 @@ module Provider::LlmConcept
 
   MerchantSuggestion = Data.define(:merchant_id, :confidence, :rationale)
 
-  def suggest_merchant(raw_name:, normalized_name:, user_merchants:)
+  def suggest_merchant(raw_name:, normalized_name:, user_merchants:, model:)
     raise NotImplementedError, "Subclasses must implement #suggest_merchant"
   end
 end
