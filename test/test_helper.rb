@@ -37,8 +37,52 @@ end
 
 module ActiveSupport
   class TestCase
-    # Run tests in parallel with specified workers
-    parallelize(workers: :number_of_processors) unless ENV["DISABLE_PARALLELIZATION"] == "true"
+    # Redis exposes 16 logical databases by default — the CI redis service and a
+    # default Redis install both provide 16. One is left free for the base
+    # connection, leaving MAX_PARALLEL_WORKERS available for isolation. A custom
+    # Redis configured with fewer databases is unsupported for parallel runs.
+    REDIS_PARALLEL_DATABASES = 16
+    MAX_PARALLEL_WORKERS = REDIS_PARALLEL_DATABASES - 1
+
+    # Run tests in parallel with the requested workers. Every worker needs its own
+    # Redis database (see the setup hook below), so the worker count is capped and
+    # an explicit PARALLEL_WORKERS above the cap is rejected rather than allowed to
+    # alias two workers onto one database. Serial runs ignore PARALLEL_WORKERS.
+    unless ENV["DISABLE_PARALLELIZATION"] == "true"
+      requested_workers = ENV["PARALLEL_WORKERS"].presence
+      requested_count = requested_workers && Integer(requested_workers, exception: false)
+
+      if requested_workers && !requested_count&.between?(1, MAX_PARALLEL_WORKERS)
+        raise "PARALLEL_WORKERS must be between 1 and #{MAX_PARALLEL_WORKERS} " \
+              "(got #{requested_workers.inspect}): each parallel worker needs its own " \
+              "Redis logical database and only #{MAX_PARALLEL_WORKERS} are free alongside " \
+              "the base connection. Lower PARALLEL_WORKERS, or run serially with " \
+              "DISABLE_PARALLELIZATION=true."
+      end
+
+      parallel_workers = requested_count ||
+        [ (Concurrent.available_processor_count || Concurrent.processor_count).floor, MAX_PARALLEL_WORKERS ].min
+
+      parallelize(workers: parallel_workers)
+    end
+
+    # Give every parallel worker its own Redis logical database so Redis-backed
+    # state can never bleed between workers. Fixture records get deterministic
+    # ids (ActiveRecord::FixtureSet.identify), so keys such as
+    # AssistantRequestLimiter's "assistant_request_limit:<user.id>" are identical
+    # in every worker; without isolation the workers race on the same keys — one
+    # worker's teardown clears a counter another worker just set, or pre-exhausts
+    # it. All Redis clients in the app and tests are created with `Redis.new`
+    # after this fork-time hook runs, and redis-rb resolves ENV["REDIS_URL"] at
+    # construction, so a single ENV rewrite isolates every client consistently.
+    # The base database stays free because the worker count is capped above.
+    parallelize_setup do |worker|
+      base_url = ENV["REDIS_URL"] || "redis://127.0.0.1:6379"
+      uri = URI.parse(base_url)
+      base_db = uri.path.to_s.delete_prefix("/").to_i
+      uri.path = "/#{(base_db + worker + 1) % REDIS_PARALLEL_DATABASES}"
+      ENV["REDIS_URL"] = uri.to_s
+    end
 
     # https://github.com/simplecov-ruby/simplecov/issues/718#issuecomment-538201587
     if ENV["COVERAGE"] == "true"
