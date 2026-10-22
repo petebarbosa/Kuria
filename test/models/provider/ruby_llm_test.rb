@@ -7,7 +7,8 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   # never leak RubyLLM objects, so these fakes only exercise the seam the
   # adapter is allowed to touch (RubyLLM.context / context.chat / chat.ask).
   class FakeConfig
-    attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id
+    attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id,
+      :request_timeout, :max_retries, :retry_interval, :retry_backoff_factor, :retry_interval_randomness
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -23,6 +24,26 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def openai_project_id=(value)
       @openai_project_id = value
+    end
+
+    def request_timeout=(value)
+      @request_timeout = value
+    end
+
+    def max_retries=(value)
+      @max_retries = value
+    end
+
+    def retry_interval=(value)
+      @retry_interval = value
+    end
+
+    def retry_backoff_factor=(value)
+      @retry_backoff_factor = value
+    end
+
+    def retry_interval_randomness=(value)
+      @retry_interval_randomness = value
     end
   end
 
@@ -1683,5 +1704,206 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
         enum.all? { |value| value.is_a?(String) } &&
         !request.body.match?(/"enum":\[\s*\d/)
     end
+  end
+
+  # --- bounded execution, failure categories, and safe diagnostics (#16) ----
+
+  test "bounds per-call execution with a local timeout and one non-streaming retry for both accounts" do
+    # OpenAI streaming chat: the adapter must cap the local context timeout at
+    # well under RubyLLM's 300s default and must disable retries entirely.
+    streaming_chat = FakeChat.new(final_message: FakeMessage.new(content: "Hi", id: "msg_bounds"))
+    streaming_config, = stub_ruby_llm_context(streaming_chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    assert_equal 120, streaming_config.request_timeout
+    assert_equal 0, streaming_config.max_retries
+    assert_equal 0.5, streaming_config.retry_interval
+    assert_equal 2, streaming_config.retry_backoff_factor
+    assert_equal 0.5, streaming_config.retry_interval_randomness
+
+    # OpenAI structured ask (non-streaming): identical timeout bounds with
+    # exactly one bounded retry instead of RubyLLM's default of three.
+    structured_chat = FakeChat.new(final_message: FakeMessage.new(
+      content: { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+    ))
+    structured_config, = stub_ruby_llm_context(structured_chat)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano")
+    end
+
+    assert_equal 120, structured_config.request_timeout
+    assert_equal 1, structured_config.max_retries
+    assert_equal 0.5, structured_config.retry_interval
+    assert_equal 2, structured_config.retry_backoff_factor
+    assert_equal 0.5, structured_config.retry_interval_randomness
+
+    # OpenCode Go structured ask: the same bounds apply to the second account,
+    # and account isolation (key/base) still holds inside the shared bounds.
+    go_chat = FakeChat.new(final_message: FakeMessage.new(
+      content: { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+    ))
+    go_config, = stub_ruby_llm_context(go_chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert_equal "test-go-key", go_config.openai_api_key
+    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
+    assert_equal 120, go_config.request_timeout
+    assert_equal 1, go_config.max_retries
+    assert_equal 0.5, go_config.retry_interval
+    assert_equal 2, go_config.retry_backoff_factor
+    assert_equal 0.5, go_config.retry_interval_randomness
+
+    # The bounds are adapter-local: the global RubyLLM config keeps the gem
+    # defaults and Kuria adds no global initializer for them.
+    assert_equal 300, RubyLLM.config.request_timeout
+    assert_equal 3, RubyLLM.config.max_retries
+    assert_nil RubyLLM.config.openai_api_key
+
+    # RubyLLM 1.16 has no retry_max_interval option; the adapter must not grow
+    # a dependency on one.
+    refute_respond_to RubyLLM.config, :retry_max_interval
+  end
+
+  test "maps the full failure category set to the safe error envelope with sanitized messages" do
+    cases = {
+      authentication: [ RubyLLM::UnauthorizedError, "Incorrect API key provided: sk-test-secret-123", false, /authentication failed/ ],
+      rate_limit: [ RubyLLM::RateLimitError, "Rate limit exceeded for sk-test-secret-123", true, /rate limit/i ],
+      server_error: [ RubyLLM::ServerError, "internal backend error", true, /API error/ ],
+      service_unavailable: [ RubyLLM::ServiceUnavailableError, "service unavailable", true, /API error/ ],
+      overloaded: [ RubyLLM::OverloadedError, "provider overloaded", true, /API error/ ],
+      context_length: [ RubyLLM::ContextLengthExceededError, "This model supports at most 8192 tokens", false, /context length/i ],
+      unknown_model: [ RubyLLM::ModelNotFoundError, "Model 'made-up-model' does not exist", false, /could not resolve model/ ],
+      configuration: [ RubyLLM::ConfigurationError, "No API key configured for openai", false, /configuration error/i ],
+      timeout: [ Faraday::TimeoutError, nil, true, /connection error/ ],
+      connection: [ Faraday::ConnectionFailed, nil, true, /connection error/ ]
+    }
+
+    cases.each do |label, (error_class, error_message, retryable, message_pattern)|
+      chat = FakeChat.new(final_message: nil)
+      if error_message
+        chat.stubs(:ask).raises(error_class, error_message)
+      else
+        chat.stubs(:ask).raises(error_class)
+      end
+      stub_ruby_llm_context(chat)
+
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano")
+      end
+
+      refute @response.success?, "expected #{label} to return the failure envelope"
+      assert_nil @response.data, "expected #{label} to carry no data"
+      error = @response.error
+      assert_kind_of Provider::RubyLlm::Error, error, "expected #{label} to map into the provider error envelope"
+      assert_match message_pattern, error.message, "expected #{label} to carry the safe category message"
+
+      assert_equal "openai", error.details[:provider_reference], "#{label} metadata must name the provider"
+      assert_equal "openai/gpt-5-nano", error.details[:model], "#{label} metadata must name the model"
+      assert_equal error_class.name, error.details[:error_class], "#{label} metadata must name the error class"
+      assert_equal retryable, error.details[:retryable], "#{label} retryability must be explicit"
+
+      # No credentials, no provider error text, no user prompt, and no RubyLLM
+      # raw exception message ever escapes into the user-facing envelope.
+      refute_match(/sk-test-secret-123/, error.message)
+      refute_match(/What is my net worth/, error.message)
+    end
+  end
+
+  test "error metadata distinguishes OpenCode Go failures from OpenAI" do
+    chat = FakeChat.new(final_message: nil)
+    chat.stubs(:ask).raises(RubyLLM::RateLimitError, "Rate limit exceeded")
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    refute @response.success?
+    error = @response.error
+    assert_kind_of Provider::RubyLlm::Error, error
+    assert_equal "opencode_go", error.details[:provider_reference]
+    assert_equal "opencode_go/glm-5.3-flash", error.details[:model]
+    assert_equal "RubyLLM::RateLimitError", error.details[:error_class]
+    assert_equal true, error.details[:retryable]
+    assert_match(/opencode_go/, error.message)
+    refute_match(/test-go-key/, error.message)
+  end
+
+  test "non-streaming retry exhaustion surfaces the rate-limit envelope after exactly one bounded retry" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 429,
+        headers: { "Content-Type" => "application/json" },
+        body: { "error" => { "message" => "SECRET-RIPE-INTERNAL-DETAIL", "type" => "rate_limit_error" } }.to_json
+      )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(
+        transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano"
+      )
+    end
+
+    refute @response.success?
+    assert_nil @response.data
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_equal "RubyLLM::RateLimitError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    # Bounded execution: the initial request plus exactly one retry — the gem's
+    # default max_retries of 3 would have produced four requests.
+    assert_requested :post, chat_url, times: 2
+    # The provider body (and its raw details) never surface in the envelope.
+    refute_match(/SECRET-RIPE-INTERNAL-DETAIL/, @response.error.message)
+  end
+
+  test "a failed streaming chat is never retried, delivers no duplicate chunks, and stops through the envelope" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(status: 500, headers: { "Content-Type" => "application/json" }, body: { "error" => { "message" => "boom" } }.to_json)
+
+    collected = []
+    streamer = proc { |chunk| collected << chunk }
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano", streamer: streamer)
+    end
+
+    refute @response.success?
+    # No retried request may replay the partially streamed answer: the failed
+    # streaming chat attempts exactly one POST.
+    assert_requested :post, chat_url, times: 1
+    assert_equal [], collected, "failed streaming chats must not stream chunks or a completed response"
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    # RubyLLM 1.16 quirk (verified against the vendored gem): a streamed
+    # failure with a JSON error body is re-mapped through the streaming error
+    # path (Streaming#handle_parsed_error) and surfaces as BadRequestError —
+    # not ServerError — regardless of the real status. The adapter envelope
+    # propagates the class name as-is and flags it non-retryable.
+    assert_equal "RubyLLM::BadRequestError", @response.error.details[:error_class]
+    assert_equal false, @response.error.details[:retryable]
+    refute_match(/What is my net worth/, @response.error.message)
   end
 end

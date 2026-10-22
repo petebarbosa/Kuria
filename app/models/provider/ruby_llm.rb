@@ -15,6 +15,25 @@ class Provider::RubyLlm < Provider
   # over-sized enrichment batch fails closed instead of silently growing.
   MAX_ENRICHMENT_TRANSACTIONS = 25
 
+  # Adapter-local bounded execution (#16). RubyLLM 1.16's defaults are
+  # request_timeout: 300 and max_retries: 3 (POSTs included), which is an
+  # unbounded wall-clock budget (~20 minutes worst case) for a single finance
+  # request. Every per-call context gets an explicit, tighter budget instead.
+  #
+  # Streaming chats (chat_response always passes an ask block, and RubyLLM 1.16
+  # sets stream: block_given?) MUST NOT retry: a retried streaming request
+  # replays the already-partially-streamed answer through the streamer.
+  # Non-streaming structured asks get at most one bounded retry.
+  #
+  # retry_max_interval is deliberately not set: RubyLLM 1.16 has no such
+  # configuration option (never depend on it).
+  REQUEST_TIMEOUT_SECONDS = 120
+  NON_STREAMING_MAX_RETRIES = 1
+  STREAMING_MAX_RETRIES = 0
+  RETRY_INTERVAL_SECONDS = 0.5
+  RETRY_BACKOFF_FACTOR = 2
+  RETRY_INTERVAL_RANDOMNESS = 0.5
+
   class << self
     # The immutable positive catalog (Provider::RubyLlm::Catalog#manifest) is
     # the supported-model source for admin selection. Admission authority is
@@ -78,7 +97,7 @@ class Provider::RubyLlm < Provider
   def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
-      context = ruby_llm_context(reference)
+      context = ruby_llm_context(reference, streaming: true)
 
       # The catalog is the admission authority: every admitted model is passed
       # with assume_model_exists: true (RubyLLM 1.16's bundled registry may be
@@ -182,14 +201,21 @@ class Provider::RubyLlm < Provider
     end
 
     # Isolated per-call RubyLLM context carrying the resolved account's key and
-    # API base. The per-call context duplicates the global configuration, which
-    # may carry OpenAI organization/project headers; these are cleared ONLY for
-    # OpenCode Go so a Go request never inherits the normal OpenAI billing
-    # identity, while normal OpenAI calls keep the deployment's own identity.
-    def ruby_llm_context(reference)
+    # API base plus the adapter-local bounded execution budget. The per-call
+    # context duplicates the global configuration, which may carry OpenAI
+    # organization/project headers; these are cleared ONLY for OpenCode Go so a
+    # Go request never inherits the normal OpenAI billing identity, while
+    # normal OpenAI calls keep the deployment's own identity.
+    def ruby_llm_context(reference, streaming:)
       RubyLLM.context do |config|
         config.openai_api_key = reference[:api_key]
         config.openai_api_base = reference[:api_base]
+
+        config.request_timeout = REQUEST_TIMEOUT_SECONDS
+        config.max_retries = streaming ? STREAMING_MAX_RETRIES : NON_STREAMING_MAX_RETRIES
+        config.retry_interval = RETRY_INTERVAL_SECONDS
+        config.retry_backoff_factor = RETRY_BACKOFF_FACTOR
+        config.retry_interval_randomness = RETRY_INTERVAL_RANDOMNESS
 
         if reference[:account] == :opencode_go
           config.openai_organization_id = nil
@@ -204,7 +230,7 @@ class Provider::RubyLlm < Provider
     # RubyLLM message itself never leaves the adapter.
     def structured_completion(model:, instructions:, prompt:, schema:)
       reference = resolve_reference(model)
-      context = ruby_llm_context(reference)
+      context = ruby_llm_context(reference, streaming: false)
 
       chat = context.chat(
         model: reference[:model_id],
