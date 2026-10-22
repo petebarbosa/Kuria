@@ -57,11 +57,10 @@ docker compose -f compose.dev.yml down
 ### Setup
 
 ```sh
-git clone https://github.com/petebarbosa/maybe.git
-cd maybe
+git clone https://github.com/petebarbosa/kuria.git
+cd kuria
 cp .env.development .env.local   # or create your own .env.local
 bin/setup                         # installs gems, creates DB, runs migrations
-bin/rails opencode:config:generate # (optional) writes MCP client config for this app
 bin/dev                           # starts Rails, Tailwind, and Sidekiq
 ```
 
@@ -127,18 +126,18 @@ All services run on the `kuria_network` bridge network.
 
 At minimum you will need to set the following environment variables:
 
-| Variable              | Description                                                                                                                |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `SECRET_KEY_BASE`     | Required. Generate with `openssl rand -hex 64`.                                                                            |
-| `SELF_HOSTED`         | Set to `true` to enable self-hosting mode.                                                                                 |
-| `PAYMENTS_ENABLED`    | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                      |
-| `SYNTH_API_KEY`       | Security market data provider (optional).                                                                                  |
-| `FREECRYPTO_API_KEY`  | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                   |
-| `OPENAI_API_KEY`      | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.        |
-| `OPENCODE_GO_API_KEY` | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.   |
+| Variable                      | Description                                                                                                                                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SECRET_KEY_BASE`             | Required. Generate with `openssl rand -hex 64`.                                                                                              |
+| `SELF_HOSTED`                 | Set to `true` to enable self-hosting mode.                                                                                                   |
+| `PAYMENTS_ENABLED`            | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                                        |
+| `SYNTH_API_KEY`               | Security market data provider (optional).                                                                                                    |
+| `FREECRYPTO_API_KEY`          | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                                     |
+| `OPENAI_API_KEY`              | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.                          |
+| `OPENCODE_GO_API_KEY`         | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.                     |
 | `ASSISTANT_REQUESTS_PER_HOUR` | Optional. Per-authenticated-user assistant request allowance (web and API), in requests per hour, enforced in both modes; defaults to `100`. |
-| `MCP_AUTH_TOKEN`      | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path. |
-| `SMTP_*`              | Mail delivery configuration (optional).                                                                                    |
+| `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path.                   |
+| `SMTP_*`                      | Mail delivery configuration (optional).                                                                                                      |
 
 ### Known capability gaps (deferred)
 
@@ -164,5 +163,5 @@ Unsupported capabilities fail safely: they surface through the existing provider
 
 ## Credits
 
-Based on [maybe-finance/maybe](https://github.com/maybe-finance/maybe), distributed under the [AGPLv3 license](LICENSE).
+Based on [kuria-finance/kuria](https://github.com/kuria-finance/kuria), distributed under the [AGPLv3 license](LICENSE).
 This fork is not affiliated with or endorsed by Maybe Finance Inc.
