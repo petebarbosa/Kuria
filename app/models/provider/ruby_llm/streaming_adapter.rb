@@ -19,8 +19,8 @@ class Provider
     # callback is always restored, and transport errors are never swallowed.
     class StreamingAdapter < Faraday::Adapter::NetHttp
       INVALID_STREAM_MESSAGE = "The model stream was malformed or incomplete.".freeze
+      MALFORMED_TOOL_CALL_MESSAGE = "The model returned a structurally malformed tool call.".freeze
       MAX_JSON_BODY_BYTES = 1024 * 1024
-      MAX_RECOVERED_TOOL_CALLS = 32
       MAX_TOOL_CALL_IDENTIFIER_BYTES = 256
       MAX_TOOL_CALL_ARGUMENT_BYTES = 64 * 1024
 
@@ -50,13 +50,36 @@ class Provider
         end
       end
 
+      # Raised while observing a streamed tool-call envelope that cannot be
+      # parsed safely (for example a non-object `function`). The error is fixed
+      # and payload-free; the request-local collector still carries the
+      # identifiable raw attempts for audit persistence. Raising before the
+      # chunk reaches RubyLLM avoids its unclassified TypeError.
+      class MalformedToolCallError < Faraday::Error
+        def initialize
+          super(MALFORMED_TOOL_CALL_MESSAGE)
+        end
+      end
+
       def call(env)
         callback = env.request.on_data
         return super unless callback
 
         state = new_stream_state
         env.request.on_data = lambda do |chunk, bytes, callback_env|
-          validate_chunk(state, chunk, callback_env) if callback_env.status == 200
+          if callback_env.status == 200
+            begin
+              validate_chunk(state, chunk, callback_env)
+            rescue InvalidStreamError
+              publish_recovered_tool_calls(state)
+              raise
+            end
+
+            if state[:malformed_tool_call_envelope]
+              publish_recovered_tool_calls(state)
+              raise MalformedToolCallError
+            end
+          end
           callback.call(chunk, bytes, callback_env)
         end
 
@@ -77,7 +100,8 @@ class Provider
             json_parsed: false,
             done: false,
             completed: false,
-            tool_calls: {}
+            tool_calls: {},
+            malformed_tool_call_envelope: false
           }
         end
 
@@ -216,9 +240,10 @@ class Provider
 
         # Reconstructs the raw tool-call fragments for one response round. The
         # provider's arguments arrive as string fragments split arbitrarily
-        # across events; ids/names may only arrive on a later fragment. Only
-        # bounded, correctly typed values are retained, and a recovered payload
-        # is never logged or surfaced in user-facing errors.
+        # across events; ids/names may only arrive on a later fragment. Every
+        # identifiable attempt is retained (index or id); only each call's
+        # identifier and raw argument bytes are bounded. A recovered payload is
+        # never logged or surfaced in user-facing errors.
         def collect_tool_calls(state, tool_calls)
           tool_calls.each do |call|
             key = tool_call_key(call)
@@ -226,8 +251,6 @@ class Provider
 
             entry = state[:tool_calls][key]
             if entry.nil?
-              break if state[:tool_calls].size >= MAX_RECOVERED_TOOL_CALLS
-
               entry = state[:tool_calls][key] = { id: nil, name: nil, arguments: +"", truncated: false }
             end
 
@@ -237,15 +260,40 @@ class Provider
             end
 
             function = call["function"]
+            if call.key?("function") && !function.nil? && !function.is_a?(Hash)
+              mark_malformed_tool_call_envelope(state)
+              append_raw_tool_call_payload(entry, function)
+              next
+            end
             next unless function.is_a?(Hash)
 
             name = function["name"]
-            if name.is_a?(String) && name.present? && name.bytesize <= MAX_TOOL_CALL_IDENTIFIER_BYTES
+            if function.key?("name") && !name.nil? && !name.is_a?(String)
+              mark_malformed_tool_call_envelope(state)
+              append_raw_tool_call_payload(entry, name)
+            elsif name.is_a?(String) && name.present? && name.bytesize <= MAX_TOOL_CALL_IDENTIFIER_BYTES
               entry[:name] = name if entry[:name].blank?
             end
 
-            append_tool_call_arguments(entry, function["arguments"])
+            arguments = function["arguments"]
+            if function.key?("arguments") && !arguments.nil? && !arguments.is_a?(String)
+              mark_malformed_tool_call_envelope(state)
+              append_raw_tool_call_payload(entry, arguments)
+            else
+              append_tool_call_arguments(entry, arguments)
+            end
           end
+        end
+
+        def mark_malformed_tool_call_envelope(state)
+          state[:malformed_tool_call_envelope] = true
+        end
+
+        def append_raw_tool_call_payload(entry, payload)
+          text = payload.is_a?(String) ? payload : JSON.generate(payload)
+          append_tool_call_arguments(entry, text)
+        rescue JSON::GeneratorError, TypeError
+          append_tool_call_arguments(entry, payload.to_s)
         end
 
         def tool_call_key(call)
@@ -299,17 +347,23 @@ class Provider
         end
 
         def ensure_complete_stream(state)
-          if state[:format] == :json
-            raise InvalidStreamError unless state[:json_parsed]
+          begin
+            if state[:format] == :json
+              raise InvalidStreamError unless state[:json_parsed]
 
-            # The buffered error path raises in RubyLLM before this point; a
-            # buffered success on a streaming request never produced chunks.
-            raise InvalidStreamError unless state[:json_buffered_error]
-          else
-            raise InvalidStreamError unless state[:done] && state[:completed]
+              # The buffered error path raises in RubyLLM before this point; a
+              # buffered success on a streaming request never produced chunks.
+              raise InvalidStreamError unless state[:json_buffered_error]
+            else
+              raise InvalidStreamError unless state[:done] && state[:completed]
+            end
+          rescue InvalidStreamError
+            publish_recovered_tool_calls(state)
+            raise
           end
 
           publish_recovered_tool_calls(state)
+          raise MalformedToolCallError if state[:malformed_tool_call_envelope]
         end
     end
   end

@@ -851,6 +851,170 @@ class AssistantTest < ActiveSupport::TestCase
     refute_match(/not-json-payload/, @chat.error)
   end
 
+  test "audits a structurally malformed tool-call envelope before failing safely" do
+    McpTools::GetAccounts.expects(:call).never
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        raw_tool_call_chunk([
+          {
+            "index" => 0,
+            "id" => "call_structural",
+            "type" => "function",
+            "function" => "SECRET_STRUCTURAL_PAYLOAD"
+          }
+        ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      )
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audit = owner.tool_calls.sole
+    assert_equal "call_structural", audit.provider_call_id
+    assert_equal "unknown_tool", audit.function_name
+    assert_includes audit.function_arguments.to_s, "SECRET_STRUCTURAL_PAYLOAD"
+    assert_match(/structurally malformed tool call/, audit.function_result.fetch("error"))
+
+    # Raw model payload survives only in audit storage.
+    assert_match(/structurally malformed tool call/, @chat.reload.error)
+    refute_match(/SECRET_STRUCTURAL_PAYLOAD/, @chat.error)
+  end
+
+  test "audits observed tool calls when the same chunk later fails stream validation" do
+    McpTools::GetAccounts.expects(:call).never
+
+    tool_event = raw_tool_call_chunk([
+      {
+        "index" => 0,
+        "id" => "call_bad_shape",
+        "type" => "function",
+        "function" => "SECRET_TRANSPORT_PAYLOAD"
+      },
+      {
+        "index" => 1,
+        "id" => "call_other",
+        "type" => "function",
+        "function" => { "name" => "get_accounts", "arguments" => "{}" }
+      }
+    ])
+    body = [
+      "data: #{tool_event.to_json}\n\n",
+      "data: {bad\n\n"
+    ].join
+
+    stub_live_catalog_admission
+    stub_openai_stream(body)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal %w[call_bad_shape call_other], audits.map(&:provider_call_id)
+    assert_equal %w[unknown_tool get_accounts], audits.map(&:function_name)
+    assert audits.all? do |audit|
+      audit.function_result.fetch("error").include?("not executed")
+    end
+
+    assert_match(/stream was malformed or incomplete/i, @chat.reload.error)
+    refute_match(/SECRET_TRANSPORT_PAYLOAD/, @chat.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "does not duplicate an earlier completed audit when a later stream batch aborts validation" do
+    account = create_family_account("Bound family checking", 5123.45)
+
+    first = sse_body(
+      tool_call_chunk([ { id: "call_round_one", name: "get_accounts", arguments: "{}" } ]),
+      finish_chunk("tool_calls"),
+      "[DONE]"
+    )
+    second_tool_event = raw_tool_call_chunk([
+      {
+        "index" => 0,
+        "id" => "call_round_two",
+        "type" => "function",
+        "function" => { "name" => "get_accounts", "arguments" => "{}" }
+      }
+    ])
+    second = [
+      "data: #{second_tool_event.to_json}\n\n",
+      "data: {bad\n\n"
+    ].join
+
+    stub_live_catalog_admission
+    stub_openai_stream(first, second)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 2
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal %w[call_round_one call_round_two], audits.map(&:provider_call_id)
+    assert_equal 2, audits.map(&:provider_call_id).uniq.size
+
+    completed = audits.first.function_result
+    assert_includes completed.fetch("accounts").map { |entry| entry["name"] }, account.name
+    assert_match(/stream was malformed or incomplete/i, audits.last.function_result.fetch("error"))
+    assert_match(/stream was malformed or incomplete/i, @chat.reload.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "audits every identifiable call in a malformed batch beyond thirty-two" do
+    McpTools::GetAccounts.expects(:call).never
+
+    calls = Array.new(33) do |index|
+      { id: "call_overflow_#{index}", name: "get_accounts", arguments: '{"broken":' }
+    end
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(tool_call_chunk(calls), finish_chunk("tool_calls"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal 33, audits.size
+    assert_equal calls.map { |call| call[:id] }, audits.map(&:provider_call_id)
+    assert_equal "call_overflow_32", audits.last.provider_call_id
+    assert audits.all? { |audit| audit.function_result.fetch("error").include?("malformed arguments") }
+  end
+
   test "audits every call in an over-budget batch and rejects the whole batch before execution" do
     McpTools::GetAccounts.expects(:call).never
 
@@ -1119,6 +1283,14 @@ class AssistantTest < ActiveSupport::TestCase
 
       {
         "id" => "chatcmpl-tool-#{SecureRandom.hex(4)}",
+        "object" => "chat.completion.chunk",
+        "choices" => [ { "index" => 0, "delta" => { "tool_calls" => tool_calls }, "finish_reason" => nil } ]
+      }
+    end
+
+    def raw_tool_call_chunk(tool_calls)
+      {
+        "id" => "chatcmpl-raw-tool-#{SecureRandom.hex(4)}",
         "object" => "chat.completion.chunk",
         "choices" => [ { "index" => 0, "delta" => { "tool_calls" => tool_calls }, "finish_reason" => nil } ]
       }

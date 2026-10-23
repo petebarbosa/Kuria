@@ -154,6 +154,10 @@ At minimum you will need to set the following environment variables:
 | `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path.                   |
 | `SMTP_*`                      | Mail delivery configuration (optional).                                                                                                      |
 
+### Implemented assistant capability
+
+- **#11:** The RubyLLM assistant reads the authenticated Family's accounts through the direct, read-only `get_accounts` tool. The server binds the Family; the model cannot select or supply a family id. Attempted calls are audited before execution.
+
 ### Known capability gaps (deferred)
 
 The RubyLLM-only cutover is **not complete**. The capabilities below are explicitly deferred to their tracked issues and are **not** claimed as working parity with the former OpenCode Server path:
@@ -161,7 +165,6 @@ The RubyLLM-only cutover is **not complete**. The capabilities below are explici
 | Issue | Deferred capability                                                         |
 | ----- | --------------------------------------------------------------------------- |
 | #10   | Guarantee ordered RubyLLM streaming and reload parity                       |
-| #11   | Read Family accounts through an audited direct tool                         |
 | #12   | Reconstruct three-turn conversations from persisted history                 |
 | #13   | Propose a Transaction without mutating financial data                       |
 | #14   | Confirm a proposed Transaction exactly once                                 |

@@ -23,6 +23,8 @@ class Provider::RubyLlm < Provider
   # (the caller's persistence callback), never in these messages or logs.
   TOOL_CALL_BUDGET_EXCEEDED_ERROR = "Tool call was not executed because the response exceeded the tool-call limit.".freeze
   MALFORMED_TOOL_CALL_ARGUMENTS_ERROR = "Tool call was not executed because the model returned malformed arguments.".freeze
+  MALFORMED_TOOL_CALL_ENVELOPE_ERROR = "Tool call was not executed because the model returned a structurally malformed tool call.".freeze
+  INVALID_STREAM_TOOL_CALL_ERROR = "Tool call was not executed because the model stream was malformed or incomplete.".freeze
   NON_OBJECT_TOOL_ARGUMENTS_ERROR = "Tool call was not executed because the model returned arguments that are not a JSON object.".freeze
 
   # Adapter-local bounded execution (#16). RubyLLM 2.1.1 defaults are
@@ -290,10 +292,11 @@ class Provider::RubyLlm < Provider
     end
 
     # Recovers the raw tool-call fragments the request-local StreamingAdapter
-    # observed when RubyLLM aborts on malformed arguments before producing a
-    # message (and therefore before any after_message hook). All calls in the
-    # rejected batch are audited as not executed, then the safe provider error
-    # is raised without the raw payload.
+    # observed when RubyLLM aborts before producing a message (and therefore
+    # before any after_message hook), either on malformed JSON arguments or on
+    # a structurally malformed envelope. All calls in the rejected batch are
+    # audited as not executed, then the safe provider error is raised without
+    # the raw payload.
     def with_recovered_tool_calls(model, audit_callback, state)
       recovered = []
 
@@ -303,9 +306,25 @@ class Provider::RubyLlm < Provider
     rescue RubyLLM::ToolCallParseError
       audit_recovered_tool_calls(recovered, audit_callback, state)
       raise Error, "RubyLLM returned malformed tool call arguments for model '#{model}'."
+    rescue StreamingAdapter::MalformedToolCallError
+      audit_recovered_tool_calls(
+        recovered,
+        audit_callback,
+        state,
+        error: MALFORMED_TOOL_CALL_ENVELOPE_ERROR
+      )
+      raise Error, "RubyLLM returned a structurally malformed tool call for model '#{model}'."
+    rescue StreamingAdapter::InvalidStreamError
+      audit_recovered_tool_calls(
+        recovered,
+        audit_callback,
+        state,
+        error: INVALID_STREAM_TOOL_CALL_ERROR
+      )
+      raise
     end
 
-    def audit_recovered_tool_calls(recovered, audit_callback, state)
+    def audit_recovered_tool_calls(recovered, audit_callback, state, error: MALFORMED_TOOL_CALL_ARGUMENTS_ERROR)
       return if audit_callback.nil?
       # A completed, parsed tool round increments the round counter and also
       # published its fragments. Only a batch beyond the parsed rounds belongs
@@ -328,7 +347,7 @@ class Provider::RubyLlm < Provider
 
       audit_callback.call(
         type: :tool_calls, round: round, calls: entries,
-        status: :not_executed, error: MALFORMED_TOOL_CALL_ARGUMENTS_ERROR
+        status: :not_executed, error: error
       )
     end
 
