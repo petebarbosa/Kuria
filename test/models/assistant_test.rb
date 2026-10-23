@@ -7,8 +7,8 @@ class AssistantTest < ActiveSupport::TestCase
   # RubyLLM path never calls a live model API.
   class FakeConfig
     attr_reader :openai_api_key, :openai_api_base
-    attr_accessor :request_timeout, :max_retries, :retry_interval,
-      :retry_backoff_factor, :retry_interval_randomness
+    attr_accessor :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
+      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -524,6 +524,41 @@ class AssistantTest < ActiveSupport::TestCase
     # message last again.
     assert_predicate reloaded, :needs_assistant_response?,
       "a failed streaming attempt must not block the retry gate"
+  end
+
+  test "removes the partial and records the provider error when the removal broadcast fails" do
+    past_answer = @chat.messages.create!(
+      type: "AssistantMessage",
+      content: "Earlier answer",
+      ai_model: "openai/gpt-4o",
+      created_at: @message.created_at - 1.hour
+    )
+
+    error = RubyLLM::ServerError.new("provider exploded mid-stream")
+    provider = RaisingStreamProvider.new(
+      error,
+      chunks: [ provider_text_chunk("Partial "), provider_text_chunk("answer") ]
+    )
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(provider)
+    AssistantMessage.any_instance.stubs(:broadcast_remove_to).raises(StandardError, "stream unavailable")
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    assert_equal 1, thinking_indicator_removes(streams).size
+
+    # The persisted row is the source of truth: a failed removal broadcast must
+    # not leave this attempt's partial behind, and historical replies stay.
+    reloaded = Chat.find(@chat.id)
+    assert_equal [ past_answer.id ], reloaded.messages.where(type: "AssistantMessage").order(:id).pluck(:id)
+    assert_predicate reloaded, :needs_assistant_response?,
+      "a failed removal broadcast must not block the retry gate"
+
+    # The original provider failure is recorded, not the broadcast failure.
+    assert_equal error.to_json, reloaded.error
   end
 
   test "persists nothing when the provider raises before streaming any content" do

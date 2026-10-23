@@ -116,7 +116,16 @@ class Assistant
     def discard_attempted_assistant_message!(assistant_message, finalized:)
       return if finalized || !assistant_message&.persisted?
 
-      assistant_message.broadcast_remove_to chat
+      # The removal broadcast is a best-effort UI update: the persisted row is
+      # the source of truth, so a broadcast failure must neither keep the
+      # partial message in the chat nor mask the provider error this attempt is
+      # already handling.
+      begin
+        assistant_message.broadcast_remove_to chat
+      rescue => e
+        Rails.logger.warn("Assistant message remove broadcast failed: #{e.class}")
+      end
+
       assistant_message.destroy!
     end
 
