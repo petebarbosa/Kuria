@@ -38,12 +38,15 @@ class Assistant
       stop_thinking
     end
 
+    audit_records = {}
+    assistant_message = nil
     llm = get_model_provider(message.ai_model)
 
     assistant_message = AssistantMessage.new(
       chat: chat,
       content: "",
-      ai_model: message.ai_model
+      ai_model: message.ai_model,
+      status: :pending
     )
 
     streamer = proc do |chunk|
@@ -59,13 +62,22 @@ class Assistant
     # later chat-level persistence step fails.
     finalized = false
 
-    response = llm.chat_response(
-      message.content,
+    provider_options = {
       model: message.ai_model,
       instructions: instructions,
       streamer: streamer,
       previous_response_id: legacy_opencode_session_id(llm)
-    )
+    }
+
+    # Tool binding and audit persistence are RubyLLM-only. The legacy
+    # provider keeps its existing call contract, and the family always comes
+    # from the chat's authenticated user, never from the model or Current.
+    if llm.is_a?(Provider::RubyLlm)
+      provider_options[:tool] = Provider::RubyLlm::FinancialTool::GetAccounts.new(chat.user.family)
+      provider_options[:audit_callback] = audit_callback_for(assistant_message, audit_records)
+    end
+
+    response = llm.chat_response(message.content, **provider_options)
 
     unless response.success?
       raise response.error
@@ -81,16 +93,76 @@ class Assistant
     stop_thinking_once.call
     finalize_assistant_message(assistant_message, completed)
     finalized = true
+    close_outstanding_audit_records!(audit_records, fallback: NOT_EXECUTED_TOOL_RESULT)
     persist_provider_response!(completed, provider: llm)
 
     completed
   rescue => e
     stop_thinking_once.call
-    discard_attempted_assistant_message!(assistant_message, finalized: finalized)
+    fail_or_discard_attempted_assistant_message!(
+      assistant_message,
+      finalized: finalized,
+      audit_records: audit_records
+    )
     chat.add_error(e)
   end
 
   private
+    PENDING_TOOL_RESULT = { "status" => "pending" }.freeze
+    NOT_EXECUTED_TOOL_RESULT = { "error" => "Tool call was not executed." }.freeze
+    INTERRUPTED_TOOL_RESULT = {
+      "error" => "Tool execution outcome is unknown because the response was interrupted."
+    }.freeze
+    MAX_AUDIT_RESULT_BYTES = 100 * 1024
+
+    # Persists the single audit owner for this attempt before any tool runs,
+    # and records each provider tool event against it. Tool calls receive a
+    # round-local identity (the provider call id can repeat across rounds) and
+    # keep their actual provider id separately. Raw malformed arguments are
+    # accepted only into `function_arguments`, never into errors or logs.
+    def audit_callback_for(assistant_message, audit_records)
+      proc do |event|
+        case event[:type]
+        when :tool_calls
+          assistant_message.save! unless assistant_message.persisted?
+          Array(event[:calls]).each do |call|
+            audit_records[call[:identity]] = ToolCall::Function.create!(
+              message: assistant_message,
+              provider_id: call[:identity],
+              provider_call_id: call[:provider_call_id],
+              function_name: call[:function_name].presence || "unknown_tool",
+              function_arguments: call[:arguments],
+              function_result: audit_tool_result_for(event)
+            )
+          end
+        when :tool_result
+          record = audit_records[event[:identity]]
+          next if record.nil?
+
+          record.update!(function_result: normalize_audit_result(event[:result]))
+        end
+      end
+    end
+
+    def audit_tool_result_for(event)
+      return PENDING_TOOL_RESULT unless event[:status] == :not_executed
+
+      { "error" => event[:error].presence || NOT_EXECUTED_TOOL_RESULT["error"] }
+    end
+
+    def normalize_audit_result(result)
+      text = result.to_s
+      return { "error" => "Tool result too large to audit." } if text.bytesize > MAX_AUDIT_RESULT_BYTES
+
+      parsed = JSON.parse(text)
+      return parsed if parsed.is_a?(Hash) && parsed.present?
+      return { "value" => parsed } if parsed.present?
+
+      { "raw" => text }
+    rescue JSON::ParserError
+      { "raw" => text }
+    end
+
     # Completes the single AssistantMessage from the finished provider response:
     # content and the provider response id are taken from the completed message,
     # never from a partial streaming chunk.
@@ -100,6 +172,50 @@ class Assistant
       assistant_message.provider_id = completed.id if completed_id(completed).present?
       assistant_message.status = :complete
       assistant_message.save!
+    end
+
+    # A failed attempt with durable tool audits keeps its hidden audit owner so
+    # the calls and their outcomes survive for retry/diagnostics. Any partial
+    # visible content is removed from the stream and cleared, outstanding calls
+    # are closed with the interrupted/unknown outcome, and the owner is marked
+    # failed (invisible). Attempts that never audited a call keep the original
+    # destroy semantics.
+    def fail_or_discard_attempted_assistant_message!(assistant_message, finalized:, audit_records:)
+      return if finalized || !assistant_message&.persisted?
+
+      if audit_records.any?
+        fail_audited_attempt!(assistant_message, audit_records)
+      else
+        discard_attempted_assistant_message!(assistant_message, finalized: false)
+      end
+    end
+
+    def fail_audited_attempt!(assistant_message, audit_records)
+      if assistant_message.content.present?
+        begin
+          assistant_message.broadcast_remove_to chat
+        rescue => e
+          Rails.logger.warn("Assistant audit message remove broadcast failed: #{e.class}")
+        end
+      end
+
+      close_outstanding_audit_records!(audit_records, fallback: INTERRUPTED_TOOL_RESULT)
+      assistant_message.update!(content: "", status: :failed)
+    end
+
+    # A successful response can still leave a call without a result when the
+    # provider never dispatched it (for example, a call id already answered in
+    # an earlier round). Close those audits as not executed rather than leaving
+    # a misleading pending record. Failure cleanup passes the interrupted
+    # outcome instead, because execution may already have happened before the
+    # provider failed and its result could not be recorded.
+    def close_outstanding_audit_records!(audit_records, fallback:)
+      audit_records.each_value do |record|
+        next unless record.persisted?
+        next unless record.function_result == PENDING_TOOL_RESULT
+
+        record.update!(function_result: fallback)
+      end
     end
 
     # A provider failure after partial chunks were streamed leaves this

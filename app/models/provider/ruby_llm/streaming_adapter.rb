@@ -20,6 +20,25 @@ class Provider
     class StreamingAdapter < Faraday::Adapter::NetHttp
       INVALID_STREAM_MESSAGE = "The model stream was malformed or incomplete.".freeze
       MAX_JSON_BODY_BYTES = 1024 * 1024
+      MAX_RECOVERED_TOOL_CALLS = 32
+      MAX_TOOL_CALL_IDENTIFIER_BYTES = 256
+      MAX_TOOL_CALL_ARGUMENT_BYTES = 64 * 1024
+
+      # Request-local recovery sink for raw streamed tool-call fragments. The
+      # adapter instance/connection is shared across contexts and threads, so
+      # the sink is threaded through isolated execution state only for the
+      # duration of one request and never stored on the adapter.
+      TOOL_CALL_COLLECTOR_KEY = :kuria_ruby_llm_tool_call_collector
+
+      class << self
+        def collect_tool_calls(collector)
+          previous = Thread.current[TOOL_CALL_COLLECTOR_KEY]
+          Thread.current[TOOL_CALL_COLLECTOR_KEY] = collector
+          yield
+        ensure
+          Thread.current[TOOL_CALL_COLLECTOR_KEY] = previous
+        end
+      end
 
       # Raised from inside the adapter's on_data callback when a 200 response
       # is not a valid, complete Chat Completions stream. The message is fixed
@@ -57,7 +76,8 @@ class Provider
             json_body: +"",
             json_parsed: false,
             done: false,
-            completed: false
+            completed: false,
+            tool_calls: {}
           }
         end
 
@@ -187,9 +207,91 @@ class Provider
           unless tool_calls.nil?
             raise InvalidStreamError unless tool_calls.is_a?(Array)
             raise InvalidStreamError unless tool_calls.all? { |call| call.is_a?(Hash) }
+
+            collect_tool_calls(state, tool_calls)
           end
 
           state[:completed] ||= content_present?(content) || tool_calls.is_a?(Array) && tool_calls.any?
+        end
+
+        # Reconstructs the raw tool-call fragments for one response round. The
+        # provider's arguments arrive as string fragments split arbitrarily
+        # across events; ids/names may only arrive on a later fragment. Only
+        # bounded, correctly typed values are retained, and a recovered payload
+        # is never logged or surfaced in user-facing errors.
+        def collect_tool_calls(state, tool_calls)
+          tool_calls.each do |call|
+            key = tool_call_key(call)
+            next if key.nil?
+
+            entry = state[:tool_calls][key]
+            if entry.nil?
+              break if state[:tool_calls].size >= MAX_RECOVERED_TOOL_CALLS
+
+              entry = state[:tool_calls][key] = { id: nil, name: nil, arguments: +"", truncated: false }
+            end
+
+            identifier = call["id"]
+            if identifier.is_a?(String) && identifier.present? && identifier.bytesize <= MAX_TOOL_CALL_IDENTIFIER_BYTES
+              entry[:id] = identifier if entry[:id].blank?
+            end
+
+            function = call["function"]
+            next unless function.is_a?(Hash)
+
+            name = function["name"]
+            if name.is_a?(String) && name.present? && name.bytesize <= MAX_TOOL_CALL_IDENTIFIER_BYTES
+              entry[:name] = name if entry[:name].blank?
+            end
+
+            append_tool_call_arguments(entry, function["arguments"])
+          end
+        end
+
+        def tool_call_key(call)
+          index = call["index"]
+          return "index:#{index}" if index.is_a?(Integer) || index.is_a?(String)
+
+          identifier = call["id"]
+          return "id:#{identifier}" if identifier.is_a?(String) && identifier.present?
+
+          nil
+        end
+
+        def append_tool_call_arguments(entry, fragment)
+          return unless fragment.is_a?(String)
+
+          remaining = MAX_TOOL_CALL_ARGUMENT_BYTES - entry[:arguments].bytesize
+          unless remaining.positive?
+            entry[:truncated] = true
+            return
+          end
+
+          if fragment.bytesize > remaining
+            entry[:truncated] = true
+            fragment = fragment.byteslice(0, remaining)
+          end
+
+          entry[:arguments] << fragment
+        end
+
+        def publish_recovered_tool_calls(state)
+          collector = Thread.current[TOOL_CALL_COLLECTOR_KEY]
+          return if collector.nil? || state[:tool_calls].empty?
+
+          calls = state[:tool_calls].values.filter_map do |entry|
+            next if entry[:id].blank? && entry[:name].blank? && entry[:arguments].empty?
+
+            {
+              id: entry[:id].presence,
+              name: entry[:name].presence,
+              raw_arguments: entry[:arguments],
+              truncated: entry[:truncated]
+            }
+          end
+          return if calls.empty?
+
+          collector << { calls: calls }
         end
 
         def content_present?(content)
@@ -206,6 +308,8 @@ class Provider
           else
             raise InvalidStreamError unless state[:done] && state[:completed]
           end
+
+          publish_recovered_tool_calls(state)
         end
     end
   end

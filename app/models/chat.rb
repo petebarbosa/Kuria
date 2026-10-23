@@ -81,10 +81,12 @@ class Chat < ApplicationRecord
   end
 
   def conversation_messages
+    visible_messages = messages.visible_in_conversation
+
     if debug_mode?
-      messages
+      visible_messages
     else
-      messages.where(type: [ "UserMessage", "AssistantMessage" ])
+      visible_messages.where(type: [ "UserMessage", "AssistantMessage" ])
     end
   end
 

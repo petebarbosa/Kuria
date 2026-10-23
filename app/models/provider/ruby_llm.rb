@@ -15,6 +15,16 @@ class Provider::RubyLlm < Provider
   # over-sized enrichment batch fails closed instead of silently growing.
   MAX_ENRICHMENT_TRANSACTIONS = 25
 
+  # Fixed per-response tool-call budget. A response that requests more calls
+  # than this is audited in full and rejected before any of its calls execute.
+  MAX_TOOL_CALLS_PER_RESPONSE = 5
+
+  # Fixed audit reasons. The raw model payload is kept only in audit storage
+  # (the caller's persistence callback), never in these messages or logs.
+  TOOL_CALL_BUDGET_EXCEEDED_ERROR = "Tool call was not executed because the response exceeded the tool-call limit.".freeze
+  MALFORMED_TOOL_CALL_ARGUMENTS_ERROR = "Tool call was not executed because the model returned malformed arguments.".freeze
+  NON_OBJECT_TOOL_ARGUMENTS_ERROR = "Tool call was not executed because the model returned arguments that are not a JSON object.".freeze
+
   # Adapter-local bounded execution (#16). RubyLLM 2.1.1 defaults are
   # request_timeout: 300, max_retries: 3 (POSTs included), and
   # retry_max_interval: 30. Every per-call context gets an explicit, tighter
@@ -97,7 +107,7 @@ class Provider::RubyLlm < Provider
     Catalog.admits?(model)
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil)
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
       context = ruby_llm_context(reference, streaming: true)
@@ -115,11 +125,20 @@ class Provider::RubyLlm < Provider
       )
       chat = chat.with_instructions(instructions) if instructions.present?
 
-      final_message = chat.ask(prompt) do |chunk|
-        next if streamer.nil?
+      if tool.present?
+        chat = chat.with_tools(tool).with_tool_options(concurrency: false)
+      end
 
-        text = chunk.respond_to?(:content) ? chunk.content : nil
-        streamer.call(ChatStreamChunk.new(type: "output_text", data: text)) if text.present?
+      audit_state = { round: 0, call_count: 0, identity_by_call_id: {} }
+      register_tool_audit_callbacks(chat, audit_callback, audit_state, model) if audit_callback.present?
+
+      final_message = with_recovered_tool_calls(model, audit_callback, audit_state) do
+        chat.ask(prompt) do |chunk|
+          next if streamer.nil?
+
+          text = chunk.respond_to?(:content) ? chunk.content : nil
+          streamer.call(ChatStreamChunk.new(type: "output_text", data: text)) if text.present?
+        end
       end
 
       if empty_completion?(final_message)
@@ -210,6 +229,109 @@ class Provider::RubyLlm < Provider
       @catalog ||= Catalog.new
     end
 
+    # Audits every parsed tool call before RubyLLM dispatches it, and audits
+    # each tool result as it is appended. Registering this on the assistant
+    # message hook is deliberate: in RubyLLM 2.1.1 the hook fires after the
+    # assistant response is parsed but before `run_tools` executes anything.
+    # A persistence (or policy) failure raised from the callback therefore
+    # prevents execution. Tool result messages correlate by their
+    # tool_call_id; `after_tool_result` is not used because it carries no id.
+    def register_tool_audit_callbacks(chat, audit_callback, state, model)
+      chat.after_message do |message|
+        case message.role.to_s
+        when "assistant"
+          next unless message.respond_to?(:tool_call?) && message.tool_call?
+
+          state[:round] += 1
+          round = state[:round]
+          calls = message.tool_calls.values.each_with_index.map do |tool_call, index|
+            {
+              identity: "#{round}:#{index}",
+              provider_call_id: tool_call.id,
+              function_name: tool_call.name.presence || "unknown_tool",
+              arguments: tool_call.arguments
+            }
+          end
+
+          if state[:call_count] + calls.size > MAX_TOOL_CALLS_PER_RESPONSE
+            audit_callback.call(
+              type: :tool_calls, round: round, calls: calls,
+              status: :not_executed, error: TOOL_CALL_BUDGET_EXCEEDED_ERROR
+            )
+            raise Error, "RubyLLM response for model '#{model}' exceeded the tool-call limit of #{MAX_TOOL_CALLS_PER_RESPONSE}."
+          end
+
+          state[:call_count] += calls.size
+          valid_arguments = calls.all? { |call| call[:arguments].is_a?(Hash) }
+
+          audit_callback.call(
+            type: :tool_calls, round: round, calls: calls,
+            status: valid_arguments ? :pending : :not_executed,
+            error: valid_arguments ? nil : NON_OBJECT_TOOL_ARGUMENTS_ERROR
+          )
+
+          unless valid_arguments
+            raise Error, "RubyLLM response for model '#{model}' returned tool arguments that are not a JSON object."
+          end
+
+          state[:identity_by_call_id] = calls.each_with_object({}) do |call, identities|
+            identities[call[:provider_call_id]] = call[:identity] if call[:provider_call_id].present?
+          end
+        when "tool"
+          identity = state[:identity_by_call_id][message.tool_call_id]
+          next if identity.nil?
+
+          audit_callback.call(
+            type: :tool_result, round: state[:round], identity: identity,
+            result: message.content.to_s
+          )
+        end
+      end
+    end
+
+    # Recovers the raw tool-call fragments the request-local StreamingAdapter
+    # observed when RubyLLM aborts on malformed arguments before producing a
+    # message (and therefore before any after_message hook). All calls in the
+    # rejected batch are audited as not executed, then the safe provider error
+    # is raised without the raw payload.
+    def with_recovered_tool_calls(model, audit_callback, state)
+      recovered = []
+
+      StreamingAdapter.collect_tool_calls(recovered) do
+        yield
+      end
+    rescue RubyLLM::ToolCallParseError
+      audit_recovered_tool_calls(recovered, audit_callback, state)
+      raise Error, "RubyLLM returned malformed tool call arguments for model '#{model}'."
+    end
+
+    def audit_recovered_tool_calls(recovered, audit_callback, state)
+      return if audit_callback.nil?
+      # A completed, parsed tool round increments the round counter and also
+      # published its fragments. Only a batch beyond the parsed rounds belongs
+      # to the malformed response that never reached after_message.
+      return unless recovered.size > state[:round]
+
+      batch = recovered.last
+      calls = batch.is_a?(Hash) ? Array(batch[:calls]) : []
+      return if calls.empty?
+
+      round = state[:round] + 1
+      entries = calls.each_with_index.map do |call, index|
+        {
+          identity: "#{round}:#{index}",
+          provider_call_id: call[:id].presence,
+          function_name: call[:name].presence || "unknown_tool",
+          arguments: call[:raw_arguments].to_s
+        }
+      end
+
+      audit_callback.call(
+        type: :tool_calls, round: round, calls: entries,
+        status: :not_executed, error: MALFORMED_TOOL_CALL_ARGUMENTS_ERROR
+      )
+    end
+
     # Isolated per-call RubyLLM context carrying the resolved account's key and
     # API base plus the adapter-local bounded execution budget. The per-call
     # context duplicates the global configuration, which may carry OpenAI
@@ -222,6 +344,10 @@ class Provider::RubyLlm < Provider
         config.openai_api_base = reference[:api_base]
 
         config.faraday_adapter = StreamingAdapter
+        # Disable RubyLLM instrumentation only on this copied request context:
+        # tool events carry arguments/results and Rails' global instrumenter
+        # forwards them to framework subscribers. The global config is untouched.
+        config.instrumenter = nil
         config.request_timeout = REQUEST_TIMEOUT_SECONDS
         config.max_retries = streaming ? STREAMING_MAX_RETRIES : NON_STREAMING_MAX_RETRIES
         config.retry_interval = RETRY_INTERVAL_SECONDS

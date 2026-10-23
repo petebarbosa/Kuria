@@ -3,12 +3,14 @@ require "test_helper"
 class AssistantTest < ActiveSupport::TestCase
   include ProviderTestHelper
 
+  OPENAI_CHAT_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+
   # Deterministic stand-ins for the RubyLLM gem boundary so the end-to-end
   # RubyLLM path never calls a live model API.
   class FakeConfig
     attr_reader :openai_api_key, :openai_api_base
     attr_accessor :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
-      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter
+      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter, :instrumenter
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -43,7 +45,7 @@ class AssistantTest < ActiveSupport::TestCase
   end
 
   class FakeChat
-    attr_reader :prompt, :instructions
+    attr_reader :prompt, :instructions, :tools, :tool_options
 
     def initialize(final_message:, chunks: [])
       @final_message = final_message
@@ -52,6 +54,21 @@ class AssistantTest < ActiveSupport::TestCase
 
     def with_instructions(instructions)
       @instructions = instructions
+      self
+    end
+
+    def with_tools(*tools)
+      @tools = tools.flatten
+      self
+    end
+
+    def with_tool_options(**options)
+      @tool_options = options
+      self
+    end
+
+    def after_message(&block)
+      (@after_message_callbacks ||= []) << block
       self
     end
 
@@ -601,7 +618,547 @@ class AssistantTest < ActiveSupport::TestCase
     assert_equal "msg_final", persisted.provider_id
   end
 
+  test "RubyLLM instructions bind the read-only accounts tool directly without model family selection" do
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(content_chunk("Hello."), finish_chunk("stop"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+
+    developer_content = nil
+    assert_requested(:post, OPENAI_CHAT_URL) do |request|
+      developer_content = JSON.parse(request.body).fetch("messages")
+        .find { |message| message["role"] == "developer" }
+        &.fetch("content")
+      true
+    end
+
+    assert_includes developer_content, "get_accounts"
+    assert_match(/read-only/i, developer_content)
+    assert_match(/authenticated/i, developer_content)
+    assert_match(/(?:never|must not|do not).*family_id/im, developer_content)
+    refute_match(/family_id is:/i, developer_content)
+    refute_includes developer_content, @chat.user.family.id
+  end
+
+  # --- tool-call audit and recovery (phase 3) -----------------------------
+
+  test "audits the bound family's get_accounts call before dispatch and persists one final streamed reply" do
+    account = create_family_account("Bound family checking", 5123.45)
+    other_account = create_other_family_account("Other family secret account", 987_654.32)
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_accounts", name: "get_accounts", arguments: "{}" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      sse_body(
+        content_chunk("Your accounts are available."),
+        finish_chunk("stop"),
+        "[DONE]"
+      )
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "complete", owner.status
+    assert_equal "Your accounts are available.", owner.content
+
+    audit = owner.tool_calls.sole
+    assert_equal "1:0", audit.provider_id
+    assert_equal "call_accounts", audit.provider_call_id
+    assert_equal "get_accounts", audit.function_name
+    assert_equal({}, audit.function_arguments)
+    assert_includes audit.function_result.fetch("accounts").map { |entry| entry["name"] }, account.name
+    refute_includes audit.function_result.fetch("accounts").map { |entry| entry["name"] }, other_account.name
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 2
+    assert_requested(:post, OPENAI_CHAT_URL) do |request|
+      tool_messages = JSON.parse(request.body).fetch("messages").select { |message| message["role"] == "tool" }
+
+      tool_messages.any? &&
+        tool_messages.all? { |message| message["content"].include?(account.name) && !message["content"].include?(other_account.name) }
+    end
+  end
+
+  test "rejects and audits a model-supplied family_id without querying accounts or leaking another family" do
+    McpTools::GetAccounts.expects(:call).never
+    other_account = create_other_family_account("Other family secret account", 987_654.32)
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_family", name: "get_accounts", arguments: '{"family_id":1}' } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      sse_body(content_chunk("I could not access those accounts."), finish_chunk("stop"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+    audit = @chat.messages.where(type: "AssistantMessage").sole.tool_calls.sole
+    assert_equal({ "family_id" => 1 }, audit.function_arguments)
+    assert_equal "Account access is restricted to the authenticated family.", audit.function_result.fetch("error")
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 2
+    assert_requested(:post, OPENAI_CHAT_URL) do |request|
+      tool_message = JSON.parse(request.body).fetch("messages").find { |message| message["role"] == "tool" }
+
+      tool_message && !tool_message["content"].include?(other_account.name)
+    end
+  end
+
+  test "audits unexpected tool arguments as a fixed failure without executing a query" do
+    McpTools::GetAccounts.expects(:call).never
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_extra", name: "get_accounts", arguments: '{"account_id":"anything"}' } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      sse_body(content_chunk("That request was invalid."), finish_chunk("stop"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+    audit = @chat.messages.where(type: "AssistantMessage").sole.tool_calls.sole
+    assert_equal({ "account_id" => "anything" }, audit.function_arguments)
+    assert_equal "Invalid tool arguments.", audit.function_result.fetch("error")
+  end
+
+  test "audits an unknown tool and continues with its safe error result" do
+    McpTools::GetAccounts.expects(:call).never
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_unknown", name: "get_accountz", arguments: "{}" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      sse_body(content_chunk("That tool is unavailable."), finish_chunk("stop"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+    audit = @chat.messages.where(type: "AssistantMessage").sole.tool_calls.sole
+    assert_equal "get_accountz", audit.function_name
+    assert_match(/unavailable tool/, audit.function_result.fetch("error"))
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 2
+    assert_requested(:post, OPENAI_CHAT_URL) do |request|
+      JSON.parse(request.body).fetch("messages").any? do |message|
+        message["role"] == "tool" && message["content"].include?("unavailable tool")
+      end
+    end
+  end
+
+  test "rejects valid non-object tool arguments safely after auditing the call" do
+    McpTools::GetAccounts.expects(:call).never
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_array", name: "get_accounts", arguments: "[]" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      )
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audit = owner.tool_calls.sole
+    assert_equal [], audit.function_arguments
+    assert_equal "Tool call was not executed because the model returned arguments that are not a JSON object.",
+      audit.function_result.fetch("error")
+    assert_match(/not a JSON object/, @chat.reload.error)
+  end
+
+  test "recovers every malformed tool call in a rejected batch, audits raw arguments, and never executes" do
+    McpTools::GetAccounts.expects(:call).never
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([
+          { id: "call_a", name: "get_accounts", arguments: '{"SECRET_RAW_ARGUMENT":' },
+          { id: "call_b", name: "get_accounts", arguments: "not-json" }
+        ]),
+        tool_call_chunk([
+          { arguments: "}" },
+          { arguments: "-payload" }
+        ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      )
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal %w[call_a call_b], audits.map(&:provider_call_id)
+    assert_equal %w[1:0 1:1], audits.map(&:provider_id)
+    assert_equal %w[get_accounts get_accounts], audits.map(&:function_name)
+    assert_equal '{"SECRET_RAW_ARGUMENT":}', audits.first.function_arguments
+    assert_equal "not-json-payload", audits.last.function_arguments
+    assert audits.all? { |audit| audit.function_result.fetch("error").include?("malformed arguments") }
+
+    # The raw model payload survives only in audit storage, never in the error.
+    assert_match(/malformed tool call arguments/, @chat.reload.error)
+    refute_match(/SECRET_RAW_ARGUMENT/, @chat.error)
+    refute_match(/not-json-payload/, @chat.error)
+  end
+
+  test "audits every call in an over-budget batch and rejects the whole batch before execution" do
+    McpTools::GetAccounts.expects(:call).never
+
+    calls = Array.new(Provider::RubyLlm::MAX_TOOL_CALLS_PER_RESPONSE + 1) do |index|
+      { id: "call_#{index}", name: "get_accounts", arguments: "{}" }
+    end
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(tool_call_chunk(calls), finish_chunk("tool_calls"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal calls.size, audits.size
+    assert audits.all? { |audit| audit.function_result.fetch("error").include?("tool-call limit") }
+    assert_match(/tool-call limit/, @chat.reload.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "enforces the tool-call budget cumulatively across rounds and preserves earlier results" do
+    account = create_family_account("Bound family checking", 5123.45)
+
+    first_calls = Array.new(3) do |index|
+      { id: "call_first_#{index}", name: "get_accounts", arguments: "{}" }
+    end
+    second_calls = Array.new(3) do |index|
+      { id: "call_second_#{index}", name: "get_accounts", arguments: "{}" }
+    end
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(tool_call_chunk(first_calls), finish_chunk("tool_calls"), "[DONE]"),
+      sse_body(tool_call_chunk(second_calls), finish_chunk("tool_calls"), "[DONE]"),
+      sse_body(content_chunk("All calls completed."), finish_chunk("stop"), "[DONE]")
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 2
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal 6, audits.size
+    assert audits.first(3).all? { |audit| audit.function_result.fetch("accounts").any? { |entry| entry["name"] == account.name } }
+    assert audits.last(3).all? { |audit| audit.function_result.fetch("error").include?("tool-call limit") }
+    assert_match(/tool-call limit/, @chat.reload.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "keeps a completed tool audit when the provider fails on the following round" do
+    account = create_family_account("Bound family checking", 5123.45)
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_accounts", name: "get_accounts", arguments: "{}" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      { status: 500, headers: { "Content-Type" => "application/json" }, body: { error: { message: "boom" } }.to_json }
+    )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audit = owner.tool_calls.sole
+    assert_includes audit.function_result.fetch("accounts").map { |entry| entry["name"] }, account.name
+    assert_match(/API error/, @chat.reload.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "removes streamed partial content but keeps the audit owner when a later round fails" do
+    create_family_account("Bound family checking", 5123.45)
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        content_chunk("Partial answer. "),
+        tool_call_chunk([ { id: "call_accounts", name: "get_accounts", arguments: "{}" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      ),
+      { status: 500, headers: { "Content-Type" => "application/json" }, body: { error: { message: "boom" } }.to_json }
+    )
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+    assert_equal 1, owner.tool_calls.count
+
+    removed_targets = streams.select { |stream| stream["action"] == "remove" }.map { |stream| stream["target"].to_s }
+    assert_includes removed_targets, "assistant_message_#{owner.id}"
+    assert_match(/API error/, @chat.reload.error)
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "keeps repeated provider call ids distinct across tool-call rounds" do
+    account = create_family_account("Bound family checking", 5123.45)
+
+    stub_live_catalog_admission
+    first = sse_body(
+      tool_call_chunk([ { id: "call_repeated", name: "get_accounts", arguments: "{}" } ]),
+      finish_chunk("tool_calls"),
+      "[DONE]"
+    )
+    second = sse_body(
+      tool_call_chunk([ { id: "call_repeated", name: "get_accounts", arguments: "{}" } ]),
+      finish_chunk("tool_calls"),
+      "[DONE]"
+    )
+    third = sse_body(content_chunk("Both rounds are audited."), finish_chunk("stop"), "[DONE]")
+    stub_openai_stream(first, second, third)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_nil @chat.reload.error
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "Both rounds are audited.", owner.content
+
+    audits = owner.tool_calls.order(:id)
+    assert_equal %w[1:0 2:0], audits.map(&:provider_id)
+    assert_equal %w[call_repeated call_repeated], audits.map(&:provider_call_id)
+    # RubyLLM treats an id answered in an earlier round as already answered, so
+    # the repeated second call is audited but never dispatched. Its distinct
+    # round-local identity and closed outcome prove the audit does not collide.
+    assert_includes audits.first.function_result.fetch("accounts").map { |entry| entry["name"] }, account.name
+    assert_equal "Tool call was not executed.", audits.last.function_result.fetch("error")
+    assert_requested :post, OPENAI_CHAT_URL, times: 3
+  end
+
+  test "records an interrupted outcome when a tool executes but its result is never audited" do
+    create_family_account("Bound family checking", 5123.45)
+
+    stub_live_catalog_admission
+    stub_openai_stream(
+      sse_body(
+        tool_call_chunk([ { id: "call_interrupted", name: "get_accounts", arguments: "{}" } ]),
+        finish_chunk("tool_calls"),
+        "[DONE]"
+      )
+    )
+
+    Provider::RubyLlm::FinancialTool::GetAccounts.any_instance
+      .expects(:call).once.raises(StandardError, "tool executed then failed before result recording")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @assistant.respond_to(@message)
+    end
+
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+
+    owner = @chat.messages.where(type: "AssistantMessage").sole
+    assert_equal "failed", owner.status
+    assert_equal "", owner.content
+    refute_includes @chat.conversation_messages, owner
+
+    audit = owner.tool_calls.sole
+    outcome = audit.function_result.fetch("error")
+    assert_match(/outcome is unknown|interrupted/i, outcome)
+    refute_match(/was not executed/i, outcome)
+    assert @chat.reload.error.present?
+    assert_predicate @chat.reload, :needs_assistant_response?
+  end
+
+  test "redacts tool-call audit arguments and results from SQL and inspection logs while retaining them in the database" do
+    args_marker = "SYNTHETIC-SQL-ARGUMENT-MARKER"
+    create_result_marker = "SYNTHETIC-SQL-RESULT-MARKER"
+    update_result_marker = "SYNTHETIC-SQL-UPDATE-MARKER"
+
+    output = StringIO.new
+    original_logger = ActiveRecord::Base.logger
+    ActiveRecord::Base.logger = Logger.new(output)
+    ActiveRecord::Base.logger.level = Logger::DEBUG
+
+    begin
+      audit = ToolCall::Function.create!(
+        message: @message,
+        provider_id: "log:1",
+        provider_call_id: "log_call",
+        function_name: "get_accounts",
+        function_arguments: { "marker" => args_marker },
+        function_result: { "marker" => create_result_marker }
+      )
+      audit.update!(function_result: { "marker" => update_result_marker })
+    ensure
+      ActiveRecord::Base.logger = original_logger
+    end
+
+    log = output.string
+    assert_includes log, "INSERT INTO \"tool_calls\""
+    assert_includes log, "UPDATE \"tool_calls\""
+    refute_includes log, args_marker
+    refute_includes log, create_result_marker
+    refute_includes log, update_result_marker
+    assert_includes log, "[FILTERED]"
+
+    audit.reload
+    assert_equal({ "marker" => args_marker }, audit.function_arguments)
+    assert_equal({ "marker" => update_result_marker }, audit.function_result)
+
+    refute_includes audit.inspect, args_marker
+    refute_includes audit.inspect, update_result_marker
+  end
+
   private
+    def stub_openai_stream(*responses)
+      stubbed = responses.map do |response|
+        if response.is_a?(Hash)
+          response
+        else
+          { status: 200, headers: { "Content-Type" => "text/event-stream" }, body: response }
+        end
+      end
+
+      stub_request(:post, OPENAI_CHAT_URL)
+        .with(headers: { "Authorization" => "Bearer test-openai-key" })
+        .to_return(*stubbed)
+    end
+
+    def sse_body(*events)
+      events.map do |event|
+        event == "[DONE]" ? "data: [DONE]\n\n" : "data: #{event.to_json}\n\n"
+      end.join
+    end
+
+    def tool_call_chunk(calls)
+      tool_calls = calls.each_with_index.map do |call, index|
+        {
+          "index" => index,
+          "id" => call[:id],
+          "type" => "function",
+          "function" => { "name" => call[:name], "arguments" => call.fetch(:arguments) }
+        }.compact
+      end
+
+      {
+        "id" => "chatcmpl-tool-#{SecureRandom.hex(4)}",
+        "object" => "chat.completion.chunk",
+        "choices" => [ { "index" => 0, "delta" => { "tool_calls" => tool_calls }, "finish_reason" => nil } ]
+      }
+    end
+
+    def content_chunk(text)
+      {
+        "id" => "chatcmpl-content-#{SecureRandom.hex(4)}",
+        "object" => "chat.completion.chunk",
+        "choices" => [ { "index" => 0, "delta" => { "content" => text }, "finish_reason" => nil } ]
+      }
+    end
+
+    def finish_chunk(reason)
+      {
+        "id" => "chatcmpl-finish-#{SecureRandom.hex(4)}",
+        "object" => "chat.completion.chunk",
+        "choices" => [ { "index" => 0, "delta" => {}, "finish_reason" => reason } ]
+      }
+    end
+
+    def create_family_account(name, balance)
+      @chat.user.family.accounts.create!(
+        name: name,
+        balance: balance,
+        currency: "USD",
+        accountable: Depository.new
+      )
+    end
+
+    def create_other_family_account(name, balance)
+      family = Family.create!(name: "Other family #{SecureRandom.hex(4)}")
+      family.accounts.create!(
+        name: name,
+        balance: balance,
+        currency: "USD",
+        accountable: Depository.new
+      )
+    end
+
     # The visible assistant body of every broadcast, in broadcast order
     # (thinking/remove frames excluded). Text is read from the rendered
     # paragraph without squish or uniq, so duplicate and whitespace-corrupted
