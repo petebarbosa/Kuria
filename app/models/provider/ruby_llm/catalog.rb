@@ -23,6 +23,17 @@ class Provider
     class Catalog
       Error = Class.new(Provider::RubyLlm::Error)
 
+      # Bounded catalog transport. A live model-list lookup is a single bounded
+      # attempt: open/read timeouts are explicit and finite so a slow or hung
+      # endpoint can never hold an admission cycle open indefinitely.
+      #
+      # No Faraday retry middleware is installed on this connection (and no
+      # retry options are passed), so a failed lookup is never repeated behind
+      # the caller's back. Retryability is only reported in the structured error
+      # details for callers that own retry policy.
+      CATALOG_OPEN_TIMEOUT_SECONDS = 5
+      CATALOG_READ_TIMEOUT_SECONDS = 30
+
       ACCOUNTS = {
         openai: {
           display_name: "OpenAI",
@@ -257,7 +268,13 @@ class Provider
             raise Error, "Missing #{config[:credential_source]} for the #{account} model catalog request. Set #{config[:credential_source]} to check live #{account} model availability."
           end
 
-          connection = Faraday.new(url: config[:api_base]) do |f|
+          connection = Faraday.new(
+            url: config[:api_base],
+            request: {
+              open_timeout: CATALOG_OPEN_TIMEOUT_SECONDS,
+              timeout: CATALOG_READ_TIMEOUT_SECONDS
+            }
+          ) do |f|
             f.request :json
             f.response :json
             f.response :raise_error
@@ -269,12 +286,40 @@ class Provider
           entries = body.is_a?(Hash) ? body["data"] : nil
 
           unless entries.is_a?(Array) && entries.all? { |entry| entry.is_a?(Hash) && entry["id"].is_a?(String) && entry["id"].present? }
-            raise Error, "Unexpected model catalog response shape for account '#{account}': expected a JSON object with a 'data' array of models carrying string 'id' values."
+            raise Error.new(
+              "Unexpected model catalog response shape for account '#{account}': expected a JSON object with a 'data' array of models carrying string 'id' values.",
+              details: {
+                provider_reference: account.to_s,
+                account: account,
+                error_class: Error.name,
+                retryable: false,
+                http_status: nil
+              }
+            )
           end
 
           entries
         rescue Faraday::Error => e
-          raise Error, "Model catalog request for account '#{account}' failed: #{e.class.name.split('::').last}."
+          raise Error.new(
+            "Model catalog request for account '#{account}' failed: #{e.class.name.split('::').last}.",
+            details: {
+              provider_reference: account.to_s,
+              account: account,
+              error_class: e.class.name,
+              retryable: retryable_catalog_failure?(e),
+              http_status: e.response_status
+            }
+          )
+        end
+
+        # Transport timeouts/connection failures and provider throttling or
+        # outages are retryable; authentication, malformed payloads, and shape
+        # failures are not. The catalog itself never retries a lookup.
+        def retryable_catalog_failure?(error)
+          return true if error.is_a?(Faraday::TimeoutError) || error.is_a?(Faraday::ConnectionFailed)
+
+          status = error.response_status
+          status == 408 || status == 429 || (500..599).cover?(status)
         end
 
         def shutdown_passed?(entry)

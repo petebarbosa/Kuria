@@ -3,12 +3,13 @@ class Provider
     # Fail-closed normalization and validation for RubyLLM structured-output
     # responses.
     #
-    # RubyLLM parses model JSON into a Hash with string keys when the response
-    # is valid JSON, leaves malformed JSON as a String, and yields nil for a
-    # provider refusal (the SDK drops refusal payloads). Only a Hash can carry
-    # a valid structured result, so anything else raises Provider::RubyLlm::Error
-    # and surfaces as a failed Provider::Response through the caller's
-    # `with_provider_response`.
+    # RubyLLM 2.1 leaves Chat Completions structured output as JSON text in
+    # `Message#content` and exposes the parsed Hash publicly via
+    # `Message#parsed`. Messages that already carry a Hash (existing fake/testing
+    # seams) are accepted as-is; malformed JSON and provider refusals stay
+    # non-Hash and fail closed. Only a Hash can carry a valid structured
+    # result, so anything else raises Provider::RubyLlm::Error and surfaces as a
+    # failed Provider::Response through the caller's `with_provider_response`.
     #
     # Every returned entry is additionally validated for required fields, value
     # types, and permitted (enum) values before a successful response is built:
@@ -23,6 +24,21 @@ class Provider
 
       def content_hash!(final_message, capability)
         content = final_message.respond_to?(:content) ? final_message.content : nil
+
+        # RubyLLM 2.1 leaves Chat Completions structured output as JSON text in
+        # `content`; `Message#parsed` is the public accessor for the Hash.
+        # Malformed JSON raises there and keeps the String below, so the
+        # existing fail-closed message is preserved.
+        if content.is_a?(String) && final_message.respond_to?(:parsed)
+          begin
+            parsed = final_message.parsed
+          rescue JSON::ParserError
+            parsed = nil
+          end
+
+          content = parsed if parsed.is_a?(Hash)
+        end
+
         return content if content.is_a?(Hash)
 
         description = content.nil? ? "an empty response or provider refusal" : "a #{content.class.name}"
