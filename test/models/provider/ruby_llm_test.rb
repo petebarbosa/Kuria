@@ -1,4 +1,5 @@
 require "test_helper"
+require "timeout"
 
 class Provider::RubyLlmTest < ActiveSupport::TestCase
   include ProviderTestHelper
@@ -9,7 +10,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   class FakeConfig
     attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id,
       :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
-      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter
+      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter, :instrumenter
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -53,6 +54,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def faraday_adapter=(value)
       @faraday_adapter = value
+    end
+
+    def instrumenter=(value)
+      @instrumenter = value
     end
   end
 
@@ -112,6 +117,49 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def initialize(content:)
       @content = content
+    end
+  end
+
+  class OverlapBarrier
+    def initialize(expected:)
+      @expected = expected
+      @arrived = Queue.new
+      @released = Queue.new
+    end
+
+    def wait
+      @arrived << true
+      @released.pop
+    end
+
+    def await_arrivals(timeout: 10)
+      Timeout.timeout(timeout) { @expected.times { @arrived.pop } }
+    end
+
+    def release_all
+      @expected.times { @released << true }
+    end
+  end
+
+  class FamilyScopedTestTool < RubyLLM::Tool
+    description "Returns the synthetic marker of the family bound to this tool."
+
+    def self.tool_name
+      "family_scoped_test_tool"
+    end
+
+    def initialize(marker:, barrier: nil)
+      @marker = marker
+      @barrier = barrier
+      super()
+    end
+
+    def execute
+      @barrier&.wait
+      {
+        "family" => @marker,
+        "accounts" => [ { "name" => "ACCOUNT-#{@marker}" } ]
+      }
     end
   end
 
@@ -219,6 +267,60 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     yield
   ensure
     Rails.application.unstub(:credentials)
+  end
+
+  def marker_from_prompt(body, markers)
+    marker = markers.find do |candidate|
+      body.fetch("messages").any? do |message|
+        message["role"] == "user" && message["content"].to_s.include?(candidate)
+      end
+    end
+
+    raise "no synthetic family marker in request" if marker.nil?
+
+    marker
+  end
+
+  # Runs two provider requests in controlled overlap: both first-round HTTP
+  # responses wait at request_barrier, then both tool executions wait at
+  # tool_barrier. Separate provider/tool/callback/streamer instances prove the
+  # request-local paths do not share family state. Each thread gets a private
+  # recorder; the test hangs no longer than the explicit barrier/join timeouts.
+  def run_overlapping_requests(markers, request_barrier:, tool_barrier:, tool_for:)
+    results = {}
+    threads = []
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      begin
+        threads = markers.map do |marker|
+          Thread.new do
+            audits = []
+            chunks = []
+            response = Provider::RubyLlm.new.chat_response(
+              "Question for #{marker}",
+              model: "openai/gpt-5-nano",
+              streamer: ->(chunk) { chunks << chunk },
+              tool: tool_for.call(marker),
+              audit_callback: ->(event) { audits << event }
+            )
+
+            results[marker] = { response: response, audits: audits, chunks: chunks }
+          end
+        end
+
+        request_barrier.await_arrivals
+        request_barrier.release_all
+        tool_barrier.await_arrivals
+        tool_barrier.release_all
+
+        threads.each { |thread| thread.join(10) || flunk("concurrent request thread did not finish") }
+        threads.each(&:value)
+      ensure
+        threads.each { |thread| thread.kill if thread.alive? }
+      end
+    end
+
+    results
   end
 
   test "supports only catalog-admitted openai and opencode_go references" do
@@ -2313,6 +2415,287 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     adapter.call(stream_env(received))
     assert_equal chunks, received
+  end
+
+  test "recovers raw tool-call fragments per response round without retaining request state on the shared adapter" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    rounds = [
+      [
+        sse_event(stream_chunk(tool_calls: [
+          { "index" => 0, "function" => { "arguments" => "{\"family" } }
+        ])),
+        sse_event(stream_chunk(tool_calls: [
+          { "index" => 0, "id" => "call_round_1", "function" => { "name" => "get_accounts", "arguments" => "_id\":1}" } }
+        ])),
+        sse_event(stream_chunk(finish_reason: "tool_calls")),
+        sse_event("[DONE]")
+      ],
+      [
+        sse_event(stream_chunk(tool_calls: [
+          { "index" => 0, "id" => "call_round_2", "function" => { "name" => "get_accounts", "arguments" => "{}" } }
+        ])),
+        sse_event(stream_chunk(finish_reason: "tool_calls")),
+        sse_event("[DONE]")
+      ]
+    ]
+
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      rounds.shift.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    collector = []
+    Provider::RubyLlm::StreamingAdapter.collect_tool_calls(collector) do
+      adapter.call(stream_env([]))
+      adapter.call(stream_env([]))
+    end
+
+    assert_equal 2, collector.size
+    assert_equal(
+      [ { id: "call_round_1", name: "get_accounts", raw_arguments: '{"family_id":1}', truncated: false } ],
+      collector.first.fetch(:calls)
+    )
+    assert_equal(
+      [ { id: "call_round_2", name: "get_accounts", raw_arguments: "{}", truncated: false } ],
+      collector.last.fetch(:calls)
+    )
+  end
+
+  test "audit callback failure prevents tool execution before dispatch" do
+    McpTools::GetAccounts.expects(:call).never
+
+    events = []
+    callback = lambda do |event|
+      events << event
+      raise "audit persistence failed" if event[:type] == :tool_calls
+    end
+
+    body = [
+      sse_event(stream_chunk(tool_calls: [
+        { "index" => 0, "id" => "call_audit", "type" => "function", "function" => { "name" => "get_accounts", "arguments" => "{}" } }
+      ])),
+      sse_event(stream_chunk(finish_reason: "tool_calls")),
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    tool = Provider::RubyLlm::FinancialTool::GetAccounts.new(families(:dylan_family))
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response(
+        "Hello", model: "openai/gpt-5-nano", streamer: proc { },
+        tool: tool, audit_callback: callback
+      )
+    end
+
+    refute @response.success?
+    assert_equal [ :tool_calls ], events.map { |event| event[:type] }
+    # The persistence failure aborts before RubyLLM's tool round, so no second
+    # request is made and the tool is never invoked.
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  test "request-local contexts do not emit RubyLLM instrumentation or tool payloads" do
+    account = families(:dylan_family).accounts.create!(
+      name: "SYNTHETIC-INSTRUMENTATION-ACCOUNT",
+      balance: 1234.56,
+      currency: "USD",
+      accountable: Depository.new
+    )
+
+    first = [
+      sse_event(stream_chunk(tool_calls: [
+        { "index" => 0, "id" => "call_instrument", "type" => "function", "function" => { "name" => "get_accounts", "arguments" => "{}" } }
+      ])),
+      sse_event(stream_chunk(finish_reason: "tool_calls")),
+      sse_event("[DONE]")
+    ].join
+    second = [
+      sse_event(stream_chunk(content: "Accounts retrieved.")),
+      sse_event(stream_chunk(finish_reason: "stop")),
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_request(:post, OPENAI_CHAT_URL)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        { status: 200, headers: { "Content-Type" => "text/event-stream" }, body: first },
+        { status: 200, headers: { "Content-Type" => "text/event-stream" }, body: second }
+      )
+
+    global_instrumenter = RubyLLM.config.instrumenter
+    payloads = []
+    callback = ->(_name, _start, _finish, _id, payload) { payloads << payload }
+
+    ActiveSupport::Notifications.subscribed(callback, /ruby_llm/) do
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        @response = @provider.chat_response(
+          "Hello", model: "openai/gpt-5-nano", streamer: proc { },
+          tool: Provider::RubyLlm::FinancialTool::GetAccounts.new(families(:dylan_family)),
+          audit_callback: proc { }
+        )
+      end
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_empty payloads, "request-local RubyLLM contexts must not publish instrumentation"
+    refute_includes payloads.map(&:inspect).join, account.name
+    assert_same global_instrumenter, RubyLLM.config.instrumenter
+    assert_equal ActiveSupport::Notifications, RubyLLM.config.instrumenter
+  end
+
+  test "keeps simultaneous family-bound requests isolated across streams, tools, audits, and answers" do
+    markers = %w[FAMILY-A FAMILY-B]
+    request_barrier = OverlapBarrier.new(expected: markers.size)
+    tool_barrier = OverlapBarrier.new(expected: markers.size)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_request(:post, OPENAI_CHAT_URL).to_return do |request|
+      body = JSON.parse(request.body)
+      marker = marker_from_prompt(body, markers)
+
+      if body.fetch("messages").any? { |message| message["role"] == "tool" }
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(content: "ANSWER-#{marker}")),
+            sse_event(stream_chunk(finish_reason: "stop")),
+            sse_event("[DONE]")
+          ].join
+        }
+      else
+        request_barrier.wait
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(tool_calls: [
+              { "index" => 0, "id" => "call-#{marker}", "type" => "function",
+                "function" => { "name" => FamilyScopedTestTool.tool_name, "arguments" => "{}" } }
+            ])),
+            sse_event(stream_chunk(finish_reason: "tool_calls")),
+            sse_event("[DONE]")
+          ].join
+        }
+      end
+    end
+
+    results = run_overlapping_requests(
+      markers,
+      request_barrier: request_barrier,
+      tool_barrier: tool_barrier,
+      tool_for: ->(marker) { FamilyScopedTestTool.new(marker: marker, barrier: tool_barrier) }
+    )
+
+    markers.each do |marker|
+      other_marker = (markers - [ marker ]).sole
+      result = results.fetch(marker)
+
+      assert result.fetch(:response).success?, "expected #{marker} to succeed"
+      assert_equal "ANSWER-#{marker}", result.fetch(:response).data.messages.first.output_text
+
+      streamed = result.fetch(:chunks)
+        .select { |chunk| chunk.type == "output_text" }
+        .map(&:data)
+        .join
+      assert_equal "ANSWER-#{marker}", streamed
+      refute_includes streamed, other_marker
+
+      call_event = result.fetch(:audits).find { |event| event[:type] == :tool_calls }
+      result_event = result.fetch(:audits).find { |event| event[:type] == :tool_result }
+      assert_equal "call-#{marker}", call_event.fetch(:calls).sole.fetch(:provider_call_id)
+      refute_includes call_event.inspect, other_marker
+
+      parsed_result = JSON.parse(result_event.fetch(:result))
+      assert_equal marker, parsed_result.fetch("family")
+      assert_equal [ "ACCOUNT-#{marker}" ], parsed_result.fetch("accounts").map { |account| account.fetch("name") }
+      refute_includes result_event.fetch(:result), other_marker
+    end
+  end
+
+  test "isolates malformed fragment recovery in one concurrent request from another family's success" do
+    valid_marker = "FAMILY-VALID"
+    malformed_marker = "FAMILY-MALFORMED"
+    markers = [ valid_marker, malformed_marker ]
+    request_barrier = OverlapBarrier.new(expected: markers.size)
+    tool_barrier = OverlapBarrier.new(expected: 1)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_request(:post, OPENAI_CHAT_URL).to_return do |request|
+      body = JSON.parse(request.body)
+      marker = marker_from_prompt(body, markers)
+
+      if body.fetch("messages").any? { |message| message["role"] == "tool" }
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(content: "ANSWER-#{valid_marker}")),
+            sse_event(stream_chunk(finish_reason: "stop")),
+            sse_event("[DONE]")
+          ].join
+        }
+      elsif marker == malformed_marker
+        request_barrier.wait
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(tool_calls: [
+              { "index" => 0, "id" => "call-#{malformed_marker}", "type" => "function",
+                "function" => { "name" => FamilyScopedTestTool.tool_name,
+                                "arguments" => "{\"family\":\"#{malformed_marker}\"" } }
+            ])),
+            sse_event(stream_chunk(tool_calls: [
+              { "index" => 0, "function" => { "arguments" => "oops}" } }
+            ])),
+            sse_event(stream_chunk(finish_reason: "tool_calls")),
+            sse_event("[DONE]")
+          ].join
+        }
+      else
+        request_barrier.wait
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(tool_calls: [
+              { "index" => 0, "id" => "call-#{valid_marker}", "type" => "function",
+                "function" => { "name" => FamilyScopedTestTool.tool_name, "arguments" => "{}" } }
+            ])),
+            sse_event(stream_chunk(finish_reason: "tool_calls")),
+            sse_event("[DONE]")
+          ].join
+        }
+      end
+    end
+
+    results = run_overlapping_requests(
+      markers,
+      request_barrier: request_barrier,
+      tool_barrier: tool_barrier,
+      tool_for: ->(marker) { FamilyScopedTestTool.new(marker: marker, barrier: marker == valid_marker ? tool_barrier : nil) }
+    )
+
+    valid = results.fetch(valid_marker)
+    assert valid.fetch(:response).success?
+    assert_equal "ANSWER-#{valid_marker}", valid.fetch(:response).data.messages.first.output_text
+    valid_result = valid.fetch(:audits).find { |event| event[:type] == :tool_result }
+    assert_includes valid_result.fetch(:result), "ACCOUNT-#{valid_marker}"
+    refute_includes valid_result.fetch(:result), malformed_marker
+
+    malformed = results.fetch(malformed_marker)
+    refute malformed.fetch(:response).success?
+    malformed_event = malformed.fetch(:audits).sole
+    assert_equal :tool_calls, malformed_event.fetch(:type)
+    assert_equal :not_executed, malformed_event.fetch(:status)
+    assert_equal "call-#{malformed_marker}", malformed_event.fetch(:calls).sole.fetch(:provider_call_id)
+    assert_includes malformed_event.fetch(:calls).sole.fetch(:arguments), malformed_marker
+    refute_includes malformed_event.inspect, valid_marker
   end
 
   # --- malformed/empty provider error events --------------------------------

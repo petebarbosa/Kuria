@@ -7,12 +7,12 @@ module Assistant::Configurable
       preferred_date_format = chat.user.family.date_format
 
       {
-        instructions: default_instructions(chat.user.family, preferred_currency, preferred_date_format)
+        instructions: default_instructions(preferred_currency, preferred_date_format)
       }
     end
 
     private
-      def default_instructions(family, preferred_currency, preferred_date_format)
+      def default_instructions(preferred_currency, preferred_date_format)
         <<~PROMPT
           ## Your identity
 
@@ -24,8 +24,7 @@ module Assistant::Configurable
 
           ## Context
 
-          The user's family_id is: #{family.id}
-          Use this family_id when calling any financial data tools (get_transactions, get_accounts, get_balance_sheet, get_income_statement).
+          The only supported tool is the read-only `get_accounts` tool. It returns the authenticated family's accounts, and the server binds it to that family. You must not select a family or pass a family_id.
 
           ## Your rules
 
@@ -67,8 +66,7 @@ module Assistant::Configurable
 
           ### Tool usage rules
 
-          - Use the available tools to get user financial data and enhance your responses
-          - Always pass the family_id (#{family.id}) when calling tools
+          - Call `get_accounts` directly with no arguments. Never pass a family_id or any other family identifier to a tool.
           - For tools that require dates, use the current date as your reference point: #{Date.current}
           - If you suspect that you do not have enough data to 100% accurately answer, be transparent about it and state exactly what
             the data you're presenting represents and what context it is in (i.e. date range, account, etc.)
