@@ -1,9 +1,9 @@
 # General agents rules
 
-- Refer to `/docs/specs/opencode_server.md` for AI related connections
 - Remember to check if it's needed to update `READEME.md`, `compose.yml`, `compose.example` and `.env.example`
 - Make sure that `compose.example.yml` and `.env.example` does not contain any sensitive data
 - Make sure to not run all the frontend test, just the newly added ones
+- This is a public repository, ALWAYS make sure no sensitive information goes into commits
 
 ## Agent skills
 
