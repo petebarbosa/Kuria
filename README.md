@@ -29,40 +29,55 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 
 ### Requirements
 
-- Ruby 4.0.7 (see `.ruby-version`)
-- Docker (for running dependencies)
-- Bundler (`gem install bundler`)
+- Docker (recommended: runs the full development stack)
+- Ruby 4.0.7 (see `.ruby-version`) and Bundler (`gem install bundler`) only for the host-based workflow
 
-### Infrastructure
+### Development with Docker (recommended)
 
-The app requires the following external services:
+`compose.dev.yml` builds `Dockerfile.dev` and runs the complete development stack:
 
-| Service    | Purpose                                               | Port |
-| ---------- | ----------------------------------------------------- | ---- |
-| PostgreSQL | Primary database                                      | 5432 |
-| Redis      | Action Cable (WebSockets) + Sidekiq (background jobs) | 6379 |
-
-Start the infrastructure with Docker:
-
-```sh
-docker compose -f compose.dev.yml up -d
-```
-
-This starts PostgreSQL and Redis containers. To stop them:
+| Service  | Purpose                               |
+| -------- | ------------------------------------- |
+| `web`    | Rails server on port 3000             |
+| `css`    | Tailwind CSS watcher                  |
+| `worker` | Sidekiq background jobs               |
+| `db`     | PostgreSQL (same image as production) |
+| `redis`  | Redis (same image as production)      |
 
 ```sh
-docker compose -f compose.dev.yml down
+docker compose -f compose.dev.yml up --build
 ```
 
-### Setup
+On the first run, create and migrate the development database from another terminal:
+
+```sh
+docker compose -f compose.dev.yml run --rm web bin/rails db:create db:migrate
+```
+
+The source tree is bind-mounted at `/rails`, so code changes are picked up live. The Compose project is named `kuria-dev`; its containers, network, and volumes are separate from the production stack. `POSTGRES_DB` is forced to `kuria_development` in this file even if `.env` sets a production database.
+
+Stop the stack with:
+
+```sh
+docker compose -f compose.dev.yml down      # keeps the development volumes
+```
+
+If the production stack is already using port 3000, stop it first **without** `-v`/`--volumes` (for example, `docker compose -f compose.yml down`), then start the development stack. Never run `down -v` against production volumes.
+
+### Host-based Rails (optional)
+
+To keep Rails, Tailwind, and Sidekiq on the host while running only PostgreSQL and Redis in Docker:
 
 ```sh
 git clone https://github.com/petebarbosa/kuria.git
 cd kuria
-cp .env.development .env.local   # or create your own .env.local
-bin/setup                         # installs gems, creates DB, runs migrations
-bin/dev                           # starts Rails, Tailwind, and Sidekiq
+cp .env.example .env        # only if .env does not exist; set SECRET_KEY_BASE
+docker compose -f compose.dev.yml up -d db redis
+bin/setup                   # installs gems, creates DB, runs migrations
+bin/dev                     # starts Rails, Tailwind, and Sidekiq on the host
 ```
+
+For this workflow keep `DB_HOST`/`DB_PORT` and `REDIS_URL` pointed at localhost (the dev compose file publishes PostgreSQL and Redis on `127.0.0.1`; use `127.0.0.1` directly if `localhost` resolves to IPv6 first on your machine), and leave `POSTGRES_DB` unset or set it to `kuria_development` so host Rails uses the isolated development database.
 
 `bin/dev` starts three processes concurrently:
 

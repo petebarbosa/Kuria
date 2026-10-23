@@ -1,0 +1,125 @@
+# Development stack. The Compose project name keeps containers, network, and
+# volumes separate from the production stack in compose.yml.
+name: kuria-dev
+
+x-db-env: &db_env
+  POSTGRES_USER: ${POSTGRES_USER:-kuria_user}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kuria_password}
+  # Force the development database even when .env sets POSTGRES_DB for
+  # production. Container environment variables win over dotenv-rails.
+  POSTGRES_DB: kuria_development
+
+x-rails-env: &rails_env
+  <<: *db_env
+  RAILS_ENV: development
+  SELF_HOSTED: "true"
+  RAILS_FORCE_SSL: "false"
+  RAILS_ASSUME_SSL: "false"
+  DB_HOST: db
+  DB_PORT: "5432"
+  REDIS_URL: redis://redis:6379/1
+  CACHE_REDIS_URL: redis://redis:6379/2
+  PORT: "3000"
+  MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+  FREECRYPTO_API_KEY: ${FREECRYPTO_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: kuria-dev-app
+    # Procfile.dev already binds Rails to 0.0.0.0. Run the web process
+    # directly so Foreman does not load .env over the container's DB/Redis
+    # hostnames; the Tailwind watcher runs in the css service.
+    command:
+      ["bundle", "exec", "bin/rails", "server", "-b", "0.0.0.0", "-p", "3000"]
+    volumes:
+      - .:/rails
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    environment:
+      <<: *rails_env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - kuria_dev
+
+  css:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: kuria-dev-app
+    command: ["bundle", "exec", "bin/rails", "tailwindcss:watch[always]"]
+    volumes:
+      - .:/rails
+    restart: unless-stopped
+    environment:
+      <<: *rails_env
+    networks:
+      - kuria_dev
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: kuria-dev-app
+    command: ["bundle", "exec", "sidekiq"]
+    volumes:
+      - .:/rails
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *rails_env
+    networks:
+      - kuria_dev
+
+  db:
+    image: postgres:18.4-trixie
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    environment:
+      <<: *db_env
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kuria_dev
+
+  redis:
+    image: redis:8.8.1-trixie
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kuria_dev
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  kuria_dev:
+    driver: bridge
