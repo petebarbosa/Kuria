@@ -15,6 +15,13 @@
 /config/master.key
 /config/credentials/*.key
 
+# Ignore local development artifacts and secret-bearing fixtures.
+/.slim/
+/.opencode/
+/.worktrees/
+/plaid_test_accounts/
+/test/vcr_cassettes/plaid/
+
 # Ignore all logfiles and tempfiles.
 /log/*
 /tmp/*

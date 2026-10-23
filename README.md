@@ -29,41 +29,55 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 
 ### Requirements
 
-- Ruby 4.0.7 (see `.ruby-version`)
-- Docker (for running dependencies)
-- Bundler (`gem install bundler`)
+- Docker (recommended: runs the full development stack)
+- Ruby 4.0.7 (see `.ruby-version`) and Bundler (`gem install bundler`) only for the host-based workflow
 
-### Infrastructure
+### Development with Docker (recommended)
 
-The app requires the following external services:
+`compose.dev.yml` builds `Dockerfile.dev` and runs the complete development stack:
 
-| Service    | Purpose                                               | Port |
-| ---------- | ----------------------------------------------------- | ---- |
-| PostgreSQL | Primary database                                      | 5432 |
-| Redis      | Action Cable (WebSockets) + Sidekiq (background jobs) | 6379 |
-
-Start the infrastructure with Docker:
-
-```sh
-docker compose -f compose.dev.yml up -d
-```
-
-This starts PostgreSQL and Redis containers. To stop them:
+| Service  | Purpose                               |
+| -------- | ------------------------------------- |
+| `web`    | Rails server on port 3000             |
+| `css`    | Tailwind CSS watcher                  |
+| `worker` | Sidekiq background jobs               |
+| `db`     | PostgreSQL (same image as production) |
+| `redis`  | Redis (same image as production)      |
 
 ```sh
-docker compose -f compose.dev.yml down
+docker compose -f compose.dev.yml up --build
 ```
 
-### Setup
+On the first run, create and migrate the development database from another terminal:
 
 ```sh
-git clone https://github.com/petebarbosa/maybe.git
-cd maybe
-cp .env.development .env.local   # or create your own .env.local
-bin/setup                         # installs gems, creates DB, runs migrations
-bin/rails opencode:config:generate # (optional) writes MCP client config for this app
-bin/dev                           # starts Rails, Tailwind, and Sidekiq
+docker compose -f compose.dev.yml run --rm web bin/rails db:create db:migrate
 ```
+
+The source tree is bind-mounted at `/rails`, so code changes are picked up live. The Compose project is named `kuria-dev`; its containers, network, and volumes are separate from the production stack. `POSTGRES_DB` is forced to `kuria_development` in this file even if `.env` sets a production database.
+
+Stop the stack with:
+
+```sh
+docker compose -f compose.dev.yml down      # keeps the development volumes
+```
+
+If the production stack is already using port 3000, stop it first **without** `-v`/`--volumes` (for example, `docker compose -f compose.yml down`), then start the development stack. Never run `down -v` against production volumes.
+
+### Host-based Rails (optional)
+
+To keep Rails, Tailwind, and Sidekiq on the host while running only PostgreSQL and Redis in Docker:
+
+```sh
+git clone https://github.com/petebarbosa/kuria.git
+cd kuria
+cp .env.example .env        # only if .env does not exist; set SECRET_KEY_BASE
+docker compose -f compose.dev.yml up -d db redis
+bin/setup                   # installs gems, creates DB, runs migrations
+bin/dev                     # starts Rails, Tailwind, and Sidekiq on the host
+```
+
+For this workflow keep `DB_HOST`/`DB_PORT` and `REDIS_URL` pointed at localhost (the dev compose file publishes PostgreSQL and Redis on `127.0.0.1`; use `127.0.0.1` directly if `localhost` resolves to IPv6 first on your machine), and leave `POSTGRES_DB` unset or set it to `kuria_development` so host Rails uses the isolated development database.
 
 `bin/dev` starts three processes concurrently:
 
@@ -127,18 +141,18 @@ All services run on the `kuria_network` bridge network.
 
 At minimum you will need to set the following environment variables:
 
-| Variable              | Description                                                                                                                |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `SECRET_KEY_BASE`     | Required. Generate with `openssl rand -hex 64`.                                                                            |
-| `SELF_HOSTED`         | Set to `true` to enable self-hosting mode.                                                                                 |
-| `PAYMENTS_ENABLED`    | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                      |
-| `SYNTH_API_KEY`       | Security market data provider (optional).                                                                                  |
-| `FREECRYPTO_API_KEY`  | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                   |
-| `OPENAI_API_KEY`      | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.        |
-| `OPENCODE_GO_API_KEY` | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.   |
+| Variable                      | Description                                                                                                                                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SECRET_KEY_BASE`             | Required. Generate with `openssl rand -hex 64`.                                                                                              |
+| `SELF_HOSTED`                 | Set to `true` to enable self-hosting mode.                                                                                                   |
+| `PAYMENTS_ENABLED`            | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                                        |
+| `SYNTH_API_KEY`               | Security market data provider (optional).                                                                                                    |
+| `FREECRYPTO_API_KEY`          | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                                     |
+| `OPENAI_API_KEY`              | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.                          |
+| `OPENCODE_GO_API_KEY`         | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.                     |
 | `ASSISTANT_REQUESTS_PER_HOUR` | Optional. Per-authenticated-user assistant request allowance (web and API), in requests per hour, enforced in both modes; defaults to `100`. |
-| `MCP_AUTH_TOKEN`      | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path. |
-| `SMTP_*`              | Mail delivery configuration (optional).                                                                                    |
+| `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path.                   |
+| `SMTP_*`                      | Mail delivery configuration (optional).                                                                                                      |
 
 ### Known capability gaps (deferred)
 
@@ -164,5 +178,5 @@ Unsupported capabilities fail safely: they surface through the existing provider
 
 ## Credits
 
-Based on [maybe-finance/maybe](https://github.com/maybe-finance/maybe), distributed under the [AGPLv3 license](LICENSE).
+Based on [kuria-finance/kuria](https://github.com/kuria-finance/kuria), distributed under the [AGPLv3 license](LICENSE).
 This fork is not affiliated with or endorsed by Maybe Finance Inc.

@@ -77,7 +77,7 @@ gem "after_commit_everywhere", "~> 1.0"
 
 # AI
 gem "mcp"
-gem "ruby_llm", "~> 1.16.0"
+gem "ruby_llm", "~> 2.0"
 
 group :development, :test do
   gem "debug", platforms: %i[mri windows]

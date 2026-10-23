@@ -15,6 +15,28 @@ class Provider::RubyLlm < Provider
   # over-sized enrichment batch fails closed instead of silently growing.
   MAX_ENRICHMENT_TRANSACTIONS = 25
 
+  # Adapter-local bounded execution (#16). RubyLLM 2.1.1 defaults are
+  # request_timeout: 300, max_retries: 3 (POSTs included), and
+  # retry_max_interval: 30. Every per-call context gets an explicit, tighter
+  # budget instead. request_timeout is the per-operation read timeout, not a
+  # total wall-clock deadline: a request can still spend time connecting,
+  # streaming accepted chunks, and waiting between a bounded number of retries.
+  #
+  # Streaming chats (chat_response always passes an ask block) MUST NOT retry:
+  # a retried streaming request replays the already-partially-streamed answer
+  # through the streamer. Non-streaming structured asks get at most one bounded
+  # retry.
+  #
+  # retry_max_interval exists in RubyLLM 2.1.1 (default 30s); Kuria caps it so
+  # the single structured retry stays tightly bounded.
+  REQUEST_TIMEOUT_SECONDS = 120
+  NON_STREAMING_MAX_RETRIES = 1
+  STREAMING_MAX_RETRIES = 0
+  RETRY_INTERVAL_SECONDS = 0.5
+  RETRY_MAX_INTERVAL_SECONDS = 2
+  RETRY_BACKOFF_FACTOR = 2
+  RETRY_INTERVAL_RANDOMNESS = 0.5
+
   class << self
     # The immutable positive catalog (Provider::RubyLlm::Catalog#manifest) is
     # the supported-model source for admin selection. Admission authority is
@@ -78,14 +100,17 @@ class Provider::RubyLlm < Provider
   def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
-      context = ruby_llm_context(reference)
+      context = ruby_llm_context(reference, streaming: true)
 
       # The catalog is the admission authority: every admitted model is passed
-      # with assume_model_exists: true (RubyLLM 1.16's bundled registry may be
+      # with assume_model_exists: true (RubyLLM 2.1.1's bundled registry may be
       # stale for current manifest IDs and is never refreshed by Kuria).
+      # The protocol is pinned: RubyLLM 2.1 otherwise defaults OpenAI (and
+      # OpenCode Go, which reuses the OpenAI provider) to the Responses API.
       chat = context.chat(
         model: reference[:model_id],
         provider: reference[:provider],
+        protocol: :chat_completions,
         assume_model_exists: reference[:assume_model_exists]
       )
       chat = chat.with_instructions(instructions) if instructions.present?
@@ -95,6 +120,10 @@ class Provider::RubyLlm < Provider
 
         text = chunk.respond_to?(:content) ? chunk.content : nil
         streamer.call(ChatStreamChunk.new(type: "output_text", data: text)) if text.present?
+      end
+
+      if empty_completion?(final_message)
+        raise Error, "RubyLLM returned an empty completion for model '#{model}'."
       end
 
       response = build_response(final_message, model)
@@ -182,14 +211,23 @@ class Provider::RubyLlm < Provider
     end
 
     # Isolated per-call RubyLLM context carrying the resolved account's key and
-    # API base. The per-call context duplicates the global configuration, which
-    # may carry OpenAI organization/project headers; these are cleared ONLY for
-    # OpenCode Go so a Go request never inherits the normal OpenAI billing
-    # identity, while normal OpenAI calls keep the deployment's own identity.
-    def ruby_llm_context(reference)
+    # API base plus the adapter-local bounded execution budget. The per-call
+    # context duplicates the global configuration, which may carry OpenAI
+    # organization/project headers; these are cleared ONLY for OpenCode Go so a
+    # Go request never inherits the normal OpenAI billing identity, while
+    # normal OpenAI calls keep the deployment's own identity.
+    def ruby_llm_context(reference, streaming:)
       RubyLLM.context do |config|
         config.openai_api_key = reference[:api_key]
         config.openai_api_base = reference[:api_base]
+
+        config.faraday_adapter = StreamingAdapter
+        config.request_timeout = REQUEST_TIMEOUT_SECONDS
+        config.max_retries = streaming ? STREAMING_MAX_RETRIES : NON_STREAMING_MAX_RETRIES
+        config.retry_interval = RETRY_INTERVAL_SECONDS
+        config.retry_max_interval = RETRY_MAX_INTERVAL_SECONDS
+        config.retry_backoff_factor = RETRY_BACKOFF_FACTOR
+        config.retry_interval_randomness = RETRY_INTERVAL_RANDOMNESS
 
         if reference[:account] == :opencode_go
           config.openai_organization_id = nil
@@ -200,15 +238,17 @@ class Provider::RubyLlm < Provider
 
     # Runs a single non-streaming structured-output chat against the explicit
     # model reference and returns the final RubyLLM message. The caller's
-    # helper normalizes its `.content` into provider-independent values; the
-    # RubyLLM message itself never leaves the adapter.
+    # helper normalizes its structured content (JSON text through the public
+    # `Message#parsed` accessor) into provider-independent values; the RubyLLM
+    # message itself never leaves the adapter.
     def structured_completion(model:, instructions:, prompt:, schema:)
       reference = resolve_reference(model)
-      context = ruby_llm_context(reference)
+      context = ruby_llm_context(reference, streaming: false)
 
       chat = context.chat(
         model: reference[:model_id],
         provider: reference[:provider],
+        protocol: :chat_completions,
         assume_model_exists: reference[:assume_model_exists]
       )
       chat = chat.with_instructions(instructions) if instructions.present?
@@ -317,24 +357,48 @@ class Provider::RubyLlm < Provider
       "ruby_llm_#{SecureRandom.hex(8)}"
     end
 
+    def empty_completion?(message)
+      content = message.respond_to?(:content) ? message.content : nil
+      tool_calls = message.respond_to?(:tool_calls) ? message.tool_calls : nil
+
+      content.blank? && tool_calls.blank?
+    end
+
     def error_transformer_for(model)
       proc do |error|
-        Error.new(
-          error_message(error, model),
-          details: {
-            provider_reference: parse_reference(model)&.dig(:provider),
-            model: model,
-            error_class: error.class.name,
-            retryable: retryable?(error)
-          }
-        )
+        Error.new(error_message(error, model), details: error_details(error, model))
       end
+    end
+
+    # Structured transport details for a model failure. Catalog::Error carries
+    # the original Faraday class, retryability, and HTTP status; only those
+    # whitelisted keys are merged so catalog internals can never choose the
+    # envelope's model or provider, which stay authoritative from the resolved
+    # reference.
+    def error_details(error, model)
+      provider_reference = parse_reference(model)&.dig(:provider)
+      details = {
+        provider_reference: provider_reference,
+        model: model,
+        error_class: error.class.name,
+        retryable: retryable?(error)
+      }
+
+      if error.is_a?(Catalog::Error) && error.details.is_a?(Hash)
+        details.merge!(error.details.slice(:error_class, :retryable, :http_status))
+        details[:provider_reference] = provider_reference
+        details[:model] = model
+      end
+
+      details
     end
 
     def error_message(error, model)
       case error
       when Error
         error.message
+      when StreamingAdapter::InvalidStreamError
+        "RubyLLM model stream was malformed or incomplete for provider '#{provider_label(model)}'"
       when RubyLLM::ConfigurationError
         "RubyLLM configuration error for provider '#{provider_label(model)}'"
       when RubyLLM::ModelNotFoundError
@@ -360,6 +424,8 @@ class Provider::RubyLlm < Provider
 
     def retryable?(error)
       case error
+      when StreamingAdapter::InvalidStreamError
+        true
       when RubyLLM::RateLimitError, RubyLLM::ServerError, RubyLLM::ServiceUnavailableError, RubyLLM::OverloadedError
         true
       when Faraday::TimeoutError, Faraday::ConnectionFailed

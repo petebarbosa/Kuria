@@ -7,6 +7,8 @@ class AssistantTest < ActiveSupport::TestCase
   # RubyLLM path never calls a live model API.
   class FakeConfig
     attr_reader :openai_api_key, :openai_api_base
+    attr_accessor :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
+      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -78,6 +80,28 @@ class AssistantTest < ActiveSupport::TestCase
 
     def initialize(content:)
       @content = content
+    end
+  end
+
+  # Issue #16 seam: a provider that streams text chunks and then raises
+  # (e.g. RubyLLM::ServerError) — the failure surfaces out of the streaming
+  # request itself, after partial content has already been delivered and
+  # persisted by the streamer.
+  class RaisingStreamProvider
+    attr_reader :error
+
+    def initialize(error, chunks: [])
+      @error = error
+      @chunks = chunks
+    end
+
+    def supports_model?(_model)
+      true
+    end
+
+    def chat_response(_prompt, streamer:, **)
+      @chunks.each { |chunk| streamer.call(chunk) }
+      raise error
     end
   end
 
@@ -441,6 +465,140 @@ class AssistantTest < ActiveSupport::TestCase
     assert_equal "legacy_sess_9", @chat.opencode_session_id,
       "the historical opencode session must be preserved"
     assert_equal "msg_legacy_2", @chat.latest_assistant_response_id
+  end
+
+  # --- Partial-stream recovery (issue #16) -------------------------------
+  # The streamer persists and broadcasts text chunks into an AssistantMessage
+  # before the provider response is complete. When the provider fails
+  # mid-stream the failure must discard exactly this attempt's persisted
+  # partial message — never a historical message, never a finalized reply —
+  # stop the thinking indicator exactly once, and land the error in the chat
+  # envelope so the user can retry the turn.
+
+  test "discards the attempt's partial assistant message when the provider raises mid-stream" do
+    # Historical traffic predates this attempt's user message, so the last
+    # conversation message stays the user's own after the partial is discarded.
+    past_answer = @chat.messages.create!(
+      type: "AssistantMessage",
+      content: "Earlier answer",
+      ai_model: "openai/gpt-4o",
+      created_at: @message.created_at - 1.hour
+    )
+
+    error = RubyLLM::ServerError.new("provider exploded mid-stream")
+    provider = RaisingStreamProvider.new(
+      error,
+      chunks: [ provider_text_chunk("Partial "), provider_text_chunk("answer") ]
+    )
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(provider)
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    # The thinking indicator is removed exactly once even though the failure
+    # happened after visible content was already delivered.
+    assert_equal 1, thinking_indicator_removes(streams).size
+
+    # The partial the client already received is removed through the same
+    # broadcast mechanism that painted it.
+    streamed_targets = streams
+      .map { |stream| stream["target"].to_s }
+      .select { |target| target.start_with?("assistant_message_") }
+      .uniq
+    assert_equal 1, streamed_targets.size, "only this attempt's partial message may appear in the stream"
+    removed_targets = streams.select { |stream| stream["action"] == "remove" }.map { |stream| stream["target"].to_s }
+    assert_includes removed_targets, streamed_targets.first
+
+    # Nothing from the failed attempt survives; historical messages are intact.
+    reloaded = Chat.find(@chat.id)
+    assert_equal [ past_answer.id ], reloaded.messages.where(type: "AssistantMessage").order(:id).pluck(:id)
+    assert_equal "Earlier answer", reloaded.messages.where(type: "AssistantMessage").sole.reload.content
+
+    # The failure is recorded in the chat's error envelope.
+    assert reloaded.reload.error.present?, "the chat must record the provider failure"
+
+    # With no surviving assistant message the retry gate sees the user's
+    # message last again.
+    assert_predicate reloaded, :needs_assistant_response?,
+      "a failed streaming attempt must not block the retry gate"
+  end
+
+  test "removes the partial and records the provider error when the removal broadcast fails" do
+    past_answer = @chat.messages.create!(
+      type: "AssistantMessage",
+      content: "Earlier answer",
+      ai_model: "openai/gpt-4o",
+      created_at: @message.created_at - 1.hour
+    )
+
+    error = RubyLLM::ServerError.new("provider exploded mid-stream")
+    provider = RaisingStreamProvider.new(
+      error,
+      chunks: [ provider_text_chunk("Partial "), provider_text_chunk("answer") ]
+    )
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(provider)
+    AssistantMessage.any_instance.stubs(:broadcast_remove_to).raises(StandardError, "stream unavailable")
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    assert_equal 1, thinking_indicator_removes(streams).size
+
+    # The persisted row is the source of truth: a failed removal broadcast must
+    # not leave this attempt's partial behind, and historical replies stay.
+    reloaded = Chat.find(@chat.id)
+    assert_equal [ past_answer.id ], reloaded.messages.where(type: "AssistantMessage").order(:id).pluck(:id)
+    assert_predicate reloaded, :needs_assistant_response?,
+      "a failed removal broadcast must not block the retry gate"
+
+    # The original provider failure is recorded, not the broadcast failure.
+    assert_equal error.to_json, reloaded.error
+  end
+
+  test "persists nothing when the provider raises before streaming any content" do
+    provider = RaisingStreamProvider.new(RubyLLM::ServerError.new("failed immediately"))
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(provider)
+
+    streams = capture_turbo_stream_broadcasts(@chat) do
+      assert_no_difference "AssistantMessage.count" do
+        @assistant.respond_to(@message)
+      end
+    end
+
+    assert_equal 1, thinking_indicator_removes(streams).size
+    assert @chat.reload.error.present?, "the chat must record the provider failure"
+    assert_predicate Chat.find(@chat.id), :needs_assistant_response?,
+      "a failed attempt must not block the retry gate"
+  end
+
+  test "keeps a finalized reply when a later persistence step fails" do
+    @assistant.expects(:get_model_provider).with("openai/gpt-4o").returns(@provider)
+
+    completed = provider_response(id: "msg_final", text: "Alpha Beta")
+    @provider.expects(:chat_response).with do |_message, **options|
+      options[:streamer].call(provider_text_chunk("Alpha"))
+      options[:streamer].call(provider_text_chunk(" Beta"))
+      true
+    end.returns(provider_success_response(completed))
+
+    @chat.stubs(:update_latest_response!).raises(StandardError, "chat persistence exploded")
+
+    capture_turbo_stream_broadcasts(@chat) do
+      @assistant.respond_to(@message)
+    end
+
+    # The completed reply is never mistaken for a failed attempt's partial and
+    # is not destroyed by the late-failure error path.
+    persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "Alpha Beta", persisted.content
+    assert_equal "complete", persisted.status
+    assert_equal "msg_final", persisted.provider_id
   end
 
   private

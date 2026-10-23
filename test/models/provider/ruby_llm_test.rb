@@ -7,7 +7,9 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   # never leak RubyLLM objects, so these fakes only exercise the seam the
   # adapter is allowed to touch (RubyLLM.context / context.chat / chat.ask).
   class FakeConfig
-    attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id
+    attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id,
+      :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
+      :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter
 
     def openai_api_key=(value)
       @openai_api_key = value
@@ -23,6 +25,34 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def openai_project_id=(value)
       @openai_project_id = value
+    end
+
+    def request_timeout=(value)
+      @request_timeout = value
+    end
+
+    def max_retries=(value)
+      @max_retries = value
+    end
+
+    def retry_interval=(value)
+      @retry_interval = value
+    end
+
+    def retry_max_interval=(value)
+      @retry_max_interval = value
+    end
+
+    def retry_backoff_factor=(value)
+      @retry_backoff_factor = value
+    end
+
+    def retry_interval_randomness=(value)
+      @retry_interval_randomness = value
+    end
+
+    def faraday_adapter=(value)
+      @faraday_adapter = value
     end
   end
 
@@ -87,6 +117,8 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
   OPENAI_MODELS_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/models"
   OPENCODE_GO_MODELS_URL = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+  OPENAI_CHAT_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+  OPENCODE_GO_CHAT_URL = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/chat/completions"
 
   setup do
     @provider = Provider::RubyLlm.new
@@ -117,6 +149,66 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     entry = { "id" => id, "object" => "model" }
     entry["shutdown_date"] = shutdown_date if shutdown_date
     entry
+  end
+
+  # Server-sent event helpers for the streaming boundary. Bytes are sent
+  # unchanged by the adapter, so these mirror the provider format exactly.
+  def sse_event(payload)
+    "data: #{payload.is_a?(String) ? payload : payload.to_json}\n\n"
+  end
+
+  def sse_comment(text)
+    ": #{text}\n\n"
+  end
+
+  def sse_error_event(payload)
+    "event: error\ndata: #{payload.to_json}\n\n"
+  end
+
+  def stream_chunk(content: nil, finish_reason: nil, role: nil, tool_calls: nil)
+    delta = {}
+    delta["role"] = role if role
+    delta["content"] = content unless content.nil?
+    delta["tool_calls"] = tool_calls if tool_calls
+
+    {
+      "id" => "chatcmpl-stream",
+      "object" => "chat.completion.chunk",
+      "created" => 1,
+      "model" => "gpt-5-nano",
+      "choices" => [ { "index" => 0, "delta" => delta, "finish_reason" => finish_reason } ]
+    }
+  end
+
+  def usage_chunk
+    {
+      "id" => "chatcmpl-stream",
+      "object" => "chat.completion.chunk",
+      "model" => "gpt-5-nano",
+      "choices" => [],
+      "usage" => { "prompt_tokens" => 3, "completion_tokens" => 2, "total_tokens" => 5 }
+    }
+  end
+
+  def stub_stream(url, body, token:)
+    stub_request(:post, url)
+      .with(headers: { "Authorization" => "Bearer #{token}" })
+      .to_return(status: 200, headers: { "Content-Type" => "text/event-stream" }, body: body)
+  end
+
+  # A Faraday env for exercising the streaming adapter directly, including
+  # chunk boundaries WebMock cannot produce (it yields the whole body once).
+  def stream_env(received)
+    env = Faraday::Env.from(
+      method: :post,
+      url: URI("https://api.openai.com/v1/chat/completions"),
+      request: Faraday::RequestOptions.new,
+      request_headers: Faraday::Utils::Headers.new,
+      response_headers: Faraday::Utils::Headers.new("content-type" => "text/event-stream"),
+      status: 200
+    )
+    env.request.on_data = ->(chunk, _bytes, _callback_env) { received << chunk }
+    env
   end
 
   # Stub the encrypted-credentials boundary (never write real secrets) as a
@@ -303,7 +395,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     # Catalog admission always passes assume_model_exists: true; RubyLLM's
     # bundled 1.16 registry is never consulted for admission.
-    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, context.chat_options)
+    assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, context.chat_options)
 
     assert_equal "What is my net worth?", chat.prompt
     assert_nil chat.instructions
@@ -427,8 +519,66 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     # still rejected when the live catalog request fails.
     assert_match(/catalog request for account 'openai' failed/i, @response.error.message)
     assert_equal "openai/gpt-5-nano", @response.error.details[:model]
-    assert_equal "Provider::RubyLlm::Catalog::Error", @response.error.details[:error_class]
-    assert_equal false, @response.error.details[:retryable]
+    assert_equal "Faraday::ServerError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    assert_equal 500, @response.error.details[:http_status]
+  end
+
+  test "propagates catalog rate limiting as a retryable provider error for both accounts" do
+    {
+      openai: [ OPENAI_MODELS_URL, "OPENAI_API_KEY", "test-openai-key", "openai/gpt-5-nano" ],
+      opencode_go: [ OPENCODE_GO_MODELS_URL, "OPENCODE_GO_API_KEY", "test-go-key", "opencode_go/glm-5.3-flash" ]
+    }.each do |account, (url, credential, token, reference)|
+      stub_request(:get, url)
+        .to_return(
+          status: 429,
+          headers: { "Content-Type" => "application/json" },
+          body: { "error" => { "message" => "SECRET-CATALOG-BODY" } }.to_json
+        )
+
+      response = nil
+      with_env_overrides(credential => token) do
+        response = @provider.chat_response("Hello", model: reference)
+      end
+
+      refute response.success?, "expected #{account} rate limiting to fail closed"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_match(/catalog request for account '#{account}' failed/i, response.error.message)
+      assert_equal reference, response.error.details[:model]
+      assert_equal account.to_s, response.error.details[:provider_reference]
+      assert_equal "Faraday::TooManyRequestsError", response.error.details[:error_class]
+      assert_equal true, response.error.details[:retryable]
+      assert_equal 429, response.error.details[:http_status]
+      refute_match(/SECRET-CATALOG-BODY/, response.error.message)
+      assert_requested :get, url, times: 1
+    end
+  end
+
+  test "propagates catalog timeouts as retryable provider errors without a status for both accounts" do
+    {
+      openai: [ OPENAI_MODELS_URL, "OPENAI_API_KEY", "test-openai-key", "openai/gpt-5-nano" ],
+      opencode_go: [ OPENCODE_GO_MODELS_URL, "OPENCODE_GO_API_KEY", "test-go-key", "opencode_go/glm-5.3-flash" ]
+    }.each do |account, (url, credential, token, reference)|
+      stub_request(:get, url).to_timeout
+
+      response = nil
+      with_env_overrides(credential => token) do
+        response = @provider.chat_response("Hello", model: reference)
+      end
+
+      refute response.success?, "expected #{account} timeout to fail closed"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_equal reference, response.error.details[:model]
+      assert_equal account.to_s, response.error.details[:provider_reference]
+      # Net::HTTP's open timeout surfaces through Faraday as a connection
+      # failure; either transport timeout class must stay retryable.
+      assert_includes %w[Faraday::TimeoutError Faraday::ConnectionFailed], response.error.details[:error_class]
+      assert_equal true, response.error.details[:retryable]
+      assert_nil response.error.details[:http_status]
+      assert_requested :get, url, times: 1
+    end
   end
 
   test "fails closed when the live catalog response has an unexpected shape" do
@@ -446,6 +596,8 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     assert_kind_of Provider::RubyLlm::Error, @response.error
     assert_match(/unexpected model catalog response shape for account 'opencode_go'/i, @response.error.message)
     assert_equal "Provider::RubyLlm::Catalog::Error", @response.error.details[:error_class]
+    assert_equal false, @response.error.details[:retryable]
+    assert_nil @response.error.details[:http_status]
   end
 
   test "keeps inherited OpenAI organization and project headers on normal OpenAI calls" do
@@ -637,11 +789,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     # The OpenAI call never sees the Go key/base and vice versa.
     assert_equal "openai-key-1", openai_config.openai_api_key
     assert_equal Provider::RubyLlm::OPENAI_BASE_URL, openai_config.openai_api_base
-    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, openai_context.chat_options)
-
+    assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, openai_context.chat_options)
     assert_equal "go-key-1", go_config.openai_api_key
     assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
-    assert_equal({ model: "glm-5.3-flash", provider: :openai, assume_model_exists: true }, go_context.chat_options)
+    assert_equal({ model: "glm-5.3-flash", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
 
     # Billing metadata never crosses: each reference resolves to its own
     # account through the catalog.
@@ -1333,7 +1484,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     # The explicit model reference resolves to the OpenAI account.
     assert_equal "test-openai-key", config.openai_api_key
     assert_equal Provider::RubyLlm::OPENAI_BASE_URL, config.openai_api_base
-    assert_equal({ model: "gpt-5-nano", provider: :openai, assume_model_exists: true }, context.chat_options)
+    assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, context.chat_options)
 
     # Strict wrapper: name + schema + strict live at the wrapper level, never
     # `strict` inside the JSON schema definition.
@@ -1682,6 +1833,739 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
         enum == [ "42" ] &&
         enum.all? { |value| value.is_a?(String) } &&
         !request.body.match?(/"enum":\[\s*\d/)
+    end
+  end
+
+  # --- bounded execution, failure categories, and safe diagnostics (#16) ----
+
+  test "bounds per-call execution with a local timeout and one non-streaming retry for both accounts" do
+    # OpenAI streaming chat: the adapter must cap the local context timeout at
+    # well under RubyLLM's 300s default and must disable retries entirely.
+    streaming_chat = FakeChat.new(final_message: FakeMessage.new(content: "Hi", id: "msg_bounds"))
+    streaming_config, streaming_context = stub_ruby_llm_context(streaming_chat)
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, streaming_context.chat_options)
+
+    assert_equal 120, streaming_config.request_timeout
+    assert_equal 0, streaming_config.max_retries
+    assert_equal 0.5, streaming_config.retry_interval
+    assert_equal 2, streaming_config.retry_max_interval
+    assert_equal 2, streaming_config.retry_backoff_factor
+    assert_equal 0.5, streaming_config.retry_interval_randomness
+    assert_equal Provider::RubyLlm::StreamingAdapter, streaming_config.faraday_adapter
+
+    # OpenAI structured ask (non-streaming): identical timeout bounds with
+    # exactly one bounded retry instead of RubyLLM's default of three.
+    structured_chat = FakeChat.new(final_message: FakeMessage.new(
+      content: { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+    ))
+    structured_config, structured_context = stub_ruby_llm_context(structured_chat)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano")
+    end
+
+    assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, structured_context.chat_options)
+
+    assert_equal 120, structured_config.request_timeout
+    assert_equal 1, structured_config.max_retries
+    assert_equal 0.5, structured_config.retry_interval
+    assert_equal 2, structured_config.retry_max_interval
+    assert_equal 2, structured_config.retry_backoff_factor
+    assert_equal 0.5, structured_config.retry_interval_randomness
+    assert_equal Provider::RubyLlm::StreamingAdapter, structured_config.faraday_adapter
+
+    # OpenCode Go structured ask: the same bounds apply to the second account,
+    # and account isolation (key/base) still holds inside the shared bounds.
+    go_chat = FakeChat.new(final_message: FakeMessage.new(
+      content: { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+    ))
+    go_config, go_context = stub_ruby_llm_context(go_chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert_equal({ model: "glm-5.3-flash", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
+
+    assert_equal "test-go-key", go_config.openai_api_key
+    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
+    assert_equal 120, go_config.request_timeout
+    assert_equal 1, go_config.max_retries
+    assert_equal 0.5, go_config.retry_interval
+    assert_equal 2, go_config.retry_max_interval
+    assert_equal 2, go_config.retry_backoff_factor
+    assert_equal 0.5, go_config.retry_interval_randomness
+    assert_equal Provider::RubyLlm::StreamingAdapter, go_config.faraday_adapter
+
+    # The bounds are adapter-local: the global RubyLLM config keeps the gem
+    # defaults and Kuria adds no global initializer for them.
+    assert_equal 300, RubyLLM.config.request_timeout
+    assert_equal 3, RubyLLM.config.max_retries
+    assert_equal 30, RubyLLM.config.retry_max_interval
+    assert_nil RubyLLM.config.openai_api_key
+
+    # The timeout is the per-operation read timeout, not a total wall-clock
+    # deadline, and the structured retry interval cap is explicit and finite.
+    assert_equal Provider::RubyLlm::RETRY_MAX_INTERVAL_SECONDS, 2
+  end
+
+  test "maps the full failure category set to the safe error envelope with sanitized messages" do
+    cases = {
+      authentication: [ RubyLLM::UnauthorizedError, "Incorrect API key provided: sk-test-secret-123", false, /authentication failed/ ],
+      rate_limit: [ RubyLLM::RateLimitError, "Rate limit exceeded for sk-test-secret-123", true, /rate limit/i ],
+      server_error: [ RubyLLM::ServerError, "internal backend error", true, /API error/ ],
+      service_unavailable: [ RubyLLM::ServiceUnavailableError, "service unavailable", true, /API error/ ],
+      overloaded: [ RubyLLM::OverloadedError, "provider overloaded", true, /API error/ ],
+      context_length: [ RubyLLM::ContextLengthExceededError, "This model supports at most 8192 tokens", false, /context length/i ],
+      unknown_model: [ RubyLLM::ModelNotFoundError, "Model 'made-up-model' does not exist", false, /could not resolve model/ ],
+      configuration: [ RubyLLM::ConfigurationError, "No API key configured for openai", false, /configuration error/i ],
+      timeout: [ Faraday::TimeoutError, nil, true, /connection error/ ],
+      connection: [ Faraday::ConnectionFailed, nil, true, /connection error/ ]
+    }
+
+    cases.each do |label, (error_class, error_message, retryable, message_pattern)|
+      chat = FakeChat.new(final_message: nil)
+      if error_message
+        chat.stubs(:ask).raises(error_class, error_message)
+      else
+        chat.stubs(:ask).raises(error_class)
+      end
+      stub_ruby_llm_context(chat)
+
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano")
+      end
+
+      refute @response.success?, "expected #{label} to return the failure envelope"
+      assert_nil @response.data, "expected #{label} to carry no data"
+      error = @response.error
+      assert_kind_of Provider::RubyLlm::Error, error, "expected #{label} to map into the provider error envelope"
+      assert_match message_pattern, error.message, "expected #{label} to carry the safe category message"
+
+      assert_equal "openai", error.details[:provider_reference], "#{label} metadata must name the provider"
+      assert_equal "openai/gpt-5-nano", error.details[:model], "#{label} metadata must name the model"
+      assert_equal error_class.name, error.details[:error_class], "#{label} metadata must name the error class"
+      assert_equal retryable, error.details[:retryable], "#{label} retryability must be explicit"
+
+      # No credentials, no provider error text, no user prompt, and no RubyLLM
+      # raw exception message ever escapes into the user-facing envelope.
+      refute_match(/sk-test-secret-123/, error.message)
+      refute_match(/What is my net worth/, error.message)
+    end
+  end
+
+  test "error metadata distinguishes OpenCode Go failures from OpenAI" do
+    chat = FakeChat.new(final_message: nil)
+    chat.stubs(:ask).raises(RubyLLM::RateLimitError, "Rate limit exceeded")
+    stub_ruby_llm_context(chat)
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    refute @response.success?
+    error = @response.error
+    assert_kind_of Provider::RubyLlm::Error, error
+    assert_equal "opencode_go", error.details[:provider_reference]
+    assert_equal "opencode_go/glm-5.3-flash", error.details[:model]
+    assert_equal "RubyLLM::RateLimitError", error.details[:error_class]
+    assert_equal true, error.details[:retryable]
+    assert_match(/opencode_go/, error.message)
+    refute_match(/test-go-key/, error.message)
+  end
+
+  test "non-streaming retry exhaustion surfaces the rate-limit envelope after exactly one bounded retry" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(
+        status: 429,
+        headers: { "Content-Type" => "application/json" },
+        body: { "error" => { "message" => "SECRET-RIPE-INTERNAL-DETAIL", "type" => "rate_limit_error" } }.to_json
+      )
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.auto_categorize(
+        transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "openai/gpt-5-nano"
+      )
+    end
+
+    refute @response.success?
+    assert_nil @response.data
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_equal "RubyLLM::RateLimitError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    # Bounded execution: the initial request plus exactly one retry — the gem's
+    # default max_retries of 3 would have produced four requests.
+    assert_requested :post, chat_url, times: 2
+    # The provider body (and its raw details) never surface in the envelope.
+    refute_match(/SECRET-RIPE-INTERNAL-DETAIL/, @response.error.message)
+  end
+
+  test "a failed streaming chat is never retried, delivers no duplicate chunks, and stops through the envelope" do
+    chat_url = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, chat_url)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(status: 500, headers: { "Content-Type" => "application/json" }, body: { "error" => { "message" => "boom" } }.to_json)
+
+    collected = []
+    streamer = proc { |chunk| collected << chunk }
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("What is my net worth?", model: "openai/gpt-5-nano", streamer: streamer)
+    end
+
+    refute @response.success?
+    # No retried request may replay the partially streamed answer: the failed
+    # streaming chat attempts exactly one POST.
+    assert_requested :post, chat_url, times: 1
+    assert_equal [], collected, "failed streaming chats must not stream chunks or a completed response"
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    # RubyLLM 2.1.1 classifies a streamed 500 through the same status mapping as
+    # a buffered response, so this is a retryable server error (the 1.16
+    # streaming path mislabeled it BadRequestError).
+    assert_equal "RubyLLM::ServerError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    refute_match(/What is my net worth/, @response.error.message)
+  end
+
+  # --- strict Chat Completions streaming (#16 finding 4) -------------------
+
+  test "streams a valid chat completions SSE response once with usage and no duplicate chunks" do
+    body = [
+      sse_comment("keep-alive"),
+      sse_event(stream_chunk(role: "assistant")),
+      sse_event(stream_chunk(content: "Hello ")),
+      sse_event(stream_chunk(content: "world")),
+      sse_event(usage_chunk),
+      sse_event(stream_chunk(finish_reason: "stop")),
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    collected = []
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { |chunk| collected << chunk })
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal "Hello world", @response.data.messages.first.output_text
+    assert_equal [ "Hello ", "world" ], collected.select { |chunk| chunk.type == "output_text" }.map(&:data)
+    assert_equal 1, collected.count { |chunk| chunk.type == "response" }
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  test "streams OpenCode Go over the pinned chat completions protocol with one POST" do
+    body = [
+      sse_event(stream_chunk(content: "Go answer")),
+      sse_event(stream_chunk(finish_reason: "stop")),
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+    stub_stream(OPENCODE_GO_CHAT_URL, body, token: "test-go-key")
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @response = @provider.chat_response("Hello", model: "opencode_go/glm-5.3-flash")
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal "Go answer", @response.data.messages.first.output_text
+    assert_requested :post, OPENCODE_GO_CHAT_URL, times: 1
+  end
+
+  test "rejects malformed SSE JSON through the provider envelope without retrying" do
+    body = [
+      sse_event(stream_chunk(content: "Hello")),
+      "data: {\"choices\":[SECRET-BROKEN]\n\n",
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_nil @response.data
+    error = @response.error
+    assert_kind_of Provider::RubyLlm::Error, error
+    assert_match(/stream was malformed or incomplete/i, error.message)
+    assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", error.details[:error_class]
+    assert_equal true, error.details[:retryable]
+    assert_equal "openai", error.details[:provider_reference]
+    assert_equal "openai/gpt-5-nano", error.details[:model]
+    refute_match(/SECRET-BROKEN/, error.message)
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  test "rejects a truncated SSE stream that never sends DONE" do
+    body = [
+      sse_event(stream_chunk(content: "Partial")),
+      sse_event(stream_chunk(finish_reason: "stop"))
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal true, @response.error.details[:retryable]
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  test "rejects a malformed SSE event after finish_reason stop even when DONE follows" do
+    body = [
+      sse_event(stream_chunk(content: "Done")),
+      sse_event(stream_chunk(finish_reason: "stop")),
+      "data: {not-json\n\n",
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", @response.error.details[:error_class]
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  test "rejects a buffered JSON completion on a streaming request" do
+    body = {
+      id: "chatcmpl-buffered",
+      object: "chat.completion",
+      model: "gpt-5-nano",
+      choices: [ { index: 0, message: { role: "assistant", content: "buffered" }, finish_reason: "stop" } ]
+    }.to_json
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_request(:post, OPENAI_CHAT_URL)
+      .with(headers: { "Authorization" => "Bearer test-openai-key" })
+      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: body)
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", @response.error.details[:error_class]
+  end
+
+  test "rejects a usage-only SSE stream that never produces a completion" do
+    body = [ sse_event(usage_chunk), sse_event("[DONE]") ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal true, @response.error.details[:retryable]
+  end
+
+  test "passes provider error events to RubyLLM's normal classifier" do
+    body = [
+      sse_error_event({ error: { message: "SECRET-EVENT-DETAIL", type: "server_error" } }),
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_equal "RubyLLM::ServerError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    refute_match(/SECRET-EVENT-DETAIL/, @response.error.message)
+    refute_match(/malformed or incomplete/i, @response.error.message)
+  end
+
+  test "classifies streaming HTTP failures for both accounts with correct retryability and one POST" do
+    accounts = {
+      openai: [ OPENAI_CHAT_URL, "OPENAI_API_KEY", "test-openai-key", "openai/gpt-5-nano", "gpt-5-nano" ],
+      opencode_go: [ OPENCODE_GO_CHAT_URL, "OPENCODE_GO_API_KEY", "test-go-key", "opencode_go/glm-5.3-flash", "glm-5.3-flash" ]
+    }
+    cases = {
+      401 => [ "RubyLLM::UnauthorizedError", false ],
+      429 => [ "RubyLLM::RateLimitError", true ],
+      500 => [ "RubyLLM::ServerError", true ]
+    }
+
+    accounts.each do |account, (chat_url, credential, token, reference, model_id)|
+      cases.each do |status, (error_class, retryable)|
+        WebMock.reset!
+        stub_live_models(account, entries: [ model_entry(model_id) ], auth_key: token)
+        stub_request(:post, chat_url)
+          .with(headers: { "Authorization" => "Bearer #{token}" })
+          .to_return(
+            status: status,
+            headers: { "Content-Type" => "application/json" },
+            body: { "error" => { "message" => "SECRET-STREAM-BODY" } }.to_json
+          )
+
+        response = nil
+        with_env_overrides(credential => token) do
+          response = Provider::RubyLlm.new.chat_response("Hello", model: reference, streamer: proc { })
+        end
+
+        refute response.success?, "expected #{account} #{status} to fail closed"
+        assert_nil response.data
+        assert_kind_of Provider::RubyLlm::Error, response.error
+        assert_equal error_class, response.error.details[:error_class], "#{account} #{status}"
+        assert_equal retryable, response.error.details[:retryable], "#{account} #{status}"
+        assert_equal account.to_s, response.error.details[:provider_reference]
+        assert_equal reference, response.error.details[:model]
+        refute_match(/SECRET-STREAM-BODY/, response.error.message)
+        assert_requested :post, chat_url, times: 1
+      end
+    end
+  end
+
+  test "validates SSE split across adapter callbacks with request-local state" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      "data: {\"choices\":[{\"delta\":{\"cont",
+      "ent\":\"Hi\"}}]}\n\n",
+      "data: [DONE]\n\n"
+    ]
+    received = []
+    env = stream_env(received)
+
+    streams = [
+      chunks,
+      [ "data: {\"choices\":[{\"delta\":{\"content\":\"Truncated\"}}]}\n\n" ]
+    ]
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      streams.shift.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(env)
+    assert_equal chunks, received
+
+    # The same shared adapter instance must not carry the first request's
+    # parser/DONE state into a second, truncated request.
+    assert_raises(Provider::RubyLlm::StreamingAdapter::InvalidStreamError) do
+      adapter.call(stream_env([]))
+    end
+  end
+
+  test "permits comments, usage-only chunks, and tool-call chunks" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      sse_comment("keep-alive"),
+      sse_event(stream_chunk(tool_calls: [
+        { "index" => 0, "id" => "call_1", "type" => "function", "function" => { "name" => "lookup", "arguments" => "{}" } }
+      ])),
+      sse_event(usage_chunk),
+      sse_event("[DONE]")
+    ]
+    received = []
+
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      chunks.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(stream_env(received))
+    assert_equal chunks, received
+  end
+
+  # --- malformed/empty provider error events --------------------------------
+
+  test "rejects a malformed provider error event instead of completing" do
+    body = [
+      sse_event(stream_chunk(content: "Partial")),
+      "event: error\ndata: {NOT-JSON\n\n",
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    refute @response.success?
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", @response.error.details[:error_class]
+    assert_equal true, @response.error.details[:retryable]
+    refute_match(/NOT-JSON/, @response.error.message)
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  # Approved relaxation: an empty SSE event carries no data, so the SDK does
+  # not dispatch it and it must not fail an otherwise complete stream.
+  test "ignores empty SSE events the SDK does not dispatch" do
+    body = [
+      sse_event(stream_chunk(content: "Partial")),
+      "event: error\n\n",
+      sse_event("[DONE]")
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal "Partial", @response.data.messages.first.output_text
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+  end
+
+  # A dispatched error event, even with empty data, must still fail closed.
+  test "rejects an empty provider error event instead of completing" do
+    [
+      "event: error\ndata: \n\n",
+      "event: error\ndata: {}\n\n"
+    ].each do |error_event|
+      WebMock.reset!
+      body = [ sse_event(stream_chunk(content: "Partial")), error_event, sse_event("[DONE]") ].join
+
+      stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+      stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+      response = nil
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        response = Provider::RubyLlm.new.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+      end
+
+      refute response.success?, "expected #{error_event.inspect} to fail closed"
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_match(/stream was malformed or incomplete/i, response.error.message)
+      assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", response.error.details[:error_class]
+      assert_requested :post, OPENAI_CHAT_URL, times: 1
+    end
+  end
+
+  # --- terminal ordering ----------------------------------------------------
+
+  test "rejects a complete event after DONE instead of appending it" do
+    body = [
+      sse_event(stream_chunk(content: "Before")),
+      sse_event("[DONE]"),
+      sse_event(stream_chunk(content: "After"))
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    collected = []
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { |chunk| collected << chunk })
+    end
+
+    refute @response.success?
+    refute_match(/BeforeAfter/, @response.data.to_s)
+    assert_kind_of Provider::RubyLlm::Error, @response.error
+    assert_match(/stream was malformed or incomplete/i, @response.error.message)
+    assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", @response.error.details[:error_class]
+    refute_includes collected.select { |chunk| chunk.type == "output_text" }.map(&:data), "After"
+  end
+
+  test "rejects a post-terminal event when DONE and the event arrive in separate callbacks" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    streams = [
+      [
+        sse_event(stream_chunk(content: "Before")),
+        "data: [DONE]\n",
+        "\n",
+        sse_event(stream_chunk(content: "After"))
+      ]
+    ]
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      streams.shift.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    assert_raises(Provider::RubyLlm::StreamingAdapter::InvalidStreamError) do
+      adapter.call(stream_env([]))
+    end
+  end
+
+  # Approved relaxation: after a complete DONE, unfinished trailing bytes the
+  # SDK never dispatches are ignored instead of rejected. A dispatched event
+  # after DONE is still rejected (see the terminal-ordering tests above).
+  test "ignores unfinished bytes after DONE at EOF" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      sse_event(stream_chunk(content: "Before")),
+      "data: [DONE]\n\n",
+      "data: {BAD"
+    ]
+    received = []
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      chunks.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(stream_env(received))
+    assert_equal chunks, received
+  end
+
+  test "allows comments and whitespace after DONE" do
+    body = [
+      sse_event(stream_chunk(content: "Before")),
+      sse_event("[DONE]"),
+      sse_comment("keep-alive after done"),
+      "   \n\n"
+    ].join
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_stream(OPENAI_CHAT_URL, body, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("Hello", model: "openai/gpt-5-nano", streamer: proc { })
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    assert_equal "Before", @response.data.messages.first.output_text
+  end
+
+  test "accepts the DONE marker split across transport callbacks" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      sse_event(stream_chunk(content: "Hi")),
+      "data: [DO",
+      "NE]\n\n"
+    ]
+    received = []
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      chunks.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(stream_env(received))
+    assert_equal chunks, received
+  end
+
+  test "accepts CR-only line endings at EOF" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\r\r",
+      "data: [DONE]\r",
+      "\r"
+    ]
+    received = []
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      chunks.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(stream_env(received))
+    assert_equal chunks, received
+  end
+
+  test "accepts CRLF line endings split across transport callbacks" do
+    adapter = Provider::RubyLlm::StreamingAdapter.new
+    chunks = [
+      "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\r",
+      "\n\r\n",
+      "data: [DONE]\r",
+      "\n\r\n"
+    ]
+    received = []
+    adapter.define_singleton_method(:perform_request) do |_http, callback_env|
+      chunks.each { |chunk| callback_env.request.on_data.call(chunk, 0, callback_env) }
+      true
+    end
+
+    adapter.call(stream_env(received))
+    assert_equal chunks, received
+  end
+
+  # --- boolean/typed chunk shape guards -------------------------------------
+
+  test "rejects boolean-shaped chunk fields for both accounts" do
+    bad_chunks = {
+      delta_false: { "choices" => [ { "index" => 0, "delta" => false } ] },
+      message_false: { "choices" => [ { "index" => 0, "delta" => nil, "message" => false } ] },
+      usage_false: {
+        "choices" => [ { "index" => 0, "delta" => { "content" => "more" } } ],
+        "usage" => false
+      },
+      tool_calls_false: { "choices" => [ { "index" => 0, "delta" => { "tool_calls" => false } } ] },
+      content_false: { "choices" => [ { "index" => 0, "delta" => { "content" => false } } ] },
+      refusal_false: { "choices" => [ { "index" => 0, "delta" => { "refusal" => false } } ] },
+      finish_reason_false: { "choices" => [ { "index" => 0, "delta" => {}, "finish_reason" => false } ] }
+    }
+    accounts = {
+      openai: [ OPENAI_CHAT_URL, "OPENAI_API_KEY", "test-openai-key", "openai/gpt-5-nano", "gpt-5-nano" ],
+      opencode_go: [ OPENCODE_GO_CHAT_URL, "OPENCODE_GO_API_KEY", "test-go-key", "opencode_go/glm-5.3-flash", "glm-5.3-flash" ]
+    }
+
+    accounts.each do |account, (chat_url, credential, token, reference, model_id)|
+      bad_chunks.each do |label, bad_chunk|
+        WebMock.reset!
+        body = [
+          sse_event(stream_chunk(content: "Partial")),
+          sse_event(bad_chunk),
+          sse_event(stream_chunk(finish_reason: "stop")),
+          sse_event("[DONE]")
+        ].join
+
+        stub_live_models(account, entries: [ model_entry(model_id) ], auth_key: token)
+        stub_stream(chat_url, body, token: token)
+
+        response = nil
+        with_env_overrides(credential => token) do
+          response = Provider::RubyLlm.new.chat_response("Hello", model: reference, streamer: proc { })
+        end
+
+        refute response.success?, "expected #{account} #{label} to fail closed"
+        assert_kind_of Provider::RubyLlm::Error, response.error
+        assert_match(/stream was malformed or incomplete/i, response.error.message)
+        assert_equal "Provider::RubyLlm::StreamingAdapter::InvalidStreamError", response.error.details[:error_class], "#{account} #{label}"
+        assert_requested :post, chat_url, times: 1
+      end
     end
   end
 end
