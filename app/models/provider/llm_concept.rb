@@ -22,7 +22,21 @@ module Provider::LlmConcept
   ChatResponse = Data.define(:id, :model, :messages, :function_requests)
   ChatFunctionRequest = Data.define(:id, :call_id, :function_name, :function_args)
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil)
+  # Optional provider-neutral conversation history supplied by the caller,
+  # excluding the current prompt. Entries are plain Hashes with a String or
+  # Symbol +role+ of "user", "assistant", "system", or "tool":
+  #
+  #   { role: "user", content: "..." }
+  #   { role: "assistant", content: "...",
+  #     tool_calls: [ { id: "call-1", name: "get_accounts", arguments: { "family_id" => 1 } } ] }
+  #   { role: "tool", tool_call_id: "call-1", content: "{\"accounts\":[]}" }
+  #   { role: "system", content: "..." }
+  #
+  # Providers translate these into their own message objects internally; no
+  # provider object is accepted or returned. Callers must not mutate the
+  # supplied entries. Omitting +history+ (or passing an empty Array) keeps the
+  # existing single-prompt behavior.
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [])
     raise NotImplementedError, "Subclasses must implement #chat_response"
   end
 

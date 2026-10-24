@@ -92,6 +92,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
       self
     end
 
+    def add_message(_message)
+      self
+    end
+
     def ask(prompt, &block)
       @prompt = prompt
       @chunks.each { |chunk| block.call(chunk) }
@@ -242,6 +246,26 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     stub_request(:post, url)
       .with(headers: { "Authorization" => "Bearer #{token}" })
       .to_return(status: 200, headers: { "Content-Type" => "text/event-stream" }, body: body)
+  end
+
+  # Captures each transmitted Chat Completions payload so provider-neutral
+  # history can be asserted at the public HTTP boundary rather than through
+  # RubyLLM internals.
+  def stub_capturing_chat_stream(url, bodies, token:, content: "History answer")
+    stub_request(:post, url)
+      .with(headers: { "Authorization" => "Bearer #{token}" })
+      .to_return do |request|
+        bodies << JSON.parse(request.body)
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(content: content)),
+            sse_event(stream_chunk(finish_reason: "stop")),
+            sse_event("[DONE]")
+          ].join
+        }
+      end
   end
 
   # A Faraday env for exercising the streaming adapter directly, including
@@ -756,6 +780,246 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     assert @response.success?
     assert_equal "You are a helpful assistant.", chat.instructions
+  end
+
+  # --- optional provider-neutral conversation history -----------------------
+
+  test "treats omitted history and an explicit empty history identically" do
+    bodies = []
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_capturing_chat_stream(OPENAI_CHAT_URL, bodies, token: "test-openai-key")
+
+    omitted = nil
+    empty = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      omitted = @provider.chat_response("CURRENT-PROMPT", model: "openai/gpt-5-nano")
+      empty = @provider.chat_response("CURRENT-PROMPT", model: "openai/gpt-5-nano", history: [])
+    end
+
+    assert omitted.success?
+    assert empty.success?
+    assert_equal 2, bodies.size
+    assert_equal bodies.first.fetch("messages"), bodies.last.fetch("messages")
+    assert_equal [ { "role" => "user", "content" => "CURRENT-PROMPT" } ], bodies.first.fetch("messages")
+  end
+
+  test "replays chronological user and assistant history before the current prompt exactly once" do
+    bodies = []
+    history = [
+      { role: "user", content: "HISTORY-USER-ONE" },
+      { "role" => "assistant", "content" => "HISTORY-ASSISTANT-ONE" },
+      { role: "user", content: "HISTORY-USER-TWO" }
+    ]
+    history_snapshot = history.deep_dup
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_capturing_chat_stream(OPENAI_CHAT_URL, bodies, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response("CURRENT-PROMPT", model: "openai/gpt-5-nano", history: history)
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    messages = bodies.sole.fetch("messages")
+
+    assert_equal %w[user assistant user user], messages.map { |message| message["role"] }
+    assert_equal(
+      [ "HISTORY-USER-ONE", "HISTORY-ASSISTANT-ONE", "HISTORY-USER-TWO", "CURRENT-PROMPT" ],
+      messages.map { |message| message["content"] }
+    )
+    assert_equal 1, messages.count { |message| message["content"] == "CURRENT-PROMPT" }
+    assert_equal history_snapshot, history
+  end
+
+  # The installed chat-completions protocol hoists every system role into the
+  # developer preamble (current instructions first, then historical system
+  # entries) while preserving non-system chronology. The adapter must not
+  # re-apply the current instructions after replaying history.
+  test "replays system history into the developer preamble while retaining current guardrails once" do
+    bodies = []
+    history = [
+      { role: "user", content: "HISTORY-USER-BEFORE" },
+      { role: "system", content: "HISTORY-SYSTEM-NOTE" },
+      { role: "assistant", content: "HISTORY-ASSISTANT-AFTER" }
+    ]
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_capturing_chat_stream(OPENAI_CHAT_URL, bodies, token: "test-openai-key")
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response(
+        "CURRENT-PROMPT", model: "openai/gpt-5-nano",
+        instructions: "CURRENT-GUARDRAILS", history: history
+      )
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    messages = bodies.sole.fetch("messages")
+    developer_messages = messages.select { |message| message["role"] == "developer" }
+
+    assert_equal [ "CURRENT-GUARDRAILS", "HISTORY-SYSTEM-NOTE" ], developer_messages.map { |message| message["content"] }
+    assert_equal 1, messages.count { |message| message["content"] == "CURRENT-GUARDRAILS" }
+    assert_equal 1, messages.count { |message| message["content"] == "HISTORY-SYSTEM-NOTE" }
+    assert_equal(
+      [ "HISTORY-USER-BEFORE", "HISTORY-ASSISTANT-AFTER", "CURRENT-PROMPT" ],
+      messages.reject { |message| message["role"] == "developer" }.map { |message| message["content"] }
+    )
+  end
+
+  test "replays paired tool requests and results without executing tools or auditing history" do
+    McpTools::GetAccounts.expects(:call).never
+
+    bodies = []
+    audits = []
+    history = [
+      { role: "user", content: "HISTORY-TOOL-QUESTION" },
+      {
+        role: "assistant",
+        content: nil,
+        tool_calls: [
+          { id: "hist-call-9f3c1a", name: "get_accounts", arguments: { "family_id" => 987_654 } }
+        ]
+      },
+      {
+        role: "tool",
+        tool_call_id: "hist-call-9f3c1a",
+        content: { accounts: [ { name: "HISTORY-ACCOUNT" } ] }.to_json
+      }
+    ]
+    history_snapshot = history.deep_dup
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_capturing_chat_stream(OPENAI_CHAT_URL, bodies, token: "test-openai-key")
+
+    tool = Provider::RubyLlm::FinancialTool::GetAccounts.new(families(:dylan_family))
+
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      @response = @provider.chat_response(
+        "CURRENT-PROMPT", model: "openai/gpt-5-nano",
+        tool: tool, audit_callback: ->(event) { audits << event }, history: history
+      )
+    end
+
+    assert @response.success?, "expected success, got: #{@response.error&.message}"
+    # The paired history stays a single request: no historical tool round runs.
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+    assert_equal [], audits
+
+    messages = bodies.sole.fetch("messages")
+    assistant = messages.find { |message| message["role"] == "assistant" }
+    assert_equal "", assistant.fetch("content")
+    assert_equal(
+      [ {
+        "id" => "hist-call-9f3c1a",
+        "type" => "function",
+        "function" => { "name" => "get_accounts", "arguments" => { "family_id" => 987_654 }.to_json }
+      } ],
+      assistant.fetch("tool_calls")
+    )
+
+    result = messages.find { |message| message["role"] == "tool" }
+    assert_equal "hist-call-9f3c1a", result.fetch("tool_call_id")
+    assert_equal "HISTORY-ACCOUNT", JSON.parse(result.fetch("content")).dig("accounts", 0, "name")
+    assert_equal 1, messages.count { |message| message["content"] == "CURRENT-PROMPT" }
+    assert_equal history_snapshot, history
+  end
+
+  test "builds a fresh chat per request without accumulating history or depending on previous_response_id" do
+    bodies = []
+    history = [
+      { role: "user", content: "HISTORY-USER" },
+      { role: "assistant", content: "HISTORY-ASSISTANT" }
+    ]
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    stub_capturing_chat_stream(OPENAI_CHAT_URL, bodies, token: "test-openai-key")
+
+    first = nil
+    second = nil
+    with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+      first = @provider.chat_response("CURRENT-PROMPT", model: "openai/gpt-5-nano", history: history)
+      second = @provider.chat_response(
+        "CURRENT-PROMPT", model: "openai/gpt-5-nano",
+        history: history, previous_response_id: "legacy-session-123"
+      )
+    end
+
+    assert first.success?
+    assert second.success?
+    assert_equal 2, bodies.size
+
+    bodies.each_with_index do |body, index|
+      messages = body.fetch("messages")
+      assert_equal(
+        [ "HISTORY-USER", "HISTORY-ASSISTANT", "CURRENT-PROMPT" ],
+        messages.map { |message| message["content"] },
+        "request #{index + 1} must carry the history exactly once"
+      )
+    end
+  end
+
+  test "replays history for both openai and opencode_go without crossing account payloads" do
+    accounts = {
+      openai: [ OPENAI_CHAT_URL, "OPENAI_API_KEY", "test-openai-key", "openai/gpt-5-nano", "gpt-5-nano", "OPENAI-HISTORY", "OPENAI-CURRENT" ],
+      opencode_go: [ OPENCODE_GO_CHAT_URL, "OPENCODE_GO_API_KEY", "test-go-key", "opencode_go/glm-5.3-flash", "glm-5.3-flash", "GO-HISTORY", "GO-CURRENT" ]
+    }
+    captured = {}
+
+    accounts.each do |account, (url, credential, token, reference, model_id, historical, current)|
+      bodies = captured[account] = []
+      stub_live_models(account, entries: [ model_entry(model_id) ], auth_key: token)
+      stub_capturing_chat_stream(url, bodies, token: token, content: "#{account} answer")
+
+      response = nil
+      with_env_overrides(credential => token) do
+        response = Provider::RubyLlm.new.chat_response(
+          current, model: reference, history: [ { role: "user", content: historical } ]
+        )
+      end
+
+      assert response.success?, "expected #{account} success, got: #{response.error&.message}"
+    end
+
+    captured.each do |account, bodies|
+      _, _, _, _, _, historical, current = accounts.fetch(account)
+      messages = bodies.sole.fetch("messages")
+
+      assert_equal [ historical, current ], messages.map { |message| message["content"] }, account.to_s
+      assert_equal 1, messages.count { |message| message["content"] == historical }, account.to_s
+    end
+  end
+
+  test "fails closed on unknown or malformed history instead of silently dropping it" do
+    invalid_histories = {
+      unknown_role: [ { role: "developer", content: "HISTORY-SECRET-CONTENT" } ],
+      missing_role: [ { content: "HISTORY-SECRET-CONTENT" } ],
+      non_hash_entry: [ "HISTORY-SECRET-CONTENT" ],
+      non_array: { role: "user", content: "HISTORY-SECRET-CONTENT" },
+      tool_result_without_id: [ { role: "tool", content: "HISTORY-SECRET-CONTENT" } ],
+      malformed_tool_call: [
+        { role: "assistant", tool_calls: [ { id: "hist-call-1" } ] }
+      ]
+    }
+
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+    RubyLLM.expects(:context).never
+
+    invalid_histories.each do |label, history|
+      response = nil
+      with_env_overrides OPENAI_API_KEY: "test-openai-key" do
+        response = Provider::RubyLlm.new.chat_response(
+          "CURRENT-PROMPT", model: "openai/gpt-5-nano", history: history
+        )
+      end
+
+      refute response.success?, "expected #{label} to fail closed"
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_equal "openai/gpt-5-nano", response.error.details[:model]
+      assert_equal "Provider::RubyLlm::Error", response.error.details[:error_class]
+      assert_equal false, response.error.details[:retryable]
+      refute_match(/HISTORY-SECRET-CONTENT/, response.error.message)
+    end
   end
 
   test "streams text chunks and a final response chunk through the existing streamer contract" do

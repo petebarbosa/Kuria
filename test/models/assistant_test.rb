@@ -67,6 +67,10 @@ class AssistantTest < ActiveSupport::TestCase
       self
     end
 
+    def add_message(_message)
+      self
+    end
+
     def after_message(&block)
       (@after_message_callbacks ||= []) << block
       self
