@@ -1,6 +1,15 @@
 class Assistant
   include Provided, Configurable, Broadcastable
 
+  # Provider-neutral history cannot be reconstructed faithfully from a
+  # completed owner whose audit rows are ambiguous or incomplete. This error is
+  # deliberately generic: persisted arguments/results and financial details
+  # must never leak through the chat error envelope.
+  class HistoryReconstructionError < Provider::Error; end
+
+  HISTORY_RECONSTRUCTION_ERROR_MESSAGE = "Conversation history could not be reconstructed safely.".freeze
+  HISTORY_TOOL_CALL_ID_PREFIX = "history-tool-call-".freeze
+
   attr_reader :chat, :instructions
 
   class << self
@@ -40,7 +49,19 @@ class Assistant
 
     audit_records = {}
     assistant_message = nil
+
+    # Marks whether this attempt's message has been finalized from the
+    # completed provider response. Until then any failure discards the
+    # attempt's partial message; afterwards the reply is preserved even if a
+    # later chat-level persistence step fails.
+    finalized = false
     llm = get_model_provider(message.ai_model)
+
+    # Snapshot the provider-neutral history before this attempt creates any
+    # message or starts a provider request. Reconstruction failure must abort
+    # the turn without touching existing messages and without leaving a
+    # phantom attempt owner. Only RubyLLM accepts the history keyword.
+    history = llm.is_a?(Provider::RubyLlm) ? history_for(message) : nil
 
     assistant_message = AssistantMessage.new(
       chat: chat,
@@ -56,12 +77,6 @@ class Assistant
       assistant_message.append_text!(chunk.data)
     end
 
-    # Marks whether this attempt's message has been finalized from the
-    # completed provider response. Until then any failure discards the
-    # attempt's partial message; afterwards the reply is preserved even if a
-    # later chat-level persistence step fails.
-    finalized = false
-
     provider_options = {
       model: message.ai_model,
       instructions: instructions,
@@ -73,6 +88,7 @@ class Assistant
     # provider keeps its existing call contract, and the family always comes
     # from the chat's authenticated user, never from the model or Current.
     if llm.is_a?(Provider::RubyLlm)
+      provider_options[:history] = history
       provider_options[:tool] = Provider::RubyLlm::FinancialTool::GetAccounts.new(chat.user.family)
       provider_options[:audit_callback] = audit_callback_for(assistant_message, audit_records)
     end
@@ -113,6 +129,7 @@ class Assistant
     INTERRUPTED_TOOL_RESULT = {
       "error" => "Tool execution outcome is unknown because the response was interrupted."
     }.freeze
+    TOOL_RESULT_TOO_LARGE_RESULT = { "error" => "Tool result too large to audit." }.freeze
     MAX_AUDIT_RESULT_BYTES = 100 * 1024
 
     # Persists the single audit owner for this attempt before any tool runs,
@@ -152,7 +169,7 @@ class Assistant
 
     def normalize_audit_result(result)
       text = result.to_s
-      return { "error" => "Tool result too large to audit." } if text.bytesize > MAX_AUDIT_RESULT_BYTES
+      return TOOL_RESULT_TOO_LARGE_RESULT if text.bytesize > MAX_AUDIT_RESULT_BYTES
 
       parsed = JSON.parse(text)
       return parsed if parsed.is_a?(Hash) && parsed.present?
@@ -161,6 +178,153 @@ class Assistant
       { "raw" => text }
     rescue JSON::ParserError
       { "raw" => text }
+    end
+
+    # Builds a provider-neutral snapshot of this chat's persisted conversation
+    # strictly before +message+. The snapshot uses chat.messages directly (not
+    # the debug-dependent conversation view), keeps a deterministic local
+    # (created_at, id) order, and never includes the current message or any
+    # later row — including rows from a previous failed retry attempt.
+    #
+    # Only user messages, non-debug Developer messages, and completed
+    # non-reasoning assistant answers participate. A completed owner's audit
+    # rows are flattened into one assistant tool-request turn per numeric
+    # round, immediately followed by that round's serialized results, and then
+    # the owner's final answer once. Ambiguous or incomplete audit provenance
+    # fails closed rather than silently omitting a historical tool block.
+    def history_for(message)
+      target = chat.messages.find_by(id: message.id)
+      raise_history_reconstruction_error if target.nil?
+
+      earlier_messages = chat.messages
+        .where(
+          "(messages.created_at < :created_at) OR " \
+          "(messages.created_at = :created_at AND messages.id < :id)",
+          created_at: target.created_at,
+          id: target.id
+        )
+        .order(:created_at, :id)
+
+      earlier_messages.each_with_object([]) do |historical, entries|
+        case historical
+        when UserMessage
+          entries << { role: "user", content: historical.content }
+        when DeveloperMessage
+          next if historical.debug? || duplicate_guardrails?(historical)
+
+          entries << { role: "system", content: historical.content }
+        when AssistantMessage
+          entries.concat(assistant_history_entries(historical))
+        else
+          raise_history_reconstruction_error
+        end
+      end
+    end
+
+    def duplicate_guardrails?(developer_message)
+      instructions.present? && developer_message.content == instructions
+    end
+
+    def assistant_history_entries(message)
+      return [] unless message.status == "complete"
+      return [] if message.reasoning?
+      raise_history_reconstruction_error unless message.content.is_a?(String)
+
+      entries = tool_history_entries(message)
+      entries << { role: "assistant", content: message.content }
+      entries
+    end
+
+    def tool_history_entries(message)
+      calls = message.tool_calls.order(:created_at, :id).to_a
+      return [] if calls.empty?
+
+      grouped_history_tool_calls(calls).flat_map do |_round, round_calls|
+        round_calls.each { |call| validate_history_tool_call!(call) }
+
+        tool_calls = round_calls.map { |call| history_tool_call(call) }
+        results = round_calls.map { |call| history_tool_result(call) }
+
+        [ { role: "assistant", content: nil, tool_calls: tool_calls } ] + results
+      end
+    end
+
+    def grouped_history_tool_calls(calls)
+      grouped = Hash.new { |hash, round| hash[round] = [] }
+      seen_identities = {}
+
+      calls.each do |call|
+        round, index = history_tool_round_and_index(call)
+        identity = [ round, index ]
+        raise_history_reconstruction_error if seen_identities.key?(identity)
+
+        seen_identities[identity] = true
+        grouped[round] << [ index, call ]
+      end
+
+      rounds = grouped.keys.sort
+      raise_history_reconstruction_error unless rounds == (1..rounds.size).to_a
+
+      rounds.each_with_object({}) do |round, ordered|
+        calls_by_index = grouped.fetch(round).sort_by { |index, _call| index }
+
+        indexes = calls_by_index.map { |index, _call| index }
+        raise_history_reconstruction_error unless indexes == (0...indexes.size).to_a
+
+        ordered[round] = calls_by_index.map { |_index, call| call }
+      end
+    end
+
+    def history_tool_round_and_index(call)
+      match = /\A(\d+):(\d+)\z/.match(call.provider_id.to_s)
+      raise_history_reconstruction_error unless match
+
+      round = Integer(match[1], 10)
+      index = Integer(match[2], 10)
+      raise_history_reconstruction_error if round < 1
+
+      [ round, index ]
+    end
+
+    def validate_history_tool_call!(call)
+      raise_history_reconstruction_error unless call.is_a?(ToolCall::Function)
+      raise_history_reconstruction_error unless call.provider_call_id.is_a?(String) && call.provider_call_id.present?
+      raise_history_reconstruction_error unless call.function_name.is_a?(String) && call.function_name.present?
+      raise_history_reconstruction_error unless call.function_arguments.is_a?(Hash)
+
+      result = call.function_result
+      raise_history_reconstruction_error unless result.is_a?(Hash) && result.present?
+      raise_history_reconstruction_error if result == PENDING_TOOL_RESULT
+      raise_history_reconstruction_error if result == TOOL_RESULT_TOO_LARGE_RESULT
+      raise_history_reconstruction_error if result == INTERRUPTED_TOOL_RESULT
+    end
+
+    def history_tool_call(call)
+      {
+        id: history_tool_call_id(call),
+        name: call.function_name,
+        arguments: call.function_arguments
+      }
+    end
+
+    def history_tool_result(call)
+      {
+        role: "tool",
+        tool_call_id: history_tool_call_id(call),
+        content: call.function_result.to_json
+      }
+    end
+
+    # A provider call id may repeat across rounds or later calls and RubyLLM
+    # treats an answered id globally. History therefore uses an id derived from
+    # the unique audit row, never the original provider id; saved rows and the
+    # live round keep their original ids untouched.
+    def history_tool_call_id(call)
+      "#{HISTORY_TOOL_CALL_ID_PREFIX}#{call.id}"
+    end
+
+    def raise_history_reconstruction_error
+      raise HistoryReconstructionError, HISTORY_RECONSTRUCTION_ERROR_MESSAGE
     end
 
     # Completes the single AssistantMessage from the finished provider response:

@@ -19,6 +19,10 @@ class Provider::RubyLlm < Provider
   # than this is audited in full and rejected before any of its calls execute.
   MAX_TOOL_CALLS_PER_RESPONSE = 5
 
+  # Caller-supplied history is plain provider-neutral data. Only these roles
+  # are understood; unknown roles fail closed rather than being dropped.
+  HISTORY_ROLES = %w[user assistant system tool].freeze
+
   # Fixed audit reasons. The raw model payload is kept only in audit storage
   # (the caller's persistence callback), never in these messages or logs.
   TOOL_CALL_BUDGET_EXCEEDED_ERROR = "Tool call was not executed because the response exceeded the tool-call limit.".freeze
@@ -109,9 +113,10 @@ class Provider::RubyLlm < Provider
     Catalog.admits?(model)
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil)
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [])
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
+      history_messages = normalize_history(history, model)
       context = ruby_llm_context(reference, streaming: true)
 
       # The catalog is the admission authority: every admitted model is passed
@@ -130,6 +135,13 @@ class Provider::RubyLlm < Provider
       if tool.present?
         chat = chat.with_tools(tool).with_tool_options(concurrency: false)
       end
+
+      # Replay caller-supplied history before installing the live audit hooks:
+      # add_message appends and coerces plain Hashes without executing tools or
+      # firing after_message, so historical rounds never consume the current
+      # request's audit budget. Current instructions are applied exactly once
+      # above and are never re-applied after the replay.
+      history_messages.each { |message| chat.add_message(message) }
 
       audit_state = { round: 0, call_count: 0, identity_by_call_id: {} }
       register_tool_audit_callbacks(chat, audit_callback, audit_state, model) if audit_callback.present?
@@ -229,6 +241,112 @@ class Provider::RubyLlm < Provider
 
     def catalog
       @catalog ||= Catalog.new
+    end
+
+    # Validates caller-supplied provider-neutral history and translates each
+    # entry into the plain attribute Hash RubyLLM's Chat#add_message accepts.
+    # Only fresh copies are handed to the gem, so caller data is never mutated.
+    # Unknown roles and malformed entries fail closed through the provider
+    # envelope instead of being skipped or partially replayed.
+    def normalize_history(history, model)
+      return [] if history.nil?
+
+      unless history.is_a?(Array)
+        raise Error, "History must be an Array of message hashes for model '#{model}'."
+      end
+
+      history.map { |entry| normalize_history_entry(entry, model) }
+    end
+
+    def normalize_history_entry(entry, model)
+      unless entry.is_a?(Hash)
+        raise Error, "Each history entry must be a Hash for model '#{model}'."
+      end
+
+      attributes = entry.symbolize_keys
+      role = attributes[:role].to_s
+
+      unless HISTORY_ROLES.include?(role)
+        raise Error, "Unsupported history role for model '#{model}'. Supported roles: #{HISTORY_ROLES.join(', ')}."
+      end
+
+      content = attributes[:content]
+
+      unless content.nil? || content.is_a?(String)
+        raise Error, "History content must be a String for model '#{model}'."
+      end
+
+      case role
+      when "assistant"
+        normalize_history_assistant(attributes, content, model)
+      when "tool"
+        normalize_history_tool_result(attributes, content, model)
+      else
+        if attributes[:tool_calls].present?
+          raise Error, "Only assistant history may carry tool calls for model '#{model}'."
+        end
+
+        { role: role.to_sym, content: content&.dup }
+      end
+    end
+
+    def normalize_history_assistant(attributes, content, model)
+      message = { role: :assistant, content: content&.dup }
+      raw_calls = attributes[:tool_calls]
+      return message if raw_calls.nil?
+
+      unless raw_calls.is_a?(Array)
+        raise Error, "History tool_calls must be an Array for model '#{model}'."
+      end
+
+      calls = raw_calls.each_with_object({}) do |raw_call, calls_by_id|
+        unless raw_call.is_a?(Hash)
+          raise Error, "Each history tool call must be a Hash for model '#{model}'."
+        end
+
+        call = raw_call.symbolize_keys
+        id = call[:id]
+        name = call[:name]
+        arguments = call[:arguments].nil? ? {} : call[:arguments]
+
+        unless id.is_a?(String) && id.present?
+          raise Error, "History tool call must carry an id for model '#{model}'."
+        end
+
+        unless name.is_a?(String) && name.present?
+          raise Error, "History tool call must carry a name for model '#{model}'."
+        end
+
+        unless arguments.is_a?(Hash)
+          raise Error, "History tool call arguments must be a Hash for model '#{model}'."
+        end
+
+        if calls_by_id.key?(id)
+          raise Error, "History tool call ids must be unique for model '#{model}'."
+        end
+
+        calls_by_id[id.dup] = { id: id.dup, name: name.dup, arguments: arguments.deep_dup }
+      end
+
+      message.merge(tool_calls: calls)
+    end
+
+    def normalize_history_tool_result(attributes, content, model)
+      tool_call_id = attributes[:tool_call_id]
+
+      unless tool_call_id.is_a?(String) && tool_call_id.present?
+        raise Error, "History tool result must carry a tool_call_id for model '#{model}'."
+      end
+
+      unless content.is_a?(String)
+        raise Error, "History tool result content must be a String for model '#{model}'."
+      end
+
+      if attributes[:tool_calls].present?
+        raise Error, "Only assistant history may carry tool calls for model '#{model}'."
+      end
+
+      { role: :tool, content: content.dup, tool_call_id: tool_call_id.dup }
     end
 
     # Audits every parsed tool call before RubyLLM dispatches it, and audits

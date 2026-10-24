@@ -157,6 +157,7 @@ At minimum you will need to set the following environment variables:
 ### Implemented assistant capability
 
 - **#11:** The RubyLLM assistant reads the authenticated Family's accounts through the direct, read-only `get_accounts` tool. The server binds the Family; the model cannot select or supply a family id. Attempted calls are audited before execution.
+- **#12:** The RubyLLM assistant reconstructs conversation history from persisted records: user messages, non-debug Developer messages (replayed as system preamble), and completed non-reasoning assistant answers, including completed tool rounds. Reconstruction is normalized from persisted final answers and audit outcomes rather than the model's exact intermediate tool-round text; ambiguous or incomplete completed tool audits fail safely instead of silently omitting history.
 
 ### Known capability gaps (deferred)
 
@@ -165,7 +166,6 @@ The RubyLLM-only cutover is **not complete**. The capabilities below are explici
 | Issue | Deferred capability                                                         |
 | ----- | --------------------------------------------------------------------------- |
 | #10   | Guarantee ordered RubyLLM streaming and reload parity                       |
-| #12   | Reconstruct three-turn conversations from persisted history                 |
 | #13   | Propose a Transaction without mutating financial data                       |
 | #14   | Confirm a proposed Transaction exactly once                                 |
 | #15   | Run one categorization workflow through RubyLLM Schema                      |
