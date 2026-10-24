@@ -1,9 +1,9 @@
 # Live provider compatibility smoke tests (#19)
 
-These tests establish protocol compatibility for a normal OpenAI account and an
+These tests check protocol compatibility for a normal OpenAI account and an
 OpenCode Go subscription. They are **opt-in only** and must never be part of
-routine CI. No live validation has been run in this checkout; production
-OpenCode Go routing/header compatibility remains blocked as described below.
+routine CI. No live validation has been run in this checkout, so these files
+define coverage, not evidence.
 
 ## Safety model
 
@@ -72,10 +72,9 @@ and production-seam tests through `Provider::RubyLlm`.
 - Real bearer behavior for OpenCode Go: a valid bearer succeeds and an invalid
   bearer is rejected with `401`/`403`.
 
-Most of these are direct HTTP protocol checks. The older file also retains one
+Most of these are direct HTTP protocol checks. The raw HTTP file also retains one
 OpenAI `Provider::RubyLlm` developer-instructions check and a production Go
-check that skips on the blocker described below; the new production-seam file
-adds the bounded adapter checks below.
+check; the production-seam file adds the bounded adapter checks below.
 
 Known Responses-only, Anthropic Messages, and Gemini model references are
 rejected with a clear unsupported-model message. If the configured reference is
@@ -93,36 +92,29 @@ uses:
   appears in the audit tool-call and tool-result events.
 - Strict structured synthetic auto-categorization returns a
   provider-independent `Provider::LlmConcept::AutoCategorization`.
-- Explicit OpenAI and OpenCode Go references are selected independently. The
-  dual-selection test skips when the known production Go routing/header blocker
-  is present instead of claiming parity.
+- Explicit OpenAI and OpenCode Go references are selected independently in the
+  dual-selection test.
 
 The production-seam file also contains a deterministic gate assertion that runs
 without any network access.
 
 ## OpenCode Go canonical transport
 
-The documented canonical endpoints verified by the harness are:
+Kuria reaches OpenCode Go through RubyLLM's hosted inference transport, not an
+OpenCode Server or local runtime:
 
 - Chat Completions: `https://opencode.ai/inference/go/openai/v1/chat/completions`
 - Model list: `https://opencode.ai/inference/go/v1/models`
 
-The canonical transport sends:
+Requests send:
 
 - `Authorization: Bearer <token>`
-- `x-opencode-session: <stable per-conversation id>`
-- a client-specific `User-Agent`
+- `x-opencode-session: ses_<opaque stable per-chat id>`
+- `User-Agent: Kuria/1.0`
 
 A successful model-list response is **availability evidence only**. It does
-not validate credentials. Authentication is proven by an actual chat
-completion, including the invalid-bearer rejection test.
-
-Kuria's production OpenCode Go routing is currently the legacy
-`https://opencode.ai/zen/go/v1` base and does not send `x-opencode-session` or a
-client-specific `User-Agent`. Issue #19 does **not** change production routing.
-Both live files therefore detect and report those blockers and explicitly skip
-their production Go checks instead of claiming parity. The documented canonical
-transport is verified separately by the raw HTTP protocol tests.
+not validate credentials; authentication evidence comes only from an actual
+chat completion, including the invalid-bearer rejection check.
 
 ## Deterministic harness tests
 
