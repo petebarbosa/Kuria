@@ -37,6 +37,13 @@ module Provider::LlmConcept
   # supplied entries. Omitting +history+ (or passing an empty Array) keeps the
   # existing single-prompt behavior.
   #
+  # Optional provider-neutral server-bound conversation identifier. Callers
+  # pass the persisted conversation id (for example Chat.id); it is never
+  # taken from model output, a prompt, or a provider-supplied session. The
+  # RubyLLM provider uses it only to derive an opaque Go session token, so the
+  # same conversation keeps the same session across provider instances.
+  # Omission leaves each standalone request independent.
+  #
   # Provider::RubyLlm additionally accepts an optional +telemetry_callback:+
   # keyword on #chat_response. It receives exactly one frozen, allowlisted
   # Hash per request (success or error):
@@ -62,7 +69,7 @@ module Provider::LlmConcept
   # arguments/results, message content, provider response bodies, API keys,
   # and authorization data are never included. Callback exceptions are
   # swallowed and never change the provider response or error handling.
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [])
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [], conversation_id: nil, telemetry_callback: nil)
     raise NotImplementedError, "Subclasses must implement #chat_response"
   end
 

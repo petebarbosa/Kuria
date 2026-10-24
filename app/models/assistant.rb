@@ -94,6 +94,7 @@ class Assistant
     # come from the chat's authenticated user, never from the model or Current.
     if llm.is_a?(Provider::RubyLlm)
       family = chat.user.family
+      provider_options[:conversation_id] = chat.id
       provider_options[:history] = history
       provider_options[:tool] = [
         Provider::RubyLlm::FinancialTool::GetAccounts.new(family),

@@ -7,7 +7,7 @@ require "socket"
 class LiveProviderHelperTest < ActiveSupport::TestCase
   FakeConfig = Struct.new(
     :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id,
-    :faraday_adapter, :instrumenter, :request_timeout, :max_retries,
+    :opencode_go_session_id, :faraday_adapter, :instrumenter, :request_timeout, :max_retries,
     :retry_interval, :retry_max_interval, :retry_backoff_factor, :retry_interval_randomness,
     keyword_init: true
   )
@@ -55,7 +55,7 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
     url = if account == :openai
       Provider::RubyLlm::OPENAI_BASE_URL + "/models"
     else
-      Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+      Provider::RubyLlm::OPENCODE_GO_MODELS_URL
     end
 
     stub_request(:get, url)
@@ -307,10 +307,10 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
     assert_nil header_value(captured, "authorization")
   end
 
-  test "production OpenCode Go catalog request has bearer but no session or client user agent" do
+  test "production OpenCode Go catalog request uses the dedicated model URL with session and user agent" do
     captured = {}
     openai_url = Provider::RubyLlm::OPENAI_BASE_URL + "/models"
-    go_url = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+    go_url = Provider::RubyLlm::OPENCODE_GO_MODELS_URL
 
     stub_request(:get, openai_url).to_return do |request|
       captured[:openai] = request.headers
@@ -338,13 +338,13 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
 
     assert_equal "Bearer test-openai-key", header_value(captured[:openai], "authorization")
     assert_equal "Bearer test-go-key", header_value(captured[:opencode_go], "authorization")
-    assert_nil header_value(captured[:opencode_go], "x-opencode-session")
-    refute_equal LiveProviderHelper::LIVE_USER_AGENT, header_value(captured[:opencode_go], "user-agent")
+    assert_match(/\Ases_[0-9a-f]{32}\z/, header_value(captured[:opencode_go], "x-opencode-session"))
+    assert_equal Provider::RubyLlm::OPENCODE_GO_USER_AGENT, header_value(captured[:opencode_go], "user-agent")
   end
 
-  test "production OpenCode Go chat request sends bearer but no documented session header" do
+  test "production OpenCode Go chat request sends the canonical session and user-agent headers" do
     captured = nil
-    url = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/chat/completions"
+    url = Provider::RubyLlm::OPENCODE_GO_CHAT_BASE_URL + "/chat/completions"
 
     stub_catalog_models(:opencode_go, ids: %w[glm-5.3-flash], key: "test-go-key")
 
@@ -369,8 +369,8 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
 
     assert response.success?, "expected the production Go boundary to succeed, got: #{response.error&.message}"
     assert_equal "Bearer test-go-key", header_value(captured, "authorization")
-    assert_nil header_value(captured, "x-opencode-session")
-    refute_equal LiveProviderHelper::LIVE_USER_AGENT, header_value(captured, "user-agent")
+    assert_match(/\Ases_[0-9a-f]{32}\z/, header_value(captured, "x-opencode-session"))
+    assert_equal Provider::RubyLlm::OPENCODE_GO_USER_AGENT, header_value(captured, "user-agent")
   end
 
   test "Go routing compatibility detects the legacy base, model-list path, and missing headers" do
@@ -389,15 +389,15 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
     assert_match(/client-specific User-Agent/, joined)
   end
 
-  test "Go routing compatibility accepts the documented base, model list, and headers" do
-    compatibility = LiveProviderHelper.go_routing_compatibility(
-      production_api_base: LiveProviderHelper::CANONICAL_GO_CHAT_BASE,
-      production_models_url: LiveProviderHelper::CANONICAL_GO_MODELS_URL,
-      production_headers: %w[Accept Authorization x-opencode-session User-Agent]
-    )
+  test "Go routing compatibility defaults to the canonical production base, model list, and headers" do
+    compatibility = LiveProviderHelper.go_routing_compatibility
 
     assert compatibility.compatible?
     assert_empty compatibility.blockers
+    assert_equal LiveProviderHelper::CANONICAL_GO_CHAT_BASE, compatibility.production_api_base
+    assert_equal LiveProviderHelper::CANONICAL_GO_MODELS_URL, compatibility.production_models_url
+    assert_includes compatibility.production_headers, "x-opencode-session"
+    assert_includes compatibility.production_headers, "user-agent"
   end
 
   test "production provider boundary keeps OpenAI and OpenCode Go contexts isolated in one process" do
@@ -431,7 +431,10 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
     assert_equal "openai-key", configs[0].openai_api_key
     assert_equal Provider::RubyLlm::OPENAI_BASE_URL, configs[0].openai_api_base
     assert_equal "go-key", configs[1].openai_api_key
-    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, configs[1].openai_api_base
+    assert_equal Provider::RubyLlm::OPENCODE_GO_CHAT_BASE_URL, configs[1].openai_api_base
+    assert_match(/\Ases_[0-9a-f]{32}\z/, configs[1].opencode_go_session_id)
+    assert_nil configs[1].openai_organization_id
+    assert_nil configs[1].openai_project_id
     refute_equal configs[0].openai_api_key, configs[1].openai_api_key
     refute_equal configs[0].openai_api_base, configs[1].openai_api_base
 
@@ -441,7 +444,7 @@ class LiveProviderHelperTest < ActiveSupport::TestCase
     assert_equal true, contexts[0].options[:assume_model_exists]
 
     assert_equal "glm-5.3-flash", contexts[1].options[:model]
-    assert_equal :openai, contexts[1].options[:provider]
+    assert_equal :opencode_go, contexts[1].options[:provider]
     assert_equal :chat_completions, contexts[1].options[:protocol]
     assert_equal true, contexts[1].options[:assume_model_exists]
   end

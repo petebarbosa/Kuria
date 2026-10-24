@@ -37,11 +37,10 @@ module LiveProviderHelper
   CANONICAL_GO_CHAT_COMPLETIONS_URL = "#{CANONICAL_GO_CHAT_BASE}/chat/completions".freeze
   CANONICAL_GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models".freeze
 
-  # The production catalog/transport currently sends only these header names
-  # for OpenCode Go. It does not send the documented x-opencode-session header
-  # or a client-specific User-Agent. This is a detected blocker, not something
-  # this harness changes (production routing is out of scope for #19).
-  PRODUCTION_GO_HEADER_NAMES = %w[Accept Authorization].freeze
+  # Headers sent by Kuria's production OpenCode Go catalog and chat transport.
+  # The routing compatibility check compares these names with the canonical
+  # transport so a regression is reported instead of silently skipping.
+  PRODUCTION_GO_HEADER_NAMES = %w[Accept Authorization x-opencode-session User-Agent].freeze
 
   ACCOUNT_CONFIG = {
     openai: {
@@ -416,12 +415,12 @@ module LiveProviderHelper
   end
 
   # Compares Kuria's production OpenCode Go routing with the documented
-  # canonical endpoint. A non-empty blockers list means parity is NOT proven;
+  # canonical endpoints. A non-empty blockers list means parity is NOT proven;
   # callers must report it instead of claiming success.
   def go_routing_compatibility(production_api_base: nil, production_models_url: nil,
                                production_headers: nil)
-    base = (production_api_base || Provider::RubyLlm::OPENCODE_GO_BASE_URL).to_s.delete_suffix("/")
-    models_url = (production_models_url || "#{base}/models").to_s.delete_suffix("/")
+    base = (production_api_base || Provider::RubyLlm::OPENCODE_GO_CHAT_BASE_URL).to_s.delete_suffix("/")
+    models_url = (production_models_url || Provider::RubyLlm::OPENCODE_GO_MODELS_URL).to_s.delete_suffix("/")
     headers = Array(production_headers || PRODUCTION_GO_HEADER_NAMES).map { |name| name.to_s.downcase }
     blockers = []
 

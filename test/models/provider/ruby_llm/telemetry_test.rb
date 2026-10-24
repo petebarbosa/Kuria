@@ -295,8 +295,8 @@ class Provider::RubyLlm::TelemetryTest < ActiveSupport::TestCase
   end
 
   test "Go telemetry reports the logical account and leaves pricing explicitly unknown" do
-    models_url = "https://opencode.ai/zen/go/v1/models"
-    chat_url = "https://opencode.ai/zen/go/v1/chat/completions"
+    models_url = Provider::RubyLlm::OPENCODE_GO_MODELS_URL
+    chat_url = Provider::RubyLlm::OPENCODE_GO_CHAT_BASE_URL + "/chat/completions"
     credential = "sk-test-go-telemetry-key"
     reference = "opencode_go/deepseek-v4.1-flash"
 
