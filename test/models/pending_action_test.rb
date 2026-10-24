@@ -3,6 +3,7 @@ require "test_helper"
 class PendingActionTest < ActiveSupport::TestCase
   setup do
     @family = families(:dylan_family)
+    @user = users(:family_admin)
     @account = @family.accounts.create!(name: "Test account", balance: 1000, currency: "USD", accountable: Depository.new)
   end
 
@@ -208,4 +209,240 @@ class PendingActionTest < ActiveSupport::TestCase
 
     assert_raises(RuntimeError) { pending.execute! }
   end
+
+  test "attributes a pending transaction to the provided family user" do
+    pending = create_transaction_proposal(user: @user)
+
+    assert_equal @user.id, pending.user_id
+    assert_equal @user, pending.user
+  end
+
+  test "rejects a user from another family without creating a proposal" do
+    assert_no_difference("PendingAction.count") do
+      assert_raises(ActiveRecord::RecordNotFound) do
+        create_transaction_proposal(user: users(:empty))
+      end
+    end
+  end
+
+  test "returns the original proposal for a retried idempotency key" do
+    first = create_transaction_proposal(user: @user, idempotency_key: "provider-call-1")
+    second = nil
+
+    assert_no_difference("PendingAction.count") do
+      second = create_transaction_proposal(user: @user, idempotency_key: "provider-call-1")
+    end
+
+    assert_equal first.id, second.id
+    assert_equal 1, PendingAction.where(id: first.id).count
+  end
+
+  test "mcp create_transaction renders the stored preview when a retry alters financial fields" do
+    params = mcp_create_transaction_params(
+      "amount" => "1000.00",
+      "currency" => "USD",
+      "idempotency_key" => "retry-amount-1"
+    )
+
+    first = McpTools::CreateTransaction.execute(params)
+    pending = PendingAction.find_by!(action_type: "create_transaction")
+
+    assert_match pending.id, mcp_tool_text(first)
+    assert_equal "1000.0", pending.preview["amount"]
+    assert_equal "1000.00", pending.params["amount"]
+
+    retried = nil
+    assert_no_difference("PendingAction.count") do
+      retried = McpTools::CreateTransaction.execute(params.merge("amount" => "1.00"))
+    end
+
+    assert_match pending.id, mcp_tool_text(retried)
+    rendered_preview = JSON.parse(mcp_tool_text(retried)[/Preview: (\{.*\})/, 1])
+
+    assert_equal pending.preview.stringify_keys, rendered_preview
+    assert_equal "1000.0", rendered_preview["amount"]
+  end
+
+  test "scopes idempotent proposals by family, user, action, and key" do
+    other_family = families(:empty)
+    other_account = other_family.accounts.create!(
+      name: "Other account",
+      balance: 0,
+      currency: "USD",
+      accountable: Depository.new
+    )
+
+    no_user = create_transaction_proposal(idempotency_key: "shared-call")
+    other_family_proposal = create_transaction_proposal(
+      family: other_family,
+      params: { "account_id" => other_account.id },
+      idempotency_key: "shared-call"
+    )
+    with_user = create_transaction_proposal(user: @user, idempotency_key: "shared-call")
+    other_action = PendingAction.create_pending!(
+      action_type: "update_transaction",
+      params: { "test" => "value" },
+      preview: { action: "update_transaction" },
+      family: @family,
+      user: @user,
+      idempotency_key: "shared-call"
+    )
+
+    ids = [ no_user.id, other_family_proposal.id, with_user.id, other_action.id ]
+    assert_equal ids.size, ids.uniq.size
+  end
+
+  test "keeps legacy behavior when user and idempotency key are omitted" do
+    first = create_transaction_proposal
+    second = create_transaction_proposal
+
+    refute_equal first.id, second.id
+    assert_nil first.user_id
+    assert_equal 1, PendingAction.where(id: first.id).count
+    assert_equal 1, PendingAction.where(id: second.id).count
+  end
+
+  test "creating a proposal does not mutate financial data" do
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      create_transaction_proposal(user: @user, idempotency_key: "no-mutation")
+    end
+  end
+
+  test "rejects an account from another family" do
+    other_account = families(:empty).accounts.create!(
+      name: "Foreign account",
+      balance: 0,
+      currency: "USD",
+      accountable: Depository.new
+    )
+
+    assert_no_difference("PendingAction.count") do
+      assert_raises(ActiveRecord::RecordNotFound) do
+        create_transaction_proposal(params: { "account_id" => other_account.id })
+      end
+    end
+  end
+
+  test "rejects a category from another family" do
+    assert_no_difference("PendingAction.count") do
+      assert_raises(ActiveRecord::RecordNotFound) do
+        create_transaction_proposal(params: { "category_id" => categories(:one).id })
+      end
+    end
+  end
+
+  test "rejects a merchant from another family" do
+    assert_no_difference("PendingAction.count") do
+      assert_raises(ActiveRecord::RecordNotFound) do
+        create_transaction_proposal(params: { "merchant_id" => merchants(:one).id })
+      end
+    end
+  end
+
+  test "accepts category and merchant references owned by the family" do
+    pending = create_transaction_proposal(
+      params: {
+        "category_id" => categories(:food_and_drink).id,
+        "merchant_id" => merchants(:netflix).id
+      }
+    )
+
+    assert pending.persisted?
+  end
+
+  test "mcp create_transaction forwards server user and idempotency key" do
+    params = mcp_create_transaction_params(
+      "user_id" => @user.id,
+      "idempotency_key" => "mcp-call-1"
+    )
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      first = McpTools::CreateTransaction.execute(params)
+      pending = PendingAction.find_by!(action_type: "create_transaction", user_id: @user.id)
+
+      assert_match pending.id, mcp_tool_text(first)
+      refute pending.params.key?("user_id")
+      refute pending.params.key?("idempotency_key")
+
+      assert_no_difference("PendingAction.count") do
+        second = McpTools::CreateTransaction.execute(params)
+        assert_match pending.id, mcp_tool_text(second)
+      end
+    end
+  end
+
+  test "mcp create_transaction rejects a user outside the family" do
+    params = mcp_create_transaction_params("user_id" => users(:empty).id)
+
+    assert_no_difference([ "PendingAction.count", "Entry.count", "Transaction.count" ]) do
+      result = McpTools::CreateTransaction.execute(params)
+      assert_match(/User not found for family/, mcp_tool_text(result))
+    end
+  end
+
+  test "mcp create_transaction accepts server user and idempotency key keywords" do
+    params = mcp_create_transaction_params
+
+    result = McpTools::CreateTransaction.execute(params, user: @user, idempotency_key: "keyword-call")
+
+    pending = PendingAction.find_by!(action_type: "create_transaction", user_id: @user.id)
+    assert_match pending.id, mcp_tool_text(result)
+    refute pending.params.key?("user_id")
+    refute pending.params.key?("idempotency_key")
+  end
+
+  test "mcp create_transaction does not advertise server attribution keys" do
+    properties = McpTools::CreateTransaction.tool_input_schema[:properties].keys.map(&:to_s)
+
+    refute_includes properties, "user_id"
+    refute_includes properties, "idempotency_key"
+  end
+
+  test "mcp create_transaction keeps legacy params shape without attribution" do
+    params = mcp_create_transaction_params
+
+    assert_difference("PendingAction.count", 1) do
+      result = McpTools::CreateTransaction.execute(params)
+
+      pending = PendingAction.find_by!(action_type: "create_transaction")
+      assert_nil pending.user_id
+      assert_equal params, pending.params
+      assert_match pending.id, mcp_tool_text(result)
+    end
+  end
+
+  private
+    def create_transaction_proposal(**options)
+      PendingAction.create_pending!(
+        action_type: options.delete(:action_type) || "create_transaction",
+        params: transaction_proposal_params(options.delete(:params) || {}),
+        preview: { action: "create_transaction" },
+        family: options.delete(:family) || @family,
+        user: options.delete(:user),
+        idempotency_key: options.delete(:idempotency_key)
+      )
+    end
+
+    def transaction_proposal_params(overrides = {})
+      {
+        "account_id" => @account.id,
+        "date" => Date.current.to_s,
+        "name" => "Proposal",
+        "amount" => "15.00"
+      }.merge(overrides)
+    end
+
+    def mcp_create_transaction_params(overrides = {})
+      {
+        "family_id" => @family.id,
+        "account_id" => @account.id,
+        "date" => Date.current.to_s,
+        "name" => "MCP proposal",
+        "amount" => "25.00"
+      }.merge(overrides)
+    end
+
+    def mcp_tool_text(result)
+      result[:content].first[:text]
+    end
 end

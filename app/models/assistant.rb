@@ -39,6 +39,11 @@ class Assistant
   # soon as the first visible content arrives, or when the request ends without
   # content, whether it succeeds or fails.
   def respond_to(message)
+    started_at = monotonic_time
+    outcome = :error
+    provider_telemetry_event = nil
+    tool_outcome_by_identity = {}
+
     thinking_stopped = false
     stop_thinking_once = lambda do
       next if thinking_stopped
@@ -85,12 +90,25 @@ class Assistant
     }
 
     # Tool binding and audit persistence are RubyLLM-only. The legacy
-    # provider keeps its existing call contract, and the family always comes
-    # from the chat's authenticated user, never from the model or Current.
+    # provider keeps its existing call contract, and the family and user always
+    # come from the chat's authenticated user, never from the model or Current.
     if llm.is_a?(Provider::RubyLlm)
+      family = chat.user.family
       provider_options[:history] = history
-      provider_options[:tool] = Provider::RubyLlm::FinancialTool::GetAccounts.new(chat.user.family)
-      provider_options[:audit_callback] = audit_callback_for(assistant_message, audit_records)
+      provider_options[:tool] = [
+        Provider::RubyLlm::FinancialTool::GetAccounts.new(family),
+        Provider::RubyLlm::FinancialTool::ProposeTransaction.new(
+          family: family,
+          user: chat.user,
+          message_id: message.id
+        )
+      ]
+      provider_options[:audit_callback] = audit_callback_for(
+        assistant_message,
+        audit_records,
+        tool_outcome_by_identity
+      )
+      provider_options[:telemetry_callback] = proc { |event| provider_telemetry_event = event }
     end
 
     response = llm.chat_response(message.content, **provider_options)
@@ -110,8 +128,10 @@ class Assistant
     finalize_assistant_message(assistant_message, completed)
     finalized = true
     close_outstanding_audit_records!(audit_records, fallback: NOT_EXECUTED_TOOL_RESULT)
+    resolve_pending_tool_outcomes!(tool_outcome_by_identity, :rejected)
     persist_provider_response!(completed, provider: llm)
 
+    outcome = :success
     completed
   rescue => e
     stop_thinking_once.call
@@ -121,6 +141,15 @@ class Assistant
       audit_records: audit_records
     )
     chat.add_error(e)
+  ensure
+    resolve_pending_tool_outcomes!(tool_outcome_by_identity, :failed) if outcome == :error
+    emit_request_telemetry(
+      message: message,
+      provider_event: provider_telemetry_event,
+      tool_outcome_by_identity: tool_outcome_by_identity,
+      outcome: outcome,
+      started_at: started_at
+    )
   end
 
   private
@@ -137,12 +166,15 @@ class Assistant
     # round-local identity (the provider call id can repeat across rounds) and
     # keep their actual provider id separately. Raw malformed arguments are
     # accepted only into `function_arguments`, never into errors or logs.
-    def audit_callback_for(assistant_message, audit_records)
+    def audit_callback_for(assistant_message, audit_records, tool_outcome_by_identity)
       proc do |event|
         case event[:type]
         when :tool_calls
           assistant_message.save! unless assistant_message.persisted?
+          status = event[:status] == :not_executed ? :rejected : :pending
+
           Array(event[:calls]).each do |call|
+            tool_outcome_by_identity[call[:identity]] = status
             audit_records[call[:identity]] = ToolCall::Function.create!(
               message: assistant_message,
               provider_id: call[:identity],
@@ -153,12 +185,55 @@ class Assistant
             )
           end
         when :tool_result
-          record = audit_records[event[:identity]]
+          identity = event[:identity]
+          result = normalize_audit_result(event[:result])
+          tool_outcome_by_identity[identity] = tool_outcome_for_result(result) if identity.present?
+
+          record = audit_records[identity]
           next if record.nil?
 
-          record.update!(function_result: normalize_audit_result(event[:result]))
+          record.update!(function_result: result)
         end
       end
+    end
+
+    def tool_outcome_for_result(result)
+      failed = result.is_a?(Hash) && (result["error"].present? || result[:error].present?)
+      failed ? :failed : :succeeded
+    end
+
+    def resolve_pending_tool_outcomes!(tool_outcome_by_identity, resolved_outcome)
+      tool_outcome_by_identity.each do |identity, outcome|
+        tool_outcome_by_identity[identity] = resolved_outcome if outcome == :pending
+      end
+    end
+
+    def summarize_tool_outcomes(tool_outcome_by_identity)
+      tool_outcome_by_identity.each_value.with_object({ succeeded: 0, rejected: 0, failed: 0 }) do |outcome, counts|
+        key = %i[succeeded rejected failed].include?(outcome) ? outcome : :failed
+        counts[key] += 1
+      end
+    end
+
+    def emit_request_telemetry(message:, provider_event:, tool_outcome_by_identity:, outcome:, started_at:)
+      AssistantTelemetry.record(
+        message_id: message&.id,
+        chat_id: chat&.id,
+        provider_event: provider_event,
+        tool_outcomes: summarize_tool_outcomes(tool_outcome_by_identity),
+        outcome: outcome,
+        latency_ms: elapsed_ms(started_at)
+      )
+    rescue StandardError
+      nil
+    end
+
+    def elapsed_ms(started_at)
+      ((monotonic_time - started_at) * 1000).round
+    end
+
+    def monotonic_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     def audit_tool_result_for(event)

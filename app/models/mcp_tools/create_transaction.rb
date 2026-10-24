@@ -61,9 +61,11 @@ module McpTools
       }
     end
 
-    def self.execute(params)
-      family = resolve_family(params["family_id"])
+    def self.execute(params, user: nil, idempotency_key: nil)
+      family = McpTools::Base.resolve_family(params["family_id"])
       account = family.accounts.find(params["account_id"])
+      user ||= resolve_user(params["user_id"], family)
+      idempotency_key = idempotency_key.presence || params["idempotency_key"].presence
       currency = params["currency"] || family.currency
       amount = BigDecimal(params["amount"])
       kind = params["kind"] || "standard"
@@ -82,20 +84,31 @@ module McpTools
 
       pending = PendingAction.create_pending!(
         action_type: "create_transaction",
-        params: params,
+        params: params.except("user_id", "idempotency_key"),
         preview: preview,
-        family: family
+        family: family,
+        user: user,
+        idempotency_key: idempotency_key
       )
 
       {
         content: [
-          { type: "text", text: "Transaction prepared for review.\nPreview: #{preview.to_json}\n\nCall confirm_action with pending_action_id: #{pending.id} to execute." }
+          { type: "text", text: "Transaction prepared for review.\nPreview: #{pending.preview.to_json}\n\nCall confirm_action with pending_action_id: #{pending.id} to execute." }
         ]
       }
-    rescue ActiveRecord::RecordNotFound => e
-      { content: [ { type: "text", text: "Error: #{e.message}" } ] }
     rescue => e
       { content: [ { type: "text", text: "Error: #{e.message}" } ] }
     end
+
+    # The user and idempotency key are supplied by the server, never advertised
+    # in the tool schema. A user id is only trusted after it resolves inside the
+    # tool call's family, so it can never widen the authorization scope.
+    def self.resolve_user(user_id, family)
+      return nil if user_id.blank?
+
+      family.users.find_by(id: user_id) ||
+        raise(ActiveRecord::RecordNotFound, "User not found for family")
+    end
+    private_class_method :resolve_user
   end
 end

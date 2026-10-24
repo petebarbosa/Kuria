@@ -19,6 +19,20 @@ class Provider::RubyLlm < Provider
   # than this is audited in full and rejected before any of its calls execute.
   MAX_TOOL_CALLS_PER_RESPONSE = 5
 
+  # Optional privacy-safe telemetry contract. The callback receives exactly one
+  # frozen, allowlisted event per #chat_response call (success or error). It
+  # never receives prompts, tool arguments/results, message content, provider
+  # response bodies, API keys, or authorization headers.
+  TELEMETRY_EVENT_NAME = :ruby_llm_request
+
+  EMPTY_TELEMETRY_USAGE = {
+    input_tokens: nil,
+    output_tokens: nil,
+    cache_read_tokens: nil,
+    cache_write_tokens: nil,
+    reasoning_tokens: nil
+  }.freeze
+
   # Caller-supplied history is plain provider-neutral data. Only these roles
   # are understood; unknown roles fail closed rather than being dropped.
   HISTORY_ROLES = %w[user assistant system tool].freeze
@@ -113,8 +127,11 @@ class Provider::RubyLlm < Provider
     Catalog.admits?(model)
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [])
-    with_provider_response(error_transformer: error_transformer_for(model)) do
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [], telemetry_callback: nil)
+    started_at = monotonic_time
+    chat = nil
+
+    response = with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
       history_messages = normalize_history(history, model)
       context = ruby_llm_context(reference, streaming: true)
@@ -159,11 +176,21 @@ class Provider::RubyLlm < Provider
         raise Error, "RubyLLM returned an empty completion for model '#{model}'."
       end
 
-      response = build_response(final_message, model)
+      chat_response = build_response(final_message, model)
 
-      streamer.call(ChatStreamChunk.new(type: "response", data: response)) if streamer.present?
-      response
+      streamer.call(ChatStreamChunk.new(type: "response", data: chat_response)) if streamer.present?
+      chat_response
     end
+
+    emit_telemetry(
+      telemetry_callback,
+      model: model,
+      response: response,
+      usage_entries: telemetry_usage_entries(chat),
+      started_at: started_at
+    )
+
+    response
   end
 
   # Auto-categorization (#15) through RubyLLM structured output. The model
@@ -696,5 +723,154 @@ class Provider::RubyLlm < Provider
       else
         false
       end
+    end
+
+    # Emits exactly one allowlisted event per request. Callback failures are
+    # deliberately swallowed: telemetry is observational and must never turn a
+    # successful provider response into an error, hide a provider error, or
+    # interrupt streaming. The RubyLLM instrumenter stays disabled (see
+    # #ruby_llm_context) because its payloads include tools and arguments.
+    def emit_telemetry(callback, model:, response:, usage_entries:, started_at:)
+      return unless callback.respond_to?(:call)
+
+      latency_ms = ((monotonic_time - started_at) * 1000).round
+
+      callback.call(
+        telemetry_event(
+          model: model,
+          response: response,
+          usage_entries: usage_entries,
+          latency_ms: latency_ms
+        )
+      )
+    rescue StandardError
+      nil
+    end
+
+    def telemetry_event(model:, response:, usage_entries:, latency_ms:)
+      account, model_id, provider = telemetry_identity(model)
+      telemetry_entries = usage_entries.map { |entry| [ entry, telemetry_entry_usage(entry) ] }
+      usage = aggregate_telemetry_usage(telemetry_entries)
+      success = response.success?
+
+      {
+        event: TELEMETRY_EVENT_NAME,
+        outcome: success ? :success : :error,
+        provider: provider,
+        model: model,
+        latency_ms: latency_ms,
+        # The usage ledger includes every tool round and failed attempt, not
+        # just the final message. None of those entries is a transport retry:
+        # #chat_response is streaming and Kuria configures
+        # STREAMING_MAX_RETRIES to zero.
+        retry_count: STREAMING_MAX_RETRIES,
+        usage: usage,
+        estimated_cost: aggregate_telemetry_cost(
+          account: account,
+          model_id: model_id,
+          telemetry_entries: telemetry_entries
+        ),
+        error_class: success ? nil : telemetry_error_class(response.error),
+        error_retryable: success ? nil : telemetry_error_retryable(response.error)
+      }.freeze
+    end
+
+    def telemetry_identity(model)
+      metadata = Catalog.metadata_for(model)
+      parsed = parse_reference(model)
+
+      [
+        metadata&.dig(:account) || parsed&.dig(:provider)&.to_sym,
+        metadata&.dig(:model_id) || parsed&.dig(:model_id),
+        metadata&.dig(:billing_account) || parsed&.dig(:provider)
+      ]
+    end
+
+    # RubyLLM's Chat keeps a request-local ledger of every physical attempt,
+    # including each tool round and failed attempts. This is not the Chat's
+    # message list: caller-supplied history is replayed with #add_message and
+    # never creates usage entries. A fake seam without #usage_entries yields an
+    # empty ledger rather than assuming zero usage.
+    def telemetry_usage_entries(chat)
+      return [] unless chat.respond_to?(:usage_entries)
+
+      Array(chat.usage_entries)
+    end
+
+    def telemetry_entry_usage(entry)
+      tokens = entry.respond_to?(:tokens) ? entry.tokens : nil
+      telemetry_tokens_usage(tokens)
+    end
+
+    def telemetry_tokens_usage(tokens)
+      return EMPTY_TELEMETRY_USAGE if tokens.nil?
+
+      {
+        input_tokens: telemetry_token(tokens, :input),
+        output_tokens: telemetry_token(tokens, :output),
+        cache_read_tokens: telemetry_token(tokens, :cache_read),
+        cache_write_tokens: telemetry_token(tokens, :cache_write),
+        reasoning_tokens: telemetry_token(tokens, :thinking)
+      }.freeze
+    end
+
+    # Only entries that actually reported usage contribute token counts. An
+    # entry with no reported usage does not make the other entries' billed
+    # tokens disappear, but it does keep the cost unknown (below), because a
+    # possibly-billed failed attempt must not be treated as a known zero.
+    def aggregate_telemetry_usage(telemetry_entries)
+      reported = telemetry_entries
+        .select { |entry, usage| telemetry_usage_available?(entry, usage) }
+        .map(&:last)
+
+      return EMPTY_TELEMETRY_USAGE if reported.empty?
+
+      EMPTY_TELEMETRY_USAGE.keys.to_h do |key|
+        values = reported.map { |usage| usage[key] }
+        [ key, values.any?(&:nil?) ? nil : values.sum ]
+      end.freeze
+    end
+
+    def telemetry_usage_available?(entry, usage)
+      return entry.usage_available? if entry.respond_to?(:usage_available?)
+
+      usage.any? { |_key, value| !value.nil? }
+    end
+
+    # Each entry is priced separately against the request's explicit account
+    # and canonical model, then the entry results are summed. Any entry with
+    # unknown usage or an unknown component keeps the total unknown. Reasoning
+    # is priced inside each entry by Pricing, so it is never double counted.
+    def aggregate_telemetry_cost(account:, model_id:, telemetry_entries:)
+      results = telemetry_entries.map do |_entry, usage|
+        Pricing.estimate(account: account, model_id: model_id, tokens: usage)
+      end
+      results << Pricing.estimate(account: account, model_id: model_id, tokens: EMPTY_TELEMETRY_USAGE) if results.empty?
+      Pricing.aggregate(results).to_h.freeze
+    end
+
+    def telemetry_token(tokens, reader)
+      return nil unless tokens.respond_to?(reader)
+
+      value = tokens.public_send(reader)
+      value.is_a?(Integer) ? value : nil
+    end
+
+    def telemetry_error_class(error)
+      return nil if error.nil?
+
+      details = error.respond_to?(:details) ? error.details : nil
+      return details[:error_class].presence if details.is_a?(Hash) && details[:error_class].present?
+
+      error.class.name
+    end
+
+    def telemetry_error_retryable(error)
+      details = error.respond_to?(:details) ? error.details : nil
+      details[:retryable] if details.is_a?(Hash)
+    end
+
+    def monotonic_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 end

@@ -36,6 +36,32 @@ module Provider::LlmConcept
   # provider object is accepted or returned. Callers must not mutate the
   # supplied entries. Omitting +history+ (or passing an empty Array) keeps the
   # existing single-prompt behavior.
+  #
+  # Provider::RubyLlm additionally accepts an optional +telemetry_callback:+
+  # keyword on #chat_response. It receives exactly one frozen, allowlisted
+  # Hash per request (success or error):
+  #
+  #   {
+  #     event: :ruby_llm_request,
+  #     outcome: :success | :error,
+  #     provider: "openai" | "opencode_go",
+  #     model: "openai/gpt-5-nano",
+  #     latency_ms: Integer,
+  #     retry_count: Integer,
+  #     usage: {
+  #       input_tokens:, output_tokens:, cache_read_tokens:,
+  #       cache_write_tokens:, reasoning_tokens:
+  #     },
+  #     estimated_cost: { usd:, known:, source:, reason: },
+  #     error_class: String | nil,
+  #     error_retryable: true | false | nil
+  #   }
+  #
+  # Token counts are nil when the provider did not report them. A nil +usd+
+  # with +known: false+ means unknown pricing, never zero. Prompt text, tool
+  # arguments/results, message content, provider response bodies, API keys,
+  # and authorization data are never included. Callback exceptions are
+  # swallowed and never change the provider response or error handling.
   def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [])
     raise NotImplementedError, "Subclasses must implement #chat_response"
   end
