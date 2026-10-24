@@ -24,7 +24,11 @@ module Assistant::Configurable
 
           ## Context
 
-          The only supported tool is the read-only `get_accounts` tool. It returns the authenticated family's accounts, and the server binds it to that family. You must not select a family or pass a family_id.
+          The supported tools are:
+          - `get_accounts`, a read-only tool that returns the authenticated family's accounts.
+          - `propose_transaction`, a proposal-only tool that prepares a transaction for the authenticated family. It does not create or change any financial data. A proposal is not executed until the user explicitly reviews and confirms it.
+
+          The server binds both tools to the authenticated family. You must not select a family or pass a family_id, user_id, or any other scope identifier.
 
           ## Your rules
 
@@ -66,7 +70,9 @@ module Assistant::Configurable
 
           ### Tool usage rules
 
-          - Call `get_accounts` directly with no arguments. Never pass a family_id or any other family identifier to a tool.
+          - Call `get_accounts` directly with no arguments. Never pass a family_id, user_id, or any other scope identifier to a tool.
+          - `propose_transaction` accepts only transaction fields: account_id, date, name, amount, currency, category_id, merchant_id, and kind. Never pass family_id, user_id, or any other scope identifier to it.
+          - After `propose_transaction` returns a pending proposal, tell the user what will be created and ask them to confirm it. Do not claim the transaction was created. Never confirm or execute a proposal yourself.
           - For tools that require dates, use the current date as your reference point: #{Date.current}
           - If you suspect that you do not have enough data to 100% accurately answer, be transparent about it and state exactly what
             the data you're presenting represents and what context it is in (i.e. date range, account, etc.)

@@ -1,3 +1,4 @@
+require "digest"
 require "securerandom"
 
 class Provider::RubyLlm < Provider
@@ -6,9 +7,68 @@ class Provider::RubyLlm < Provider
   Error = Class.new(Provider::Error)
 
   OPENAI_BASE_URL = "https://api.openai.com/v1".freeze
-  OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1".freeze
+  # Official OpenCode Go endpoints. The Go inference service exposes its live
+  # model list at /inference/go/v1/models, while its OpenAI-compatible chat
+  # API lives at /inference/go/openai/v1 (chat completions are posted to
+  # /inference/go/openai/v1/chat/completions). The legacy /zen/go/v1 paths are
+  # intentionally not used.
+  OPENCODE_GO_BASE_URL = "https://opencode.ai/inference/go/v1".freeze
+  OPENCODE_GO_CHAT_BASE_URL = "https://opencode.ai/inference/go/openai/v1".freeze
+  OPENCODE_GO_MODELS_URL = "#{OPENCODE_GO_BASE_URL}/models".freeze
+  OPENCODE_GO_SESSION_HEADER = "x-opencode-session".freeze
+  OPENCODE_GO_SESSION_PREFIX = "ses_".freeze
+  # Hash namespace for server-bound Chat identifiers. Including a fixed
+  # namespace keeps the derived token scoped to this use; the raw identifier
+  # never leaves the process.
+  OPENCODE_GO_CONVERSATION_SESSION_NAMESPACE = "kuria:opencode_go:conversation".freeze
+  # Go requires each client to identify itself instead of presenting a generic
+  # HTTP-library or SDK user agent.
+  OPENCODE_GO_USER_AGENT = "Kuria/1.0".freeze
 
   SUPPORTED_PROVIDER_REFERENCES = %w[openai opencode_go].freeze
+
+  # RubyLLM custom provider for the official OpenCode Go OpenAI-compatible
+  # Chat Completions API. A dedicated provider (rather than reusing :openai)
+  # gives Go authoritative request headers: RubyLLM merges provider headers
+  # after chat-level headers, so this is the stable 2.1.1 seam that can set a
+  # client User-Agent and the required session header without affecting
+  # OpenAI. It exposes Chat Completions only; Responses/Anthropic/Gemini
+  # transports are never registered for Go. The session id comes from the
+  # per-call context (derived from the server-bound conversation), with an
+  # opaque per-instance fallback, and is never derived from model output.
+  class OpenCodeGoProvider < RubyLLM::Provider
+    protocol :chat_completions, RubyLLM::Protocols::ChatCompletions
+
+    def api_base
+      @config.openai_api_base || OPENCODE_GO_CHAT_BASE_URL
+    end
+
+    def headers
+      {
+        "Authorization" => "Bearer #{@config.openai_api_key}",
+        OPENCODE_GO_SESSION_HEADER => @config.opencode_go_session_id.presence || session_id,
+        "User-Agent" => OPENCODE_GO_USER_AGENT
+      }.compact
+    end
+
+    def session_id
+      @session_id ||= Provider::RubyLlm.request_session_id
+    end
+
+    def self.configuration_options
+      %i[opencode_go_session_id]
+    end
+
+    def self.configuration_requirements
+      %i[openai_api_key]
+    end
+
+    def self.assume_models_exist?
+      true
+    end
+  end
+
+  RubyLLM::Provider.register :opencode_go, OpenCodeGoProvider
 
   # Legacy structured-output enrichment guard: the workflows this provider
   # replaces cap a single request at 25 transactions. Preserved so an
@@ -18,6 +78,20 @@ class Provider::RubyLlm < Provider
   # Fixed per-response tool-call budget. A response that requests more calls
   # than this is audited in full and rejected before any of its calls execute.
   MAX_TOOL_CALLS_PER_RESPONSE = 5
+
+  # Optional privacy-safe telemetry contract. The callback receives exactly one
+  # frozen, allowlisted event per #chat_response call (success or error). It
+  # never receives prompts, tool arguments/results, message content, provider
+  # response bodies, API keys, or authorization headers.
+  TELEMETRY_EVENT_NAME = :ruby_llm_request
+
+  EMPTY_TELEMETRY_USAGE = {
+    input_tokens: nil,
+    output_tokens: nil,
+    cache_read_tokens: nil,
+    cache_write_tokens: nil,
+    reasoning_tokens: nil
+  }.freeze
 
   # Caller-supplied history is plain provider-neutral data. Only these roles
   # are understood; unknown roles fail closed rather than being dropped.
@@ -54,6 +128,29 @@ class Provider::RubyLlm < Provider
   RETRY_INTERVAL_RANDOMNESS = 0.5
 
   class << self
+    # An opaque, non-identifying Go request session id. Go uses it only for
+    # routing/prompt-cache affinity; it is generated per provider instance (or
+    # per standalone catalog), never derived from a model, prompt, user, or
+    # credential, and is never logged by Kuria.
+    def request_session_id
+      "#{OPENCODE_GO_SESSION_PREFIX}#{SecureRandom.hex(16)}"
+    end
+
+    # Deterministic, opaque session id for a server-bound conversation
+    # identifier (Chat.id). The same conversation therefore keeps the same Go
+    # routing/prompt-cache session across fresh provider instances, while the
+    # raw identifier and caller data never appear in the header. A blank
+    # identifier (standalone call or enrichment) gets an independent generated
+    # session instead.
+    def conversation_session_id(conversation_id)
+      return request_session_id if conversation_id.blank?
+
+      digest = Digest::SHA256.hexdigest(
+        "#{OPENCODE_GO_CONVERSATION_SESSION_NAMESPACE}:#{conversation_id}"
+      )
+      "#{OPENCODE_GO_SESSION_PREFIX}#{digest[0, 32]}"
+    end
+
     # The immutable positive catalog (Provider::RubyLlm::Catalog#manifest) is
     # the supported-model source for admin selection. Admission authority is
     # the catalog, never RubyLLM's bundled 1.16 registry, which Kuria never
@@ -113,17 +210,22 @@ class Provider::RubyLlm < Provider
     Catalog.admits?(model)
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [])
-    with_provider_response(error_transformer: error_transformer_for(model)) do
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [], conversation_id: nil, telemetry_callback: nil)
+    started_at = monotonic_time
+    chat = nil
+
+    response = with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
       history_messages = normalize_history(history, model)
-      context = ruby_llm_context(reference, streaming: true)
+      session_id = conversation_id.present? && reference[:account] == :opencode_go ?
+        self.class.conversation_session_id(conversation_id) : nil
+      context = ruby_llm_context(reference, streaming: true, session_id: session_id)
 
       # The catalog is the admission authority: every admitted model is passed
       # with assume_model_exists: true (RubyLLM 2.1.1's bundled registry may be
       # stale for current manifest IDs and is never refreshed by Kuria).
-      # The protocol is pinned: RubyLLM 2.1 otherwise defaults OpenAI (and
-      # OpenCode Go, which reuses the OpenAI provider) to the Responses API.
+      # The protocol is pinned so no provider can silently default to a
+      # different transport.
       chat = context.chat(
         model: reference[:model_id],
         provider: reference[:provider],
@@ -159,11 +261,21 @@ class Provider::RubyLlm < Provider
         raise Error, "RubyLLM returned an empty completion for model '#{model}'."
       end
 
-      response = build_response(final_message, model)
+      chat_response = build_response(final_message, model)
 
-      streamer.call(ChatStreamChunk.new(type: "response", data: response)) if streamer.present?
-      response
+      streamer.call(ChatStreamChunk.new(type: "response", data: chat_response)) if streamer.present?
+      chat_response
     end
+
+    emit_telemetry(
+      telemetry_callback,
+      model: model,
+      response: response,
+      usage_entries: telemetry_usage_entries(chat),
+      started_at: started_at
+    )
+
+    response
   end
 
   # Auto-categorization (#15) through RubyLLM structured output. The model
@@ -240,7 +352,15 @@ class Provider::RubyLlm < Provider
     ChatResponse = Provider::LlmConcept::ChatResponse
 
     def catalog
-      @catalog ||= Catalog.new
+      @catalog ||= Catalog.new(session_id: opencode_go_session_id)
+    end
+
+    # Stable for this provider instance so its live Go model-list lookups share
+    # one opaque session. Chat and structured requests get their own
+    # provider-instance session inside RubyLLM. A new provider instance gets a
+    # fresh id.
+    def opencode_go_session_id
+      @opencode_go_session_id ||= self.class.request_session_id
     end
 
     # Validates caller-supplied provider-neutral history and translates each
@@ -470,12 +590,12 @@ class Provider::RubyLlm < Provider
     end
 
     # Isolated per-call RubyLLM context carrying the resolved account's key and
-    # API base plus the adapter-local bounded execution budget. The per-call
-    # context duplicates the global configuration, which may carry OpenAI
-    # organization/project headers; these are cleared ONLY for OpenCode Go so a
-    # Go request never inherits the normal OpenAI billing identity, while
-    # normal OpenAI calls keep the deployment's own identity.
-    def ruby_llm_context(reference, streaming:)
+    # API base plus the adapter-local bounded execution budget. OpenAI keeps the
+    # deployment's inherited organization/project identity. OpenCode Go uses the
+    # dedicated :opencode_go provider with the same isolated credential/base,
+    # and explicitly clears inherited organization/project headers so no
+    # OpenAI billing identity can leak into a Go request.
+    def ruby_llm_context(reference, streaming:, session_id: nil)
       RubyLLM.context do |config|
         config.openai_api_key = reference[:api_key]
         config.openai_api_base = reference[:api_base]
@@ -493,6 +613,7 @@ class Provider::RubyLlm < Provider
         config.retry_interval_randomness = RETRY_INTERVAL_RANDOMNESS
 
         if reference[:account] == :opencode_go
+          config.opencode_go_session_id = session_id.presence || self.class.request_session_id
           config.openai_organization_id = nil
           config.openai_project_id = nil
         end
@@ -579,6 +700,10 @@ class Provider::RubyLlm < Provider
     end
 
     def build_reference(metadata, model)
+      unless metadata[:protocol] == :chat_completions
+        raise Error, "Unsupported protocol '#{metadata[:protocol]}' for model '#{model}'. RubyLLM only supports Chat Completions for this catalog; Responses, Anthropic Messages, and Gemini transports are not enabled."
+      end
+
       api_key = Catalog.api_key_for(metadata[:credential_source])
 
       if api_key.blank?
@@ -696,5 +821,154 @@ class Provider::RubyLlm < Provider
       else
         false
       end
+    end
+
+    # Emits exactly one allowlisted event per request. Callback failures are
+    # deliberately swallowed: telemetry is observational and must never turn a
+    # successful provider response into an error, hide a provider error, or
+    # interrupt streaming. The RubyLLM instrumenter stays disabled (see
+    # #ruby_llm_context) because its payloads include tools and arguments.
+    def emit_telemetry(callback, model:, response:, usage_entries:, started_at:)
+      return unless callback.respond_to?(:call)
+
+      latency_ms = ((monotonic_time - started_at) * 1000).round
+
+      callback.call(
+        telemetry_event(
+          model: model,
+          response: response,
+          usage_entries: usage_entries,
+          latency_ms: latency_ms
+        )
+      )
+    rescue StandardError
+      nil
+    end
+
+    def telemetry_event(model:, response:, usage_entries:, latency_ms:)
+      account, model_id, provider = telemetry_identity(model)
+      telemetry_entries = usage_entries.map { |entry| [ entry, telemetry_entry_usage(entry) ] }
+      usage = aggregate_telemetry_usage(telemetry_entries)
+      success = response.success?
+
+      {
+        event: TELEMETRY_EVENT_NAME,
+        outcome: success ? :success : :error,
+        provider: provider,
+        model: model,
+        latency_ms: latency_ms,
+        # The usage ledger includes every tool round and failed attempt, not
+        # just the final message. None of those entries is a transport retry:
+        # #chat_response is streaming and Kuria configures
+        # STREAMING_MAX_RETRIES to zero.
+        retry_count: STREAMING_MAX_RETRIES,
+        usage: usage,
+        estimated_cost: aggregate_telemetry_cost(
+          account: account,
+          model_id: model_id,
+          telemetry_entries: telemetry_entries
+        ),
+        error_class: success ? nil : telemetry_error_class(response.error),
+        error_retryable: success ? nil : telemetry_error_retryable(response.error)
+      }.freeze
+    end
+
+    def telemetry_identity(model)
+      metadata = Catalog.metadata_for(model)
+      parsed = parse_reference(model)
+
+      [
+        metadata&.dig(:account) || parsed&.dig(:provider)&.to_sym,
+        metadata&.dig(:model_id) || parsed&.dig(:model_id),
+        metadata&.dig(:billing_account) || parsed&.dig(:provider)
+      ]
+    end
+
+    # RubyLLM's Chat keeps a request-local ledger of every physical attempt,
+    # including each tool round and failed attempts. This is not the Chat's
+    # message list: caller-supplied history is replayed with #add_message and
+    # never creates usage entries. A fake seam without #usage_entries yields an
+    # empty ledger rather than assuming zero usage.
+    def telemetry_usage_entries(chat)
+      return [] unless chat.respond_to?(:usage_entries)
+
+      Array(chat.usage_entries)
+    end
+
+    def telemetry_entry_usage(entry)
+      tokens = entry.respond_to?(:tokens) ? entry.tokens : nil
+      telemetry_tokens_usage(tokens)
+    end
+
+    def telemetry_tokens_usage(tokens)
+      return EMPTY_TELEMETRY_USAGE if tokens.nil?
+
+      {
+        input_tokens: telemetry_token(tokens, :input),
+        output_tokens: telemetry_token(tokens, :output),
+        cache_read_tokens: telemetry_token(tokens, :cache_read),
+        cache_write_tokens: telemetry_token(tokens, :cache_write),
+        reasoning_tokens: telemetry_token(tokens, :thinking)
+      }.freeze
+    end
+
+    # Only entries that actually reported usage contribute token counts. An
+    # entry with no reported usage does not make the other entries' billed
+    # tokens disappear, but it does keep the cost unknown (below), because a
+    # possibly-billed failed attempt must not be treated as a known zero.
+    def aggregate_telemetry_usage(telemetry_entries)
+      reported = telemetry_entries
+        .select { |entry, usage| telemetry_usage_available?(entry, usage) }
+        .map(&:last)
+
+      return EMPTY_TELEMETRY_USAGE if reported.empty?
+
+      EMPTY_TELEMETRY_USAGE.keys.to_h do |key|
+        values = reported.map { |usage| usage[key] }
+        [ key, values.any?(&:nil?) ? nil : values.sum ]
+      end.freeze
+    end
+
+    def telemetry_usage_available?(entry, usage)
+      return entry.usage_available? if entry.respond_to?(:usage_available?)
+
+      usage.any? { |_key, value| !value.nil? }
+    end
+
+    # Each entry is priced separately against the request's explicit account
+    # and canonical model, then the entry results are summed. Any entry with
+    # unknown usage or an unknown component keeps the total unknown. Reasoning
+    # is priced inside each entry by Pricing, so it is never double counted.
+    def aggregate_telemetry_cost(account:, model_id:, telemetry_entries:)
+      results = telemetry_entries.map do |_entry, usage|
+        Pricing.estimate(account: account, model_id: model_id, tokens: usage)
+      end
+      results << Pricing.estimate(account: account, model_id: model_id, tokens: EMPTY_TELEMETRY_USAGE) if results.empty?
+      Pricing.aggregate(results).to_h.freeze
+    end
+
+    def telemetry_token(tokens, reader)
+      return nil unless tokens.respond_to?(reader)
+
+      value = tokens.public_send(reader)
+      value.is_a?(Integer) ? value : nil
+    end
+
+    def telemetry_error_class(error)
+      return nil if error.nil?
+
+      details = error.respond_to?(:details) ? error.details : nil
+      return details[:error_class].presence if details.is_a?(Hash) && details[:error_class].present?
+
+      error.class.name
+    end
+
+    def telemetry_error_retryable(error)
+      details = error.respond_to?(:details) ? error.details : nil
+      details[:retryable] if details.is_a?(Hash)
+    end
+
+    def monotonic_time
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 end

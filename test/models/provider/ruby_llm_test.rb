@@ -9,7 +9,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   # adapter is allowed to touch (RubyLLM.context / context.chat / chat.ask).
   class FakeConfig
     attr_reader :openai_api_key, :openai_api_base, :openai_organization_id, :openai_project_id,
-      :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
+      :opencode_go_session_id, :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
       :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter, :instrumenter
 
     def openai_api_key=(value)
@@ -26,6 +26,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
 
     def openai_project_id=(value)
       @openai_project_id = value
+    end
+
+    def opencode_go_session_id=(value)
+      @opencode_go_session_id = value
     end
 
     def request_timeout=(value)
@@ -168,9 +172,14 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
   end
 
   OPENAI_MODELS_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/models"
-  OPENCODE_GO_MODELS_URL = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+  # Official OpenCode Go endpoints (https://opencode.ai/v2/docs/console/go).
+  # The Go chat API is OpenAI-compatible under /go/openai/v1, while the live
+  # model list lives under /go/v1/models. They are deliberately not derived
+  # from one another so a regression cannot silently hit the legacy /zen/go
+  # endpoint or the wrong Go path.
+  OPENCODE_GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models".freeze
   OPENAI_CHAT_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
-  OPENCODE_GO_CHAT_URL = Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/chat/completions"
+  OPENCODE_GO_CHAT_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions".freeze
 
   setup do
     @provider = Provider::RubyLlm.new
@@ -305,6 +314,13 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     marker
   end
 
+  # WebMock exposes request header names with the transmitted casing. Look up
+  # case-insensitively so a header-casing change in an HTTP library cannot make
+  # a transport assertion pass vacuously.
+  def header_value(request, name)
+    request.headers.find { |header, _value| header.to_s.casecmp?(name) }&.last
+  end
+
   # Runs two provider requests in controlled overlap: both first-round HTTP
   # responses wait at request_barrier, then both tool executions wait at
   # tool_barrier. Separate provider/tool/callback/streamer instances prove the
@@ -398,9 +414,9 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     opencode_go = Provider::RubyLlm.supported_models.fetch("opencode_go/glm-5.3-flash")
     assert_equal :opencode_go, opencode_go[:account]
     assert_equal "glm-5.3-flash", opencode_go[:model_id]
-    assert_equal :openai, opencode_go[:provider]
+    assert_equal :opencode_go, opencode_go[:provider]
     assert_equal :chat_completions, opencode_go[:protocol]
-    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, opencode_go[:api_base]
+    assert_equal "https://opencode.ai/inference/go/openai/v1", opencode_go[:api_base]
     assert_equal "OPENCODE_GO_API_KEY", opencode_go[:credential_source]
     assert_equal "opencode_go", opencode_go[:billing_account]
     assert_equal true, opencode_go[:assume_model_exists]
@@ -1157,13 +1173,267 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     assert_equal Provider::RubyLlm::OPENAI_BASE_URL, openai_config.openai_api_base
     assert_equal({ model: "gpt-5-nano", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, openai_context.chat_options)
     assert_equal "go-key-1", go_config.openai_api_key
-    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
-    assert_equal({ model: "glm-5.3-flash", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
+    assert_equal "https://opencode.ai/inference/go/openai/v1", go_config.openai_api_base
+    assert_equal({ model: "glm-5.3-flash", provider: :opencode_go, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
 
     # Billing metadata never crosses: each reference resolves to its own
     # account through the catalog.
     assert_equal "openai", Provider::RubyLlm.supported_models.fetch("openai/gpt-5-nano")[:billing_account]
     assert_equal "opencode_go", Provider::RubyLlm.supported_models.fetch("opencode_go/glm-5.3-flash")[:billing_account]
+  end
+
+  # Official OpenCode Go transport (https://opencode.ai/v2/docs/console/go):
+  # every Go request carries an opaque session id and a client-specific
+  # User-Agent, while the chat and model-list endpoints are the current
+  # /inference/go paths. No legacy /zen/go request may be made.
+  test "uses the official Go endpoints, session, and client headers for catalog, chat, and structured requests in one process" do
+    legacy_models_url = "https://opencode.ai/zen/go/v1/models"
+    legacy_chat_url = "https://opencode.ai/zen/go/v1/chat/completions"
+
+    go_requests = []
+    openai_requests = []
+    go_chat_count = 0
+
+    stub_request(:get, OPENCODE_GO_MODELS_URL).to_return do |request|
+      go_requests << request
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { object: "list", data: [ model_entry("glm-5.3-flash") ] }.to_json
+      }
+    end
+
+    stub_request(:post, OPENCODE_GO_CHAT_URL).to_return do |request|
+      go_requests << request
+      go_chat_count += 1
+
+      if go_chat_count == 1
+        {
+          status: 200,
+          headers: { "Content-Type" => "text/event-stream" },
+          body: [
+            sse_event(stream_chunk(content: "Go answer")),
+            sse_event(stream_chunk(finish_reason: "stop")),
+            sse_event("[DONE]")
+          ].join
+        }
+      else
+        structured = { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+        {
+          status: 200,
+          headers: { "Content-Type" => "application/json" },
+          body: {
+            id: "chatcmpl-go-structured",
+            object: "chat.completion",
+            created: 1,
+            model: "glm-5.3-flash",
+            choices: [ { index: 0, message: { role: "assistant", content: structured.to_json }, finish_reason: "stop" } ]
+          }.to_json
+        }
+      end
+    end
+
+    stub_request(:get, OPENAI_MODELS_URL).to_return do |request|
+      openai_requests << request
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { object: "list", data: [ model_entry("gpt-5-nano") ] }.to_json
+      }
+    end
+
+    stub_request(:post, OPENAI_CHAT_URL).to_return do |request|
+      openai_requests << request
+      {
+        status: 200,
+        headers: { "Content-Type" => "text/event-stream" },
+        body: [
+          sse_event(stream_chunk(content: "OpenAI answer")),
+          sse_event(stream_chunk(finish_reason: "stop")),
+          sse_event("[DONE]")
+        ].join
+      }
+    end
+
+    original_org = RubyLLM.config.openai_organization_id
+    original_project = RubyLLM.config.openai_project_id
+    RubyLLM.config.openai_organization_id = "org-inherited"
+    RubyLLM.config.openai_project_id = "proj-inherited"
+
+    begin
+      with_env_overrides OPENAI_API_KEY: "test-openai-key", OPENCODE_GO_API_KEY: "test-go-key" do
+        chat = @provider.chat_response("GO-CHAT", model: "opencode_go/glm-5.3-flash")
+        assert chat.success?, "expected Go chat success, got: #{chat.error&.message}"
+
+        structured = @provider.auto_categorize(
+          transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ],
+          model: "opencode_go/glm-5.3-flash"
+        )
+        assert structured.success?, "expected Go structured success, got: #{structured.error&.message}"
+
+        openai = @provider.chat_response("OPENAI-CHAT", model: "openai/gpt-5-nano")
+        assert openai.success?, "expected OpenAI chat success, got: #{openai.error&.message}"
+      end
+    ensure
+      RubyLLM.config.openai_organization_id = original_org
+      RubyLLM.config.openai_project_id = original_project
+    end
+
+    assert_requested :get, OPENCODE_GO_MODELS_URL, times: 1
+    assert_requested :post, OPENCODE_GO_CHAT_URL, times: 2
+    assert_requested :get, OPENAI_MODELS_URL, times: 1
+    assert_requested :post, OPENAI_CHAT_URL, times: 1
+    assert_not_requested :get, legacy_models_url
+    assert_not_requested :post, legacy_chat_url
+
+    # Every Go request (catalog, chat, structured) carries its own opaque
+    # lifecycle session; OpenAI requests remain isolated and never inherit it.
+    go_sessions = go_requests.map { |request| header_value(request, "x-opencode-session") }
+    assert_equal 3, go_sessions.size
+    assert go_sessions.all? { |session| session.match?(/\Ases_[0-9a-f]{32}\z/) }
+
+    go_requests.each do |request|
+      assert_equal "Bearer test-go-key", header_value(request, "Authorization")
+      assert_equal "Kuria/1.0", header_value(request, "User-Agent"), "Go request #{request.method.upcase} #{request.uri}"
+      assert_nil header_value(request, "OpenAI-Organization")
+      assert_nil header_value(request, "OpenAI-Project")
+    end
+
+    openai_requests.each do |request|
+      assert_equal "Bearer test-openai-key", header_value(request, "Authorization")
+      assert_nil header_value(request, "x-opencode-session")
+      refute_equal "Kuria/1.0", header_value(request, "User-Agent")
+    end
+
+    # Normal OpenAI billing identity is preserved; Go clears the inherited
+    # org/project identity.
+    openai_chat_request = openai_requests.find { |request| request.uri.path.end_with?("/chat/completions") }
+    assert_equal "org-inherited", header_value(openai_chat_request, "OpenAI-Organization")
+    assert_equal "proj-inherited", header_value(openai_chat_request, "OpenAI-Project")
+  end
+
+  test "derives one opaque Go session from the conversation identifier across fresh providers and ignores external session ids" do
+    sessions = []
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+
+    stub_request(:post, OPENCODE_GO_CHAT_URL).to_return do |request|
+      sessions << header_value(request, "x-opencode-session")
+      {
+        status: 200,
+        headers: { "Content-Type" => "text/event-stream" },
+        body: [
+          sse_event(stream_chunk(content: "Go answer")),
+          sse_event(stream_chunk(finish_reason: "stop")),
+          sse_event("[DONE]")
+        ].join
+      }
+    end
+
+    responses = []
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      responses << Provider::RubyLlm.new.chat_response(
+        "Hello", model: "opencode_go/glm-5.3-flash", conversation_id: "chat-42"
+      )
+      responses << Provider::RubyLlm.new.chat_response(
+        "Hello", model: "opencode_go/glm-5.3-flash", conversation_id: "chat-42",
+        previous_response_id: "external-opencode-session"
+      )
+      responses << Provider::RubyLlm.new.chat_response(
+        "Hello", model: "opencode_go/glm-5.3-flash", conversation_id: "chat-43"
+      )
+      responses << Provider::RubyLlm.new.chat_response(
+        "Hello", model: "opencode_go/glm-5.3-flash"
+      )
+    end
+
+    assert responses.all?(&:success?), responses.map { |response| response.error&.message }.inspect
+    assert_equal 4, sessions.size
+    assert sessions.all? { |session| session.match?(/\Ases_[0-9a-f]{32}\z/) }
+
+    # Same Chat.id, including a fresh provider instance and an attempted
+    # external legacy session, always resolves to the same opaque token.
+    assert_equal sessions[0], sessions[1]
+    # Different chats and standalone (no conversation) calls are independent.
+    refute_equal sessions[0], sessions[2]
+    refute_equal sessions[0], sessions[3]
+    refute_equal "ses_chat-42", sessions[0]
+    refute_match(/chat-42/, sessions[0])
+    refute_match(/external-opencode-session/, sessions[1])
+  end
+
+  test "gives standalone Go enrichment requests independent sessions and OpenAI no Go session" do
+    go_sessions = []
+    openai_sessions = []
+    stub_live_models(:opencode_go, entries: [ model_entry("glm-5.3-flash") ], auth_key: "test-go-key")
+    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
+
+    stub_request(:post, OPENCODE_GO_CHAT_URL).to_return do |request|
+      go_sessions << header_value(request, "x-opencode-session")
+      content = { "categorizations" => [ { "transaction_id" => "1", "category_name" => "Groceries" } ] }
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: {
+          id: "chatcmpl-go-enrichment",
+          object: "chat.completion",
+          created: 1,
+          model: "glm-5.3-flash",
+          choices: [ { index: 0, message: { role: "assistant", content: content.to_json }, finish_reason: "stop" } ]
+        }.to_json
+      }
+    end
+
+    stub_request(:post, OPENAI_CHAT_URL).to_return do |request|
+      openai_sessions << header_value(request, "x-opencode-session")
+      {
+        status: 200,
+        headers: { "Content-Type" => "text/event-stream" },
+        body: [
+          sse_event(stream_chunk(content: "OpenAI answer")),
+          sse_event(stream_chunk(finish_reason: "stop")),
+          sse_event("[DONE]")
+        ].join
+      }
+    end
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key", OPENAI_API_KEY: "test-openai-key" do
+      2.times do
+        response = Provider::RubyLlm.new.auto_categorize(
+          transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ],
+          model: "opencode_go/glm-5.3-flash"
+        )
+        assert response.success?, response.error&.message
+      end
+
+      response = Provider::RubyLlm.new.chat_response(
+        "Hello", model: "openai/gpt-5-nano", conversation_id: "chat-42"
+      )
+      assert response.success?, response.error&.message
+    end
+
+    assert_equal 2, go_sessions.size
+    assert go_sessions.all? { |session| session.match?(/\Ases_[0-9a-f]{32}\z/) }
+    refute_equal go_sessions[0], go_sessions[1]
+    assert_nil openai_sessions.sole
+  end
+
+  test "rejects a catalogued non-chat-completions protocol instead of switching transports" do
+    reference = "opencode_go/glm-5.3-flash"
+    metadata = Provider::RubyLlm::Catalog.manifest.fetch(reference).merge(protocol: :responses)
+
+    Provider::RubyLlm::Catalog.stubs(:metadata_for).with(reference).returns(metadata)
+    Provider::RubyLlm::Catalog.stubs(:api_key_for).with("OPENCODE_GO_API_KEY").returns("test-go-key")
+    Provider::RubyLlm::Catalog.any_instance.expects(:available?).never
+    RubyLLM.expects(:context).never
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      response = @provider.chat_response("Hello", model: reference)
+      refute response.success?
+      assert_nil response.data
+      assert_kind_of Provider::RubyLlm::Error, response.error
+      assert_match(/protocol/i, response.error.message)
+      refute_match(/test-go-key/, response.error.message)
+    end
   end
 
   test "keeps per-call provider contexts isolated from the global RubyLLM config" do
@@ -1182,6 +1452,7 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
     # mutated, so its provider options stay at their defaults.
     assert_nil RubyLLM.config.openai_api_key
     assert_nil RubyLLM.config.openai_api_base
+    assert_nil RubyLLM.config.opencode_go_session_id
   end
 
   test "never refreshes or mutates the global RubyLLM model registry" do
@@ -2260,10 +2531,10 @@ class Provider::RubyLlmTest < ActiveSupport::TestCase
       @provider.auto_categorize(transactions: [ { id: "1" } ], user_categories: [ { name: "Groceries" } ], model: "opencode_go/glm-5.3-flash")
     end
 
-    assert_equal({ model: "glm-5.3-flash", provider: :openai, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
+    assert_equal({ model: "glm-5.3-flash", provider: :opencode_go, protocol: :chat_completions, assume_model_exists: true }, go_context.chat_options)
 
     assert_equal "test-go-key", go_config.openai_api_key
-    assert_equal Provider::RubyLlm::OPENCODE_GO_BASE_URL, go_config.openai_api_base
+    assert_equal "https://opencode.ai/inference/go/openai/v1", go_config.openai_api_base
     assert_equal 120, go_config.request_timeout
     assert_equal 1, go_config.max_retries
     assert_equal 0.5, go_config.retry_interval

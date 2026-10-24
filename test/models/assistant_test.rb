@@ -4,11 +4,12 @@ class AssistantTest < ActiveSupport::TestCase
   include ProviderTestHelper
 
   OPENAI_CHAT_URL = Provider::RubyLlm::OPENAI_BASE_URL + "/chat/completions"
+  OPENCODE_GO_CHAT_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions".freeze
 
   # Deterministic stand-ins for the RubyLLM gem boundary so the end-to-end
   # RubyLLM path never calls a live model API.
   class FakeConfig
-    attr_reader :openai_api_key, :openai_api_base
+    attr_reader :openai_api_key, :openai_api_base, :opencode_go_session_id
     attr_accessor :request_timeout, :max_retries, :retry_interval, :retry_max_interval,
       :retry_backoff_factor, :retry_interval_randomness, :faraday_adapter, :instrumenter
 
@@ -18,6 +19,10 @@ class AssistantTest < ActiveSupport::TestCase
 
     def openai_api_base=(value)
       @openai_api_base = value
+    end
+
+    def opencode_go_session_id=(value)
+      @opencode_go_session_id = value
     end
 
     # The OpenCode Go branch clears these so a Go request never inherits the
@@ -248,6 +253,50 @@ class AssistantTest < ActiveSupport::TestCase
       content: "Hello from Go.",
       ai_model: "opencode_go/glm-5.3-flash"
     )
+  end
+
+  test "keeps one opaque Go session per chat across assistant turns and separates chats" do
+    Provider::RubyLlm::Catalog.any_instance.stubs(:available?).returns(true)
+
+    sessions = []
+    stub_request(:post, OPENCODE_GO_CHAT_URL).to_return do |request|
+      sessions << header_value(request, "x-opencode-session")
+      {
+        status: 200,
+        headers: { "Content-Type" => "text/event-stream" },
+        body: sse_body(content_chunk("Go reply"), finish_chunk("stop"), "[DONE]")
+      }
+    end
+
+    @message.update!(ai_model: "opencode_go/glm-5.3-flash")
+    second_message = @chat.messages.create!(
+      type: "UserMessage",
+      content: "And again?",
+      ai_model: "opencode_go/glm-5.3-flash"
+    )
+    other_chat = Chat.create!(title: "Other conversation", user: @chat.user)
+    other_message = other_chat.messages.create!(
+      type: "UserMessage",
+      content: "Other chat prompt",
+      ai_model: "opencode_go/glm-5.3-flash"
+    )
+
+    with_env_overrides OPENCODE_GO_API_KEY: "test-go-key" do
+      @chat.assistant.respond_to(@message)
+      @chat.assistant.respond_to(second_message)
+      other_chat.assistant.respond_to(other_message)
+    end
+
+    assert_nil @chat.reload.error
+    assert_nil other_chat.reload.error
+    assert_equal 3, sessions.size
+    assert sessions.all? { |session| session.match?(/\Ases_[0-9a-f]{32}\z/) }
+
+    # Fresh provider instances within the same Chat derive the same session;
+    # another Chat never shares it.
+    assert_equal sessions[0], sessions[1]
+    refute_equal sessions[0], sessions[2]
+    refute_equal "ses_#{@chat.id}", sessions[0]
   end
 
   # --- Observable streaming contract (issue #10) -------------------------
@@ -1255,6 +1304,10 @@ class AssistantTest < ActiveSupport::TestCase
   end
 
   private
+    def header_value(request, name)
+      request.headers.find { |header, _value| header.to_s.casecmp?(name) }&.last
+    end
+
     def stub_openai_stream(*responses)
       stubbed = responses.map do |response|
         if response.is_a?(Hash)

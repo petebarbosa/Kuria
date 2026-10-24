@@ -1,5 +1,8 @@
+require "digest"
+
 class PendingAction < ApplicationRecord
   belongs_to :family
+  belongs_to :user, optional: true
 
   validates :action_type, presence: true
   validates :params, :preview, :expires_at, presence: true
@@ -11,14 +14,29 @@ class PendingAction < ApplicationRecord
   TTL = 10.minutes
 
   class << self
-    def create_pending!(action_type:, params:, preview:, family:)
-      create!(
+    def create_pending!(action_type:, params:, preview:, family:, user: nil, idempotency_key: nil)
+      validate_user!(user, family)
+      validate_references!(action_type, params, family)
+
+      attributes = {
         action_type: action_type,
         params: params,
         preview: preview,
         family: family,
+        user: user,
         expires_at: TTL.from_now
+      }
+
+      key = idempotency_key.presence
+      return create!(attributes) unless key
+
+      attributes[:id] = deterministic_id(
+        family: family,
+        user: user,
+        action_type: action_type,
+        idempotency_key: key
       )
+      create_idempotent!(attributes)
     end
 
     def confirm_and_execute!(id:, confirmed_by: nil)
@@ -33,6 +51,70 @@ class PendingAction < ApplicationRecord
       )
       action
     end
+
+    private
+
+      # A retry of the same provider tool call must return the original
+      # proposal instead of creating another actionable action. The primary key
+      # is derived from the family, user, action, and provider idempotency key,
+      # so the database's unique constraint resolves concurrent duplicates.
+      def create_idempotent!(attributes)
+        existing = find_by(id: attributes[:id])
+        return existing if existing
+
+        transaction(requires_new: true) { create!(attributes) }
+      rescue ActiveRecord::RecordNotUnique
+        find_by!(id: attributes[:id])
+      end
+
+      def deterministic_id(family:, user:, action_type:, idempotency_key:)
+        digest = Digest::SHA256.hexdigest(
+          [ family.id, user&.id, action_type, idempotency_key ].map(&:to_s).join("\0")
+        )
+        hex = digest[0, 32]
+        hex[12] = "5"
+        hex[16] = ((hex[16].to_i(16) & 0x3) | 0x8).to_s(16)
+
+        [ hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12] ].join("-")
+      end
+
+      def validate_user!(user, family)
+        return if user.nil?
+
+        family.users.find(user.id)
+      end
+
+      def validate_references!(action_type, params, family)
+        return unless action_type == "create_transaction"
+
+        validate_account_reference!(params, family)
+        validate_category_reference!(params, family)
+        validate_merchant_reference!(params, family)
+      end
+
+      def validate_account_reference!(params, family)
+        return if family.accounts.exists?(id: param_value(params, "account_id"))
+
+        raise ActiveRecord::RecordNotFound, "Account not found for family"
+      end
+
+      def validate_category_reference!(params, family)
+        id = param_value(params, "category_id")
+        return if id.blank? || family.categories.exists?(id: id)
+
+        raise ActiveRecord::RecordNotFound, "Category not found for family"
+      end
+
+      def validate_merchant_reference!(params, family)
+        id = param_value(params, "merchant_id")
+        return if id.blank? || family.merchants.exists?(id: id)
+
+        raise ActiveRecord::RecordNotFound, "Merchant not found for family"
+      end
+
+      def param_value(params, key)
+        params[key] || params[key.to_sym]
+      end
   end
 
   def expired?

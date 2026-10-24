@@ -123,10 +123,13 @@ class Provider
         opencode_go: {
           display_name: "OpenCode Go",
           prefix: "opencode_go/",
-          api_base: OPENCODE_GO_BASE_URL,
+          # Chat requests use the OpenAI-compatible /go/openai/v1 base; the
+          # live model list is served from /go/v1/models (see models_url).
+          api_base: OPENCODE_GO_CHAT_BASE_URL,
+          models_url: OPENCODE_GO_MODELS_URL,
           credential_source: "OPENCODE_GO_API_KEY",
           billing_account: "opencode_go",
-          ruby_llm_provider: :openai,
+          ruby_llm_provider: :opencode_go,
           shutdown_filtering: false,
           manifest: %w[
             glm-5.3-flash
@@ -209,8 +212,12 @@ class Provider
         end
       end
 
-      def initialize
+      def initialize(session_id: nil)
         @available_references = {}
+        # Go model-list requests carry an opaque session id. The owning
+        # provider passes its model-list session; a standalone catalog (for
+        # example the admin selection listing) gets its own fresh id.
+        @session_id = session_id.presence || Provider::RubyLlm.request_session_id
       end
 
       # Whether a reference is currently admitted: catalogued AND returned by
@@ -255,17 +262,28 @@ class Provider
       end
 
       private
-        # Authenticated live model list for an account. OpenAI is
-        # authenticated with its own key; the OpenCode Go Bearer key is sent
-        # for forward compatibility even though the endpoint is currently
-        # public/global. Both accounts use the OpenAI-compatible Chat
-        # Completions protocol.
+        # Authenticated live model list for an account. OpenAI is authenticated
+        # with its own key and base. OpenCode Go uses the official
+        # /inference/go/v1/models endpoint and, like every Go request, carries
+        # the opaque session id and client-specific User-Agent. Both accounts
+        # use the OpenAI-compatible Chat Completions protocol for inference.
         def live_model_entries(account)
           config = ACCOUNTS.fetch(account)
           api_key = self.class.api_key_for(config[:credential_source])
 
           if api_key.blank?
             raise Error, "Missing #{config[:credential_source]} for the #{account} model catalog request. Set #{config[:credential_source]} to check live #{account} model availability."
+          end
+
+          models_url = config[:models_url].presence || "#{config[:api_base]}/models"
+          headers = {
+            "Accept" => "application/json",
+            "Authorization" => "Bearer #{api_key}"
+          }
+
+          if account == :opencode_go
+            headers[OPENCODE_GO_SESSION_HEADER] = @session_id
+            headers["User-Agent"] = OPENCODE_GO_USER_AGENT
           end
 
           connection = Faraday.new(
@@ -278,11 +296,10 @@ class Provider
             f.request :json
             f.response :json
             f.response :raise_error
-            f.headers["Accept"] = "application/json"
-            f.headers["Authorization"] = "Bearer #{api_key}"
+            headers.each { |name, value| f.headers[name] = value }
           end
 
-          body = connection.get("#{config[:api_base]}/models").body
+          body = connection.get(models_url).body
           entries = body.is_a?(Hash) ? body["data"] : nil
 
           unless entries.is_a?(Array) && entries.all? { |entry| entry.is_a?(Hash) && entry["id"].is_a?(String) && entry["id"].present? }
