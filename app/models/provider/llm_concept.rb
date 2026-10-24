@@ -36,7 +36,13 @@ module Provider::LlmConcept
   # provider object is accepted or returned. Callers must not mutate the
   # supplied entries. Omitting +history+ (or passing an empty Array) keeps the
   # existing single-prompt behavior.
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [])
+  # Optional provider-neutral server-bound conversation identifier. Callers
+  # pass the persisted conversation id (for example Chat.id); it is never
+  # taken from model output, a prompt, or a provider-supplied session. The
+  # RubyLLM provider uses it only to derive an opaque Go session token, so the
+  # same conversation keeps the same session across provider instances.
+  # Omission leaves each standalone request independent.
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, history: [], conversation_id: nil)
     raise NotImplementedError, "Subclasses must implement #chat_response"
   end
 

@@ -88,6 +88,7 @@ class Assistant
     # provider keeps its existing call contract, and the family always comes
     # from the chat's authenticated user, never from the model or Current.
     if llm.is_a?(Provider::RubyLlm)
+      provider_options[:conversation_id] = chat.id
       provider_options[:history] = history
       provider_options[:tool] = Provider::RubyLlm::FinancialTool::GetAccounts.new(chat.user.family)
       provider_options[:audit_callback] = audit_callback_for(assistant_message, audit_records)

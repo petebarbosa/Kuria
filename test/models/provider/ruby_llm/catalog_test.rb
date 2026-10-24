@@ -13,8 +13,14 @@ class Provider::RubyLlm::CatalogTest < ActiveSupport::TestCase
 
   ACCOUNT_URLS = {
     openai: Provider::RubyLlm::OPENAI_BASE_URL + "/models",
-    opencode_go: Provider::RubyLlm::OPENCODE_GO_BASE_URL + "/models"
+    # Official Go model list (https://opencode.ai/v2/docs/console/go) is under
+    # /inference/go/v1/models, not the legacy /zen/go/v1 or the chat base.
+    opencode_go: "https://opencode.ai/inference/go/v1/models".freeze
   }.freeze
+
+  def header_value(request, name)
+    request.headers.find { |header, _value| header.to_s.casecmp?(name) }&.last
+  end
 
   def catalog
     Provider::RubyLlm::Catalog.new
@@ -156,6 +162,52 @@ class Provider::RubyLlm::CatalogTest < ActiveSupport::TestCase
 
       WebMock.reset!
     end
+  end
+
+  test "uses the official Go model-list URL and Go session/client headers while OpenAI stays isolated" do
+    go_request = nil
+    openai_request = nil
+
+    stub_request(:get, ACCOUNT_URLS.fetch(:opencode_go)).to_return do |request|
+      go_request = request
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { object: "list", data: [ { "id" => "glm-5.3-flash", "object" => "model" } ] }.to_json
+      }
+    end
+
+    stub_request(:get, ACCOUNT_URLS.fetch(:openai)).to_return do |request|
+      openai_request = request
+      {
+        status: 200,
+        headers: { "Content-Type" => "application/json" },
+        body: { object: "list", data: [ { "id" => "gpt-5-nano", "object" => "model" } ] }.to_json
+      }
+    end
+
+    with_account_key(:openai, "test-openai-key") do
+      catalog.available_references(:openai)
+    end
+
+    with_account_key(:opencode_go, "test-go-key") do
+      references = catalog.available_references(:opencode_go)
+      assert_includes references, "opencode_go/glm-5.3-flash"
+    end
+
+    assert_requested :get, ACCOUNT_URLS.fetch(:opencode_go), times: 1
+    assert_requested :get, ACCOUNT_URLS.fetch(:openai), times: 1
+    assert_not_requested :get, "https://opencode.ai/zen/go/v1/models"
+
+    assert_equal "Bearer test-go-key", header_value(go_request, "Authorization")
+    assert_equal "Kuria/1.0", header_value(go_request, "User-Agent")
+    assert_match(/\Ases_[0-9a-f]{32}\z/, header_value(go_request, "x-opencode-session"))
+    assert_nil header_value(go_request, "OpenAI-Organization")
+    assert_nil header_value(go_request, "OpenAI-Project")
+
+    assert_equal "Bearer test-openai-key", header_value(openai_request, "Authorization")
+    assert_nil header_value(openai_request, "x-opencode-session")
+    refute_equal "Kuria/1.0", header_value(openai_request, "User-Agent")
   end
 
   test "a failed live lookup never falls back to the static manifest" do

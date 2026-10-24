@@ -1,3 +1,4 @@
+require "digest"
 require "securerandom"
 
 class Provider::RubyLlm < Provider
@@ -6,9 +7,68 @@ class Provider::RubyLlm < Provider
   Error = Class.new(Provider::Error)
 
   OPENAI_BASE_URL = "https://api.openai.com/v1".freeze
-  OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1".freeze
+  # Official OpenCode Go endpoints. The Go inference service exposes its live
+  # model list at /inference/go/v1/models, while its OpenAI-compatible chat
+  # API lives at /inference/go/openai/v1 (chat completions are posted to
+  # /inference/go/openai/v1/chat/completions). The legacy /zen/go/v1 paths are
+  # intentionally not used.
+  OPENCODE_GO_BASE_URL = "https://opencode.ai/inference/go/v1".freeze
+  OPENCODE_GO_CHAT_BASE_URL = "https://opencode.ai/inference/go/openai/v1".freeze
+  OPENCODE_GO_MODELS_URL = "#{OPENCODE_GO_BASE_URL}/models".freeze
+  OPENCODE_GO_SESSION_HEADER = "x-opencode-session".freeze
+  OPENCODE_GO_SESSION_PREFIX = "ses_".freeze
+  # Hash namespace for server-bound Chat identifiers. Including a fixed
+  # namespace keeps the derived token scoped to this use; the raw identifier
+  # never leaves the process.
+  OPENCODE_GO_CONVERSATION_SESSION_NAMESPACE = "kuria:opencode_go:conversation".freeze
+  # Go requires each client to identify itself instead of presenting a generic
+  # HTTP-library or SDK user agent.
+  OPENCODE_GO_USER_AGENT = "Kuria/1.0".freeze
 
   SUPPORTED_PROVIDER_REFERENCES = %w[openai opencode_go].freeze
+
+  # RubyLLM custom provider for the official OpenCode Go OpenAI-compatible
+  # Chat Completions API. A dedicated provider (rather than reusing :openai)
+  # gives Go authoritative request headers: RubyLLM merges provider headers
+  # after chat-level headers, so this is the stable 2.1.1 seam that can set a
+  # client User-Agent and the required session header without affecting
+  # OpenAI. It exposes Chat Completions only; Responses/Anthropic/Gemini
+  # transports are never registered for Go. The session id comes from the
+  # per-call context (derived from the server-bound conversation), with an
+  # opaque per-instance fallback, and is never derived from model output.
+  class OpenCodeGoProvider < RubyLLM::Provider
+    protocol :chat_completions, RubyLLM::Protocols::ChatCompletions
+
+    def api_base
+      @config.openai_api_base || OPENCODE_GO_CHAT_BASE_URL
+    end
+
+    def headers
+      {
+        "Authorization" => "Bearer #{@config.openai_api_key}",
+        OPENCODE_GO_SESSION_HEADER => @config.opencode_go_session_id.presence || session_id,
+        "User-Agent" => OPENCODE_GO_USER_AGENT
+      }.compact
+    end
+
+    def session_id
+      @session_id ||= Provider::RubyLlm.request_session_id
+    end
+
+    def self.configuration_options
+      %i[opencode_go_session_id]
+    end
+
+    def self.configuration_requirements
+      %i[openai_api_key]
+    end
+
+    def self.assume_models_exist?
+      true
+    end
+  end
+
+  RubyLLM::Provider.register :opencode_go, OpenCodeGoProvider
 
   # Legacy structured-output enrichment guard: the workflows this provider
   # replaces cap a single request at 25 transactions. Preserved so an
@@ -54,6 +114,29 @@ class Provider::RubyLlm < Provider
   RETRY_INTERVAL_RANDOMNESS = 0.5
 
   class << self
+    # An opaque, non-identifying Go request session id. Go uses it only for
+    # routing/prompt-cache affinity; it is generated per provider instance (or
+    # per standalone catalog), never derived from a model, prompt, user, or
+    # credential, and is never logged by Kuria.
+    def request_session_id
+      "#{OPENCODE_GO_SESSION_PREFIX}#{SecureRandom.hex(16)}"
+    end
+
+    # Deterministic, opaque session id for a server-bound conversation
+    # identifier (Chat.id). The same conversation therefore keeps the same Go
+    # routing/prompt-cache session across fresh provider instances, while the
+    # raw identifier and caller data never appear in the header. A blank
+    # identifier (standalone call or enrichment) gets an independent generated
+    # session instead.
+    def conversation_session_id(conversation_id)
+      return request_session_id if conversation_id.blank?
+
+      digest = Digest::SHA256.hexdigest(
+        "#{OPENCODE_GO_CONVERSATION_SESSION_NAMESPACE}:#{conversation_id}"
+      )
+      "#{OPENCODE_GO_SESSION_PREFIX}#{digest[0, 32]}"
+    end
+
     # The immutable positive catalog (Provider::RubyLlm::Catalog#manifest) is
     # the supported-model source for admin selection. Admission authority is
     # the catalog, never RubyLLM's bundled 1.16 registry, which Kuria never
@@ -113,17 +196,19 @@ class Provider::RubyLlm < Provider
     Catalog.admits?(model)
   end
 
-  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [])
+  def chat_response(prompt, model:, instructions: nil, functions: [], function_results: [], streamer: nil, previous_response_id: nil, tool: nil, audit_callback: nil, history: [], conversation_id: nil)
     with_provider_response(error_transformer: error_transformer_for(model)) do
       reference = resolve_reference(model)
       history_messages = normalize_history(history, model)
-      context = ruby_llm_context(reference, streaming: true)
+      session_id = conversation_id.present? && reference[:account] == :opencode_go ?
+        self.class.conversation_session_id(conversation_id) : nil
+      context = ruby_llm_context(reference, streaming: true, session_id: session_id)
 
       # The catalog is the admission authority: every admitted model is passed
       # with assume_model_exists: true (RubyLLM 2.1.1's bundled registry may be
       # stale for current manifest IDs and is never refreshed by Kuria).
-      # The protocol is pinned: RubyLLM 2.1 otherwise defaults OpenAI (and
-      # OpenCode Go, which reuses the OpenAI provider) to the Responses API.
+      # The protocol is pinned so no provider can silently default to a
+      # different transport.
       chat = context.chat(
         model: reference[:model_id],
         provider: reference[:provider],
@@ -240,7 +325,15 @@ class Provider::RubyLlm < Provider
     ChatResponse = Provider::LlmConcept::ChatResponse
 
     def catalog
-      @catalog ||= Catalog.new
+      @catalog ||= Catalog.new(session_id: opencode_go_session_id)
+    end
+
+    # Stable for this provider instance so its live Go model-list lookups share
+    # one opaque session. Chat and structured requests get their own
+    # provider-instance session inside RubyLLM. A new provider instance gets a
+    # fresh id.
+    def opencode_go_session_id
+      @opencode_go_session_id ||= self.class.request_session_id
     end
 
     # Validates caller-supplied provider-neutral history and translates each
@@ -470,12 +563,12 @@ class Provider::RubyLlm < Provider
     end
 
     # Isolated per-call RubyLLM context carrying the resolved account's key and
-    # API base plus the adapter-local bounded execution budget. The per-call
-    # context duplicates the global configuration, which may carry OpenAI
-    # organization/project headers; these are cleared ONLY for OpenCode Go so a
-    # Go request never inherits the normal OpenAI billing identity, while
-    # normal OpenAI calls keep the deployment's own identity.
-    def ruby_llm_context(reference, streaming:)
+    # API base plus the adapter-local bounded execution budget. OpenAI keeps the
+    # deployment's inherited organization/project identity. OpenCode Go uses the
+    # dedicated :opencode_go provider with the same isolated credential/base,
+    # and explicitly clears inherited organization/project headers so no
+    # OpenAI billing identity can leak into a Go request.
+    def ruby_llm_context(reference, streaming:, session_id: nil)
       RubyLLM.context do |config|
         config.openai_api_key = reference[:api_key]
         config.openai_api_base = reference[:api_base]
@@ -493,6 +586,7 @@ class Provider::RubyLlm < Provider
         config.retry_interval_randomness = RETRY_INTERVAL_RANDOMNESS
 
         if reference[:account] == :opencode_go
+          config.opencode_go_session_id = session_id.presence || self.class.request_session_id
           config.openai_organization_id = nil
           config.openai_project_id = nil
         end
@@ -579,6 +673,10 @@ class Provider::RubyLlm < Provider
     end
 
     def build_reference(metadata, model)
+      unless metadata[:protocol] == :chat_completions
+        raise Error, "Unsupported protocol '#{metadata[:protocol]}' for model '#{model}'. RubyLLM only supports Chat Completions for this catalog; Responses, Anthropic Messages, and Gemini transports are not enabled."
+      end
+
       api_key = Catalog.api_key_for(metadata[:credential_source])
 
       if api_key.blank?
