@@ -39,20 +39,159 @@ class PendingAction < ApplicationRecord
       create_idempotent!(attributes)
     end
 
-    def confirm_and_execute!(id:, confirmed_by: nil)
-      action = pending.find_by(id: id)
+    def confirm_and_execute!(id:, confirmed_by: nil, family: nil)
+      action = confirmation_scope(family).find_by(id: id)
       return nil unless action
+      return nil if confirmed_by.is_a?(User) && confirmed_by.family_id != action.family_id
 
-      result = action.execute!
-      action.update!(
-        confirmed_at: Time.current,
-        confirmed_by: confirmed_by,
-        audit_result: result
-      )
-      action
+      action.with_lock do
+        if action.confirmed?
+          record_rejected_attempt!(action, "already_confirmed", confirmed_by)
+          nil
+        elsif action.expired?
+          record_rejected_attempt!(action, "expired", confirmed_by)
+          nil
+        else
+          result = execute_in_savepoint!(action)
+          attempt = confirmation_attempt(
+            "confirmed",
+            confirmed_by,
+            execution_status: result.is_a?(Hash) && result["success"] == true ? "succeeded" : "failed"
+          )
+          action.update!(
+            confirmed_at: Time.current,
+            confirmed_by: confirmer_identifier(confirmed_by),
+            audit_result: append_confirmation_attempt(action, attempt, execution_result: result)
+          )
+          update_tool_call_audits!(action, attempt)
+          action
+        end
+      end
     end
 
     private
+
+      def confirmation_scope(family)
+        family ? where(family: family) : all
+      end
+
+      # Executors rescue their own failures and return a result hash, so a
+      # failed execution must be signalled as a savepoint rollback. Financial
+      # writes then disappear while the outer row lock and the consumed-action
+      # marker/audit remain committed.
+      def execute_in_savepoint!(action)
+        result = nil
+
+        transaction(requires_new: true) do
+          result = action.execute!
+          result = result.is_a?(Hash) ? result.deep_stringify_keys : {}
+          raise ActiveRecord::Rollback unless result["success"] == true
+        end
+
+        result
+      end
+
+      def record_rejected_attempt!(action, reason, confirmed_by)
+        attempt = confirmation_attempt("rejected", confirmed_by, reason: reason)
+        audit = append_confirmation_attempt(action, attempt)
+        action.update!(audit_result: audit)
+        update_tool_call_audits!(action, attempt, execution_status: audit["execution_status"])
+        attempt
+      end
+
+      def confirmation_attempt(status, confirmed_by, reason: nil, execution_status: nil)
+        {
+          "status" => status,
+          "reason" => reason,
+          "confirmed_by" => confirmer_identifier(confirmed_by),
+          "execution_status" => execution_status,
+          "at" => Time.current.iso8601
+        }.compact
+      end
+
+      # Keeps the outcome that changed the action under "confirmation" and the
+      # latest attempt (including replays) under "last_confirmation_attempt".
+      # The full attempt history survives in "confirmation_attempts".
+      def append_confirmation_attempt(action, attempt, execution_result: nil)
+        audit = if execution_result
+          execution_result.deep_dup
+        elsif action.audit_result.is_a?(Hash)
+          action.audit_result.deep_dup
+        else
+          {}
+        end
+
+        audit["success"] = false if attempt["reason"] == "expired" && !audit.key?("success")
+        record_execution_status!(audit, attempt, derive_from_success: attempt["reason"] == "already_confirmed")
+
+        if attempt["status"] == "confirmed"
+          audit["confirmation"] = attempt
+        else
+          audit["confirmation"] ||= attempt
+        end
+
+        audit["last_confirmation_attempt"] = attempt
+        audit["confirmation_attempts"] = Array(audit["confirmation_attempts"]) + [ attempt ]
+        audit
+      end
+
+      # Legacy confirmed actions may only carry "success". Derive the enum from
+      # it on replay; when neither field exists, leave the outcome unknown.
+      def record_execution_status!(audit, attempt, derive_from_success: false)
+        if attempt["execution_status"].present?
+          audit["execution_status"] = attempt["execution_status"]
+          return
+        end
+
+        return if audit["execution_status"].present?
+
+        status = derived_execution_status(audit) if derive_from_success
+        audit["execution_status"] = status if status
+      end
+
+      def derived_execution_status(audit)
+        return "succeeded" if audit["success"] == true
+        return "failed" if audit["success"] == false
+
+        nil
+      end
+
+      def update_tool_call_audits!(action, attempt, execution_status: nil)
+        ToolCall::Function
+          .where("function_result ->> 'pending_action_id' = ?", action.id)
+          .find_each do |call|
+            call.update!(
+              function_result: append_tool_confirmation_attempt(
+                call.function_result,
+                attempt,
+                execution_status: execution_status
+              )
+            )
+          end
+      end
+
+      def append_tool_confirmation_attempt(result, attempt, execution_status: nil)
+        audit = result.is_a?(Hash) ? result.deep_dup : {}
+        if execution_status.present?
+          audit["execution_status"] = execution_status
+        else
+          record_execution_status!(audit, attempt)
+        end
+
+        if attempt["status"] == "confirmed"
+          audit["confirmation"] = attempt
+        else
+          audit["confirmation"] ||= attempt
+        end
+
+        audit["last_confirmation_attempt"] = attempt
+        audit["confirmation_attempts"] = Array(audit["confirmation_attempts"]) + [ attempt ]
+        audit
+      end
+
+      def confirmer_identifier(confirmed_by)
+        confirmed_by.is_a?(User) ? confirmed_by.id : confirmed_by
+      end
 
       # A retry of the same provider tool call must return the original
       # proposal instead of creating another actionable action. The primary key

@@ -1,4 +1,6 @@
 require "test_helper"
+require "concurrent"
+require "timeout"
 
 class PendingActionTest < ActiveSupport::TestCase
   setup do
@@ -215,6 +217,310 @@ class PendingActionTest < ActiveSupport::TestCase
 
     assert_equal @user.id, pending.user_id
     assert_equal @user, pending.user
+  end
+
+  # Regression lock (#14): knowing a pending action id must not let a user
+  # from another Family execute its financial mutation.
+  test "rejects a confirmer from another family without mutating financial data" do
+    pending = create_transaction_proposal(user: @user)
+    other_user = users(:empty)
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      result = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: other_user)
+      assert_nil result
+    end
+
+    pending.reload
+    assert_nil pending.confirmed_at
+    assert_nil pending.audit_result
+  end
+
+  test "records the authenticated confirming user instead of an MCP label" do
+    pending = create_transaction_proposal(user: @user)
+
+    confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+    assert_equal @user.id, confirmed.confirmed_by
+    refute_equal "mcp", confirmed.confirmed_by
+    assert_equal @user.id, pending.reload.confirmed_by
+  end
+
+  test "records an expired confirmation attempt without executing" do
+    pending = create_transaction_proposal(user: @user)
+    audit = tool_audit_for(pending)
+    pending.update!(expires_at: 1.hour.ago)
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      result = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+      assert_nil result
+    end
+
+    pending.reload
+    assert_nil pending.confirmed_at
+    assert_equal "rejected", pending.audit_result["confirmation"]["status"]
+    assert_equal "expired", pending.audit_result["confirmation"]["reason"]
+    assert_equal @user.id, pending.audit_result["confirmation"]["confirmed_by"]
+
+    audit.reload
+    assert_equal "rejected", audit.function_result.dig("last_confirmation_attempt", "status")
+    assert_equal "expired", audit.function_result.dig("last_confirmation_attempt", "reason")
+  end
+
+  test "records a replayed confirmation rejection without executing again" do
+    pending = create_transaction_proposal(user: @user)
+    assert PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user).present?
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      result = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+      assert_nil result
+    end
+
+    pending.reload
+    assert pending.confirmed?
+    assert_equal "confirmed", pending.audit_result["confirmation"]["status"]
+    assert_equal "rejected", pending.audit_result["last_confirmation_attempt"]["status"]
+    assert_equal "already_confirmed", pending.audit_result["last_confirmation_attempt"]["reason"]
+    assert_equal 2, pending.audit_result["confirmation_attempts"].size
+  end
+
+  test "preserves a legacy successful execution status when replaying" do
+    pending = create_transaction_proposal(user: @user)
+    pending.update!(
+      confirmed_at: 1.minute.ago,
+      confirmed_by: @user.id,
+      audit_result: { "success" => true, "entry_id" => 123 }
+    )
+    audit = tool_audit_for(pending)
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      assert_nil PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    pending.reload
+    assert_equal true, pending.audit_result["success"]
+    assert_equal "succeeded", pending.audit_result["execution_status"]
+    assert_equal "already_confirmed", pending.audit_result.dig("last_confirmation_attempt", "reason")
+
+    audit.reload
+    assert_equal "succeeded", audit.function_result["execution_status"]
+    assert_equal "already_confirmed", audit.function_result.dig("last_confirmation_attempt", "reason")
+  end
+
+  test "preserves a legacy failed execution status when replaying" do
+    pending = create_transaction_proposal(user: @user)
+    pending.update!(
+      confirmed_at: 1.minute.ago,
+      confirmed_by: @user.id,
+      audit_result: { "success" => false, "error" => "legacy failure" }
+    )
+    audit = tool_audit_for(pending)
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      assert_nil PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    pending.reload
+    assert_equal false, pending.audit_result["success"]
+    assert_equal "failed", pending.audit_result["execution_status"]
+    assert_equal "already_confirmed", pending.audit_result.dig("last_confirmation_attempt", "reason")
+
+    audit.reload
+    assert_equal "failed", audit.function_result["execution_status"]
+  end
+
+  test "leaves a genuinely unknown legacy execution status unknown on replay" do
+    pending = create_transaction_proposal(user: @user)
+    pending.update!(
+      confirmed_at: 1.minute.ago,
+      confirmed_by: @user.id,
+      audit_result: { "legacy_marker" => true }
+    )
+    audit = tool_audit_for(pending)
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      assert_nil PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    pending.reload
+    refute pending.audit_result.key?("success")
+    assert_nil pending.audit_result["execution_status"]
+    assert_equal "already_confirmed", pending.audit_result.dig("last_confirmation_attempt", "reason")
+
+    audit.reload
+    assert_nil audit.function_result["execution_status"]
+    refute_equal "not_executed", audit.function_result["execution_status"]
+  end
+
+  test "records confirmation and replay outcomes in the related tool call audit" do
+    pending = create_transaction_proposal(user: @user)
+    audit = tool_audit_for(pending)
+
+    PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+    audit.reload
+    assert_equal "confirmed", audit.function_result.dig("confirmation", "status")
+    assert_equal @user.id, audit.function_result.dig("confirmation", "confirmed_by")
+    assert_equal "confirmed", audit.function_result.dig("last_confirmation_attempt", "status")
+
+    PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+    audit.reload
+    assert_equal "confirmed", audit.function_result.dig("confirmation", "status")
+    assert_equal "rejected", audit.function_result.dig("last_confirmation_attempt", "status")
+    assert_equal 2, audit.function_result["confirmation_attempts"].size
+  end
+
+  test "rolls back partial financial writes when execution fails" do
+    entry = Entry.create!(
+      account: @account,
+      date: 1.day.ago.to_date,
+      name: "Original",
+      amount: 100,
+      currency: "USD",
+      entryable: Transaction.new
+    )
+    pending = PendingAction.create_pending!(
+      action_type: "update_transaction",
+      params: {
+        "entry_id" => entry.id,
+        "name" => "Partially updated",
+        "amount" => "200",
+        "kind" => "not_a_valid_kind"
+      },
+      preview: { action: "update_transaction" },
+      family: @family,
+      user: @user
+    )
+    confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+    assert confirmed.present?
+    confirmed.reload
+    assert confirmed.confirmed?
+    assert_equal false, confirmed.audit_result["success"]
+
+    entry.reload
+    assert_equal "Original", entry.name
+    assert_equal BigDecimal("100"), entry.amount
+    assert_equal "failed", confirmed.audit_result["execution_status"]
+    assert_equal "confirmed", confirmed.audit_result["confirmation"]["status"]
+  end
+
+  test "records an invalid-date execution failure as consumed without financial data" do
+    pending = create_transaction_proposal(user: @user, params: { "date" => "not-a-date" })
+    audit = tool_audit_for(pending)
+
+    confirmed = nil
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    assert confirmed.present?
+    confirmed.reload
+    assert confirmed.confirmed?
+    assert_equal false, confirmed.audit_result["success"]
+    assert_equal "failed", confirmed.audit_result["execution_status"]
+    assert_equal "confirmed", confirmed.audit_result["confirmation"]["status"]
+
+    audit.reload
+    assert_equal "failed", audit.function_result["execution_status"]
+    assert_equal "confirmed", audit.function_result.dig("confirmation", "status")
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      assert_nil PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    confirmed.reload
+    assert_equal "already_confirmed", confirmed.audit_result["last_confirmation_attempt"]["reason"]
+    assert_equal 1, confirmed.audit_result["confirmation_attempts"].count { |attempt| attempt["status"] == "confirmed" }
+
+    valid = create_transaction_proposal(user: @user)
+    assert_difference([ "Entry.count", "Transaction.count" ], 1) do
+      assert PendingAction.confirm_and_execute!(id: valid.id, confirmed_by: @user).present?
+    end
+  end
+
+  test "records a deleted-account execution failure as consumed without financial data" do
+    pending = create_transaction_proposal(user: @user)
+    audit = tool_audit_for(pending)
+    @account.destroy!
+
+    confirmed = nil
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    assert confirmed.present?
+    confirmed.reload
+    assert confirmed.confirmed?
+    assert_equal false, confirmed.audit_result["success"]
+    assert_equal "failed", confirmed.audit_result["execution_status"]
+
+    audit.reload
+    assert_equal "failed", audit.function_result["execution_status"]
+  end
+
+  test "rolls back mutation and marker when pending action audit write fails" do
+    pending = create_transaction_proposal(user: @user)
+    entry_count = Entry.count
+    transaction_count = Transaction.count
+
+    PendingAction.any_instance.stubs(:update!).raises(ActiveRecord::ActiveRecordError, "pending audit write failed")
+
+    assert_raises(ActiveRecord::ActiveRecordError) do
+      PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    assert_equal entry_count, Entry.count
+    assert_equal transaction_count, Transaction.count
+    pending.reload
+    assert_nil pending.confirmed_at
+    assert_nil pending.audit_result
+  end
+
+  test "rolls back mutation and marker when linked tool audit write fails" do
+    pending = create_transaction_proposal(user: @user)
+    tool_audit_for(pending)
+    entry_count = Entry.count
+    transaction_count = Transaction.count
+
+    ToolCall::Function.any_instance.stubs(:update!).raises(ActiveRecord::ActiveRecordError, "tool audit write failed")
+
+    assert_raises(ActiveRecord::ActiveRecordError) do
+      PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    assert_equal entry_count, Entry.count
+    assert_equal transaction_count, Transaction.count
+    pending.reload
+    assert_nil pending.confirmed_at
+    assert_nil pending.audit_result
+  end
+
+  test "rejects an action outside the confirming family scope without executing" do
+    other_family = families(:empty)
+    other_account = other_family.accounts.create!(
+      name: "Foreign pending account",
+      balance: 0,
+      currency: "USD",
+      accountable: Depository.new
+    )
+    pending = create_transaction_proposal(
+      family: other_family,
+      params: { "account_id" => other_account.id }
+    )
+
+    assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+      result = PendingAction.confirm_and_execute!(
+        id: pending.id,
+        confirmed_by: @user,
+        family: @family
+      )
+      assert_nil result
+    end
+
+    pending.reload
+    assert_nil pending.confirmed_at
+    assert_nil pending.audit_result
   end
 
   test "rejects a user from another family without creating a proposal" do
@@ -442,7 +748,93 @@ class PendingActionTest < ActiveSupport::TestCase
       }.merge(overrides)
     end
 
+    def tool_audit_for(pending)
+      ToolCall::Function.create!(
+        message: messages(:chat1_assistant_response),
+        provider_id: "1:0",
+        provider_call_id: "call_proposal",
+        function_name: "propose_transaction",
+        function_arguments: { "amount" => "15.00" },
+        function_result: { "status" => "pending_confirmation", "pending_action_id" => pending.id }
+      )
+    end
+
     def mcp_tool_text(result)
       result[:content].first[:text]
     end
+end
+
+# Real committed rows and separate connections prove the database lock, not
+# just in-process object state. Transactional fixtures would hide the pending
+# action from the second connection, so this class opts out.
+class PendingActionConcurrencyTest < ActiveSupport::TestCase
+  self.use_transactional_tests = false
+
+  setup do
+    @family = Family.create!(name: "Concurrency #{SecureRandom.hex(6)}", currency: "USD")
+    @user = @family.users.create!(
+      email: "concurrency-#{SecureRandom.hex(8)}@example.com",
+      password: "password123",
+      first_name: "Concurrency",
+      last_name: "User",
+      role: "admin"
+    )
+    @account = @family.accounts.create!(
+      name: "Concurrency account",
+      balance: 1000,
+      currency: "USD",
+      accountable: Depository.new
+    )
+  end
+
+  teardown do
+    PendingAction.where(family_id: @family.id).delete_all
+    @family.destroy!
+  end
+
+  test "executes the financial mutation exactly once under concurrent confirmation" do
+    3.times do |iteration|
+      pending = PendingAction.create_pending!(
+        action_type: "create_transaction",
+        params: {
+          "account_id" => @account.id,
+          "date" => Date.current.to_s,
+          "name" => "Concurrent proposal #{iteration}",
+          "amount" => "10.00"
+        },
+        preview: { action: "create_transaction" },
+        family: @family,
+        user: @user
+      )
+
+      barrier = Concurrent::CyclicBarrier.new(2)
+      threads = 2.times.map do
+        Thread.new do
+          ActiveRecord::Base.connection_pool.with_connection do
+            barrier.wait
+            PendingAction.confirm_and_execute!(
+              id: pending.id,
+              confirmed_by: @user,
+              family: @family
+            )
+          end
+        end
+      end
+
+      results = Timeout.timeout(10) { threads.map(&:value) }
+      assert_equal 1, results.count { |result| result.present? },
+        "iteration #{iteration} returned more than one successful confirmation"
+      assert_equal 1, results.count(&:nil?),
+        "iteration #{iteration} did not reject the losing confirmation"
+
+      assert_equal 1, Entry.where(account: @account, name: "Concurrent proposal #{iteration}").count,
+        "iteration #{iteration} executed the mutation more than once"
+
+      pending.reload
+      attempts = pending.audit_result["confirmation_attempts"]
+      assert_equal 1, attempts.count { |attempt| attempt["status"] == "confirmed" }
+      assert_equal 1, attempts.count { |attempt| attempt["status"] == "rejected" }
+      assert_equal "succeeded", pending.audit_result["execution_status"]
+    end
+  end
 end

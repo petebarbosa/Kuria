@@ -24,6 +24,10 @@ Rails.application.routes.draw do
     end
   end
 
+  resources :pending_actions, only: [] do
+    post :confirm, on: :member
+  end
+
   resources :family_exports, only: %i[new create index] do
     member do
       get :download
