@@ -135,7 +135,7 @@ The production compose file (`compose.example.yml`) includes:
 
 All services run on the `kuria_network` bridge network.
 
-> **AI provider:** AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go APIs directly (`OPENAI_API_KEY` and/or `OPENCODE_GO_API_KEY`). Provider keys are supplied through the environment (or encrypted deployment credentials) and are never stored in ordinary application settings. No OpenCode Server container or local OpenCode runtime is required or started. The selectable models are listed from each configured provider at configuration/selection time; there is no default model and no hardcoded list, the model is selected explicitly per chat, and an unavailable selection requires reselection rather than silent replacement. Assistant requests are rate limited per authenticated user (web and API) at `ASSISTANT_REQUESTS_PER_HOUR` requests per hour, defaulting to 100 in both managed and self-hosted modes; over-limit requests are rejected before any provider work. Historical OpenCode data is retained and no history is deleted. Features still deferred to their tracked issues are listed in [Known capability gaps](#known-capability-gaps-deferred).
+> **AI provider:** AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go APIs directly (`OPENAI_API_KEY` and/or `OPENCODE_GO_API_KEY`). Provider keys are supplied through the environment (or encrypted deployment credentials) and are never stored in ordinary application settings. No OpenCode Server container or local OpenCode runtime is required or started. Both accounts use OpenAI-compatible Chat Completions only; Responses-only, Anthropic Messages, and Gemini model references are rejected and never translated to another protocol. The selectable models are the verified Chat Completions catalog intersected with each configured account's live model list; there is no default model, the model is selected explicitly per chat, and an unavailable selection requires reselection rather than silent replacement. Assistant requests are rate limited per authenticated user (web and API) at `ASSISTANT_REQUESTS_PER_HOUR` requests per hour, defaulting to 100 in both managed and self-hosted modes; over-limit requests are rejected before any provider work. Historical OpenCode data is retained and no history is deleted. Features still deferred to their tracked issues are listed in [Known capability gaps](#known-capability-gaps-deferred).
 
 > **Transaction enrichment model:** Financial enrichment (auto-categorization and merchant detection/suggestion) reuses the same provider credentials and is configured by an administrator under **Settings → Account → Transaction enrichment model**, which saves the choice on the Family. There is no default model: the selector lists the models currently available for the configured provider credentials, the saved selection is the only model enrichment uses, and a saved model that is no longer available fails safely and requires reselection rather than a silent fallback. As with chat, provider keys come from the environment or encrypted deployment credentials and are never stored in ordinary application settings.
 
@@ -148,10 +148,10 @@ At minimum you will need to set the following environment variables:
 | `PAYMENTS_ENABLED`            | Set to `false` to disable Stripe/subscription billing (all accounts treated as paid).                                                        |
 | `SYNTH_API_KEY`               | Security market data provider (optional).                                                                                                    |
 | `FREECRYPTO_API_KEY`          | Crypto exchange-rate snapshots via FreeCryptoAPI (optional; historical crypto unsupported on free tier).                                     |
-| `OPENAI_API_KEY`              | Optional. Enables `openai/<model>` selection; models are listed from the provider at selection time, not hardcoded.                          |
-| `OPENCODE_GO_API_KEY`         | Optional. Enables `opencode_go/<model>` selection; models are listed from the provider at selection time, not hardcoded.                     |
+| `OPENAI_API_KEY`              | Optional. Enables `openai/<model>` selection; models are the verified catalog intersected with the provider's live list.                     |
+| `OPENCODE_GO_API_KEY`         | Optional. Enables `opencode_go/<model>` selection; models are the verified catalog intersected with the provider's live list.                |
 | `ASSISTANT_REQUESTS_PER_HOUR` | Optional. Per-authenticated-user assistant request allowance (web and API), in requests per hour, enforced in both modes; defaults to `100`. |
-| `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the retired OpenCode Server LLM path.                   |
+| `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the RubyLLM provider path.                              |
 | `SMTP_*`                      | Mail delivery configuration (optional).                                                                                                      |
 
 ### Implemented assistant capability
@@ -166,16 +166,13 @@ At minimum you will need to set the following environment variables:
 
 Remaining capability parity is **incomplete**. The capabilities below are explicitly deferred to their tracked issues and are **not** claimed as working parity with the former OpenCode Server path:
 
-| Issue | Deferred capability                                                         |
-| ----- | --------------------------------------------------------------------------- |
-| #10   | Guarantee ordered RubyLLM streaming and reload parity                       |
-| #14   | Confirm a proposed Transaction exactly once                                 |
-| #15   | Run one categorization workflow through RubyLLM Schema                      |
-| #16   | Recover safely from RubyLLM provider failures                               |
-| #17   | Rate-limit authenticated Assistant requests per user                        |
-| #30   | Migrate merchant detection and suggestions to the RubyLLM provider contract |
+| Issue | Deferred capability                                                                       |
+| ----- | ----------------------------------------------------------------------------------------- |
+| #14   | Confirm a proposed Transaction exactly once                                               |
+| #21   | Produce the RubyLLM readiness acceptance report                                           |
+| #31   | Complete the RubyLLM-only cutover and retire remaining OpenCode Server code/configuration |
 
-Unsupported capabilities fail safely: they surface through the existing provider response/error path — a failed response, a form alert, or a rejected model selection — and never report placeholder success or silently substitute a model. Financial enrichment that is not yet migrated (auto-categorization, merchant detection, and merchant suggestion) currently returns a failed provider response rather than performing the work.
+Unsupported capabilities fail safely: they surface through the existing provider response/error path — a failed response, a form alert, or a rejected model selection — and never report placeholder success or silently substitute a model. Transaction enrichment (auto-categorization, merchant detection, and merchant suggestion) runs through RubyLLM structured output (#15 and #30 are closed), but it still requires an explicitly saved enrichment model and fails safely when that model is unavailable.
 
 ---
 
