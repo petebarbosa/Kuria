@@ -186,17 +186,57 @@ class PendingActionsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "rejects a user from another family without mutating the pending action" do
-    sign_in users(:empty)
+    other_user = users(:empty)
+    sign_in other_user
+    original_params = @pending.params
+    original_preview = @pending.preview
 
     assert_no_difference([ "Entry.count", "Transaction.count" ]) do
       post "/pending_actions/#{@pending.id}/confirm"
     end
 
     assert_response :not_found
+    assert response.body.blank?
 
     @pending.reload
     assert_nil @pending.confirmed_at
-    assert_nil @pending.audit_result
+    assert_equal @user.id, @pending.user_id
+    assert_equal original_params, @pending.params
+    assert_equal original_preview, @pending.preview
+    assert_equal "rejected", @pending.audit_result.dig("confirmation", "status")
+    assert_equal "wrong_family", @pending.audit_result.dig("confirmation", "reason")
+    assert_equal other_user.id, @pending.audit_result.dig("confirmation", "confirmed_by")
+
+    @audit.reload
+    assert_equal "wrong_family", @audit.function_result.dig("last_confirmation_attempt", "reason")
+    assert_equal other_user.id, @audit.function_result.dig("last_confirmation_attempt", "confirmed_by")
+  end
+
+  test "returns an identical empty not found response for a missing pending action" do
+    missing_id = SecureRandom.uuid
+
+    assert_no_difference([ "PendingAction.count", "Entry.count", "Transaction.count" ]) do
+      post "/pending_actions/#{missing_id}/confirm"
+    end
+
+    assert_response :not_found
+    assert response.body.blank?
+
+    @audit.reload
+    refute @audit.function_result.key?("last_confirmation_attempt")
+    refute @audit.function_result.key?("confirmation_attempts")
+  end
+
+  test "returns an identical empty not found response for a malformed pending action id" do
+    assert_no_difference([ "PendingAction.count", "Entry.count", "Transaction.count" ]) do
+      post "/pending_actions/not-a-uuid/confirm"
+    end
+
+    assert_response :not_found
+    assert response.body.blank?
+
+    @audit.reload
+    refute @audit.function_result.key?("last_confirmation_attempt")
   end
 end
 

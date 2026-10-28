@@ -12,6 +12,9 @@ class PendingAction < ApplicationRecord
   scope :pending, -> { not_expired.where(confirmed_at: nil) }
 
   TTL = 10.minutes
+  MAX_CONFIRMATION_ATTEMPTS = 100
+  MAX_ACTOR_IDENTIFIER_LENGTH = 100
+  ACTION_ID_FORMAT = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
 
   class << self
     def create_pending!(action_type:, params:, preview:, family:, user: nil, idempotency_key: nil)
@@ -40,12 +43,30 @@ class PendingAction < ApplicationRecord
     end
 
     def confirm_and_execute!(id:, confirmed_by: nil, family: nil)
-      action = confirmation_scope(family).find_by(id: id)
-      return nil unless action
-      return nil if confirmed_by.is_a?(User) && confirmed_by.family_id != action.family_id
+      return nil unless valid_action_id?(id)
+
+      trusted_family = family if family.is_a?(Family)
+      return nil if !family.nil? && !trusted_family
+
+      action = confirmation_scope(trusted_family).find_by(id: id)
+      foreign = false
+
+      unless action
+        # The scoped miss is indistinguishable from a missing id to the caller,
+        # but an existing action outside the scope still gets an audit-only
+        # rejection. This lookup never leads to execution.
+        action = find_by(id: id)
+        return nil unless action
+        return nil unless family_mismatch?(action, trusted_family, confirmed_by)
+
+        foreign = true
+      end
 
       action.with_lock do
-        if action.confirmed?
+        if foreign || family_mismatch?(action, trusted_family, confirmed_by)
+          record_rejected_attempt!(action, "wrong_family", confirmed_by)
+          nil
+        elsif action.confirmed?
           record_rejected_attempt!(action, "already_confirmed", confirmed_by)
           nil
         elsif action.expired?
@@ -73,6 +94,11 @@ class PendingAction < ApplicationRecord
 
       def confirmation_scope(family)
         family ? where(family: family) : all
+      end
+
+      def family_mismatch?(action, family, confirmed_by)
+        (family.is_a?(Family) && family.id != action.family_id) ||
+          (confirmed_by.is_a?(User) && confirmed_by.family_id != action.family_id)
       end
 
       # Executors rescue their own failures and return a result hash, so a
@@ -111,28 +137,19 @@ class PendingAction < ApplicationRecord
 
       # Keeps the outcome that changed the action under "confirmation" and the
       # latest attempt (including replays) under "last_confirmation_attempt".
-      # The full attempt history survives in "confirmation_attempts".
+      # Earlier attempts stay in "confirmation_attempts" (newest 100 kept): a
+      # successful confirmation merges its execution result into the existing
+      # audit instead of replacing it.
       def append_confirmation_attempt(action, attempt, execution_result: nil)
-        audit = if execution_result
-          execution_result.deep_dup
-        elsif action.audit_result.is_a?(Hash)
-          action.audit_result.deep_dup
-        else
-          {}
-        end
+        audit = action.audit_result.is_a?(Hash) ? action.audit_result.deep_dup : {}
+        audit.merge!(execution_result.deep_dup) if execution_result
 
         audit["success"] = false if attempt["reason"] == "expired" && !audit.key?("success")
-        record_execution_status!(audit, attempt, derive_from_success: attempt["reason"] == "already_confirmed")
-
-        if attempt["status"] == "confirmed"
-          audit["confirmation"] = attempt
-        else
-          audit["confirmation"] ||= attempt
-        end
-
-        audit["last_confirmation_attempt"] = attempt
-        audit["confirmation_attempts"] = Array(audit["confirmation_attempts"]) + [ attempt ]
-        audit
+        merge_confirmation_attempt!(
+          audit,
+          attempt,
+          derive_from_success: attempt["reason"] == "already_confirmed"
+        )
       end
 
       # Legacy confirmed actions may only carry "success". Derive the enum from
@@ -172,10 +189,16 @@ class PendingAction < ApplicationRecord
 
       def append_tool_confirmation_attempt(result, attempt, execution_status: nil)
         audit = result.is_a?(Hash) ? result.deep_dup : {}
+        merge_confirmation_attempt!(audit, attempt, execution_status: execution_status)
+      end
+
+      # The one place both audit shapes stamp an attempt: authoritative
+      # outcome, latest attempt, and the bounded newest-first-100 history.
+      def merge_confirmation_attempt!(audit, attempt, execution_status: nil, derive_from_success: false)
         if execution_status.present?
           audit["execution_status"] = execution_status
         else
-          record_execution_status!(audit, attempt)
+          record_execution_status!(audit, attempt, derive_from_success: derive_from_success)
         end
 
         if attempt["status"] == "confirmed"
@@ -185,12 +208,20 @@ class PendingAction < ApplicationRecord
         end
 
         audit["last_confirmation_attempt"] = attempt
-        audit["confirmation_attempts"] = Array(audit["confirmation_attempts"]) + [ attempt ]
+        attempts = Array(audit["confirmation_attempts"]) + [ attempt ]
+        audit["confirmation_attempts"] = attempts.last(MAX_CONFIRMATION_ATTEMPTS)
         audit
       end
 
+      def valid_action_id?(id)
+        id.is_a?(String) && ACTION_ID_FORMAT.match?(id)
+      end
+
       def confirmer_identifier(confirmed_by)
-        confirmed_by.is_a?(User) ? confirmed_by.id : confirmed_by
+        return confirmed_by.id if confirmed_by.is_a?(User)
+        return nil unless confirmed_by.is_a?(String)
+
+        confirmed_by.strip[0, MAX_ACTOR_IDENTIFIER_LENGTH].presence
       end
 
       # A retry of the same provider tool call must return the original
