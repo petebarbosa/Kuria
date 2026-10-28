@@ -137,13 +137,24 @@ The endpoint rejects requests with `401 Unauthorized` when no token is configure
 
 Assistant requests are rate limited per authenticated user (web and API) at `ASSISTANT_REQUESTS_PER_HOUR`, defaulting to `100`. Requests over the limit are rejected before any provider work. An invalid value fails loudly instead of silently disabling the limit.
 
+## Transaction proposal confirmation
+
+The assistant's `propose_transaction` tool only prepares an inspectable `PendingAction` with a 10-minute TTL and preview; it never creates or mutates a transaction. A prepared proposal is executed through the authenticated web endpoint:
+
+```http
+POST /pending_actions/:id/confirm
+```
+
+The endpoint requires an authenticated user session and returns JSON. The first confirmation executes the transaction exactly once and records the confirming user and the execution status on both the pending action and the tool-call audit. Replays return `422 Unprocessable Entity` with reason `already_confirmed`, expired proposals return `422` with reason `expired`, and a proposal belonging to another family returns `404 Not Found`; none of these execute again. If execution itself fails, the response is `422` with `status: "confirmed"` and `execution_status: "failed"`.
+
+There are no in-chat confirmation controls yet: the assistant exposes no confirmation tool and the chat UI renders no confirm action, so confirmation is endpoint-based only. The `pending_confirmation` tool result carries the `pending_action_id` and preview that the endpoint needs.
+
 ## Current limitations
 
 Remaining work is tracked in GitHub issues. In this checkout:
 
 | Issue | Status  | Scope                                                                                      |
 | ----- | ------- | ------------------------------------------------------------------------------------------ |
-| #14   | Pending | Confirm a proposed transaction exactly once.                                               |
 | #21   | Pending | Produce the RubyLLM readiness acceptance report.                                           |
 | #31   | Pending | Complete the RubyLLM-only cutover and retire remaining OpenCode Server code/configuration. |
 
