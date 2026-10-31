@@ -481,60 +481,26 @@ class AssistantTest < ActiveSupport::TestCase
 
     @assistant.respond_to(@message)
 
-    assert_nil captured_options[:previous_response_id],
-      "a RubyLLM request must not inherit a legacy opencode session id"
+    refute captured_options.key?(:previous_response_id),
+      "a RubyLLM request must not carry the retired legacy session keyword"
+
+    persisted = @chat.messages.ordered.where(type: "AssistantMessage").sole
+    assert_equal "ruby_llm_deadbeef", persisted.provider_id
+    assert_equal "Answer", persisted.content
+    assert_equal "openai/gpt-4o", persisted.ai_model
 
     @chat.reload
     assert_equal "ruby_llm_deadbeef", @chat.latest_assistant_response_id
     assert_equal "legacy_sess_123", @chat.opencode_session_id,
-      "RubyLLM must not overwrite the legacy opencode session"
+      "historical opencode sessions are retained and never rewritten"
   end
 
-  test "writes a legacy OpenCode response id as the opencode session and latest response" do
-    opencode = build_opencode_provider
-    @message.update!(ai_model: "opencode/big-pickle")
-    @assistant.expects(:get_model_provider).with("opencode/big-pickle").returns(opencode)
-
-    completed = provider_response(id: "msg_legacy", text: "Legacy answer", model: "opencode/big-pickle")
-    captured_options = nil
-    opencode.expects(:chat_response).with do |_message, **options|
-      captured_options = options
-      options[:streamer].call(provider_text_chunk("Legacy answer"))
-      options[:streamer].call(provider_stream_chunk(completed))
-      true
-    end.returns(provider_success_response(completed))
-
-    @assistant.respond_to(@message)
-
-    assert_nil captured_options[:previous_response_id],
-      "a fresh legacy OpenCode chat starts a new session"
-
-    @chat.reload
-    assert_equal "msg_legacy", @chat.opencode_session_id
-    assert_equal "msg_legacy", @chat.latest_assistant_response_id
-  end
-
-  test "threads and preserves an existing opencode session for the legacy OpenCode provider" do
-    opencode = build_opencode_provider
-    @message.update!(ai_model: "opencode/big-pickle")
-    @assistant.expects(:get_model_provider).with("opencode/big-pickle").returns(opencode)
-    @chat.update!(opencode_session_id: "legacy_sess_9")
-
-    completed = provider_response(id: "msg_legacy_2", text: "More", model: "opencode/big-pickle")
-    captured_options = nil
-    opencode.expects(:chat_response).with do |_message, **options|
-      captured_options = options
-      true
-    end.returns(provider_success_response(completed))
-
-    @assistant.respond_to(@message)
-
-    assert_equal "legacy_sess_9", captured_options[:previous_response_id]
-
-    @chat.reload
-    assert_equal "legacy_sess_9", @chat.opencode_session_id,
-      "the historical opencode session must be preserved"
-    assert_equal "msg_legacy_2", @chat.latest_assistant_response_id
+  test "provider registry exposes no legacy OpenCode provider factory or entry" do
+    refute Provider::Registry.respond_to?(:opencode),
+      "the registry must not expose a legacy opencode factory"
+    assert_raises(Provider::Registry::Error) { Provider::Registry.get_provider(:opencode) }
+    assert_raises(Provider::Registry::Error) { Provider::Registry.for_concept(:llm).get_provider(:opencode) }
+    assert_equal [ Provider::RubyLlm ], Provider::Registry.for_concept(:llm).providers.map(&:class)
   end
 
   # --- Partial-stream recovery (issue #16) -------------------------------
@@ -1413,14 +1379,6 @@ class AssistantTest < ActiveSupport::TestCase
         assert current.start_with?(previous), "expected #{current.inspect} to extend #{previous.inspect}"
       end
       assert contents.last.start_with?(partials.last), "expected the final broadcast to extend #{partials.last.inspect}"
-    end
-
-    # A real legacy OpenCode provider with its HTTP client stubbed, so
-    # provider-identity checks (is_a?) see the genuine class without a network
-    # dependency.
-    def build_opencode_provider
-      Provider::Opencode::Client.stubs(:new).returns(mock("opencode_client"))
-      Provider::Opencode.new
     end
 
     def thinking_indicator_removes(streams)

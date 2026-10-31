@@ -115,35 +115,18 @@ class Settings::HostingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  test "hosting always uses RubyLLM mode regardless of the legacy provider toggle" do
-    @provider.expects(:usage).times(3).returns(@usage_response)
-    Provider::Opencode::Client.expects(:new).never
-    stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
-
-    with_self_hosting do
-      [ nil, "opencode", "ruby_llm" ].each do |value|
-        with_env_overrides KURIA_LLM_PROVIDER: value, OPENAI_API_KEY: "test-openai-key", OPENCODE_GO_API_KEY: nil do
-          get settings_hosting_url
-
-          assert_response :success
-          assert controller.instance_variable_get(:@ai_ruby_llm_mode)
-        end
-      end
-    end
-  end
-
-  test "RubyLLM show never constructs an OpenCode client" do
+  test "hosting always uses RubyLLM mode" do
     @provider.expects(:usage).returns(@usage_response)
-    Provider::Opencode::Client.expects(:new).never
     stub_live_models(:openai, entries: [ model_entry("gpt-5-nano") ], auth_key: "test-openai-key")
 
     with_self_hosting do
       with_env_overrides OPENAI_API_KEY: "test-openai-key", OPENCODE_GO_API_KEY: nil do
         get settings_hosting_url
+
+        assert_response :success
+        assert controller.instance_variable_get(:@ai_ruby_llm_mode)
       end
     end
-
-    assert_response :success
   end
 
   test "RubyLLM show populates AI settings from the live selectable models" do
@@ -206,21 +189,20 @@ class Settings::HostingsControllerTest < ActionDispatch::IntegrationTest
     end
   end
 
-  test "does not persist a deployment default model through hosting settings" do
-    original = Setting.opencode_default_model
-
+  test "does not expose legacy OpenCode server or deployment default model settings" do
     with_self_hosting do
-      patch settings_hosting_url, params: { setting: { opencode_default_model: "opencode/other-model" } }
+      patch settings_hosting_url, params: {
+        setting: {
+          opencode_server_url: "http://legacy-opencode:4096",
+          opencode_default_model: "opencode/other-model"
+        }
+      }
 
       assert_redirected_to settings_hosting_url
+    end
 
-      # The value is unchanged: nil when no default is stored, otherwise the
-      # previously stored value.
-      if original.nil?
-        assert_nil Setting.opencode_default_model
-      else
-        assert_equal original, Setting.opencode_default_model
-      end
+    %i[opencode_server_url opencode_server_username opencode_server_password opencode_default_model].each do |field|
+      refute Setting.respond_to?(field), "Setting must not expose #{field}"
     end
   end
 
