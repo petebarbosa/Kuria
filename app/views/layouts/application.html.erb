@@ -105,34 +105,71 @@
             <%= render "layouts/shared/breadcrumbs", breadcrumbs: @breadcrumbs %>
           <% end %>
         </div>
-        <%= icon("panel-right", as_button: true, data: { action: "app-layout#toggleRightSidebar" }) %>
       </div>
       <% if content_for?(:page_header) %>
         <%= yield :page_header %>
       <% end %>
       <%= yield %>
     <% end %>
-    <%# DESKTOP - Right sidebar %>
-    <%= tag.div class: class_names(
-          "hidden lg:block h-full overflow-y-auto shrink-0 max-w-[400px] transition-all duration-300",
-          Current.user.show_ai_sidebar? ? expanded_sidebar_class : collapsed_sidebar_class,
-        ),
-        data: { app_layout_target: "rightSidebar" } do %>
-      <%= tag.div id: "chat-container", class: "relative h-full", data: { controller: "chat hotkey", turbo_permanent: true } do %>
-        <div class="flex flex-col h-full justify-between shrink-0">
-          <%= turbo_frame_tag chat_frame, src: chat_view_path(@chat), loading: "lazy", class: "h-full" do %>
-            <div class="flex justify-center items-center h-full">
-              <%= icon("loader-circle", class: "animate-spin") %>
+    <%# SHARED - Floating AI chat. Kept out of the layout flow so the workspace never splits or resizes. %>
+    <div data-controller="chat-panel">
+      <button
+        type="button"
+        data-chat-panel-target="launcher"
+        data-action="chat-panel#open"
+        aria-haspopup="dialog"
+        aria-controls="ai-chat-panel"
+        aria-expanded="false"
+        class="fixed bottom-[calc(env(safe-area-inset-bottom)+5.25rem)] right-4 z-30 inline-flex items-center gap-2 rounded-full border border-tertiary bg-container/95 py-2 pl-2 pr-4 text-sm font-medium text-primary shadow-lg backdrop-blur transition duration-200 hover:-translate-y-0.5 hover:shadow-xl focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gray-900 lg:bottom-6 lg:right-6">
+        <%= render "chats/ai_avatar" %>
+        <span>Ask Kuria</span>
+      </button>
+
+      <dialog
+        id="ai-chat-panel"
+        class="chat-panel fixed inset-0 m-0 h-dvh max-h-none w-full max-w-none border-0 bg-transparent p-0 text-primary backdrop:bg-alpha-black-400 backdrop:backdrop-blur-[2px] lg:inset-auto lg:right-4 lg:top-4 lg:bottom-4 lg:h-auto lg:w-[26rem] lg:max-w-[calc(100vw-2rem)] lg:rounded-2xl lg:border lg:border-tertiary lg:shadow-xl"
+        aria-labelledby="ai-chat-panel-title"
+        data-chat-panel-target="dialog"
+        data-turbo-permanent>
+        <div class="flex h-full min-h-0 flex-col overflow-hidden bg-surface lg:rounded-2xl">
+          <header class="flex shrink-0 items-center justify-between gap-3 border-b border-tertiary px-4 pb-3 pt-[calc(env(safe-area-inset-top)+0.75rem)] lg:py-3">
+            <div class="flex min-w-0 items-center gap-2.5">
+              <%= render "chats/ai_avatar" %>
+              <div class="min-w-0">
+                <h2 id="ai-chat-panel-title" class="truncate text-sm font-medium text-primary">Kuria AI</h2>
+                <p class="truncate text-xs text-secondary">Ask about your money</p>
+              </div>
             </div>
-          <% end %>
-        </div>
-        <% unless Current.user.ai_enabled? %>
-          <div class="absolute backdrop-blur-lg inset-0 h-full w-full flex flex-col justify-center items-center pl-0.5 pr-4">
-            <%= render "chats/ai_consent" %>
+            <div class="flex shrink-0 items-center gap-2">
+              <kbd aria-hidden="true" class="hidden rounded border border-tertiary px-1.5 py-0.5 text-[10px] font-medium text-secondary lg:inline">Esc</kbd>
+              <button
+                type="button"
+                data-chat-panel-target="close"
+                data-action="chat-panel#close"
+                aria-label="Close AI chat"
+                class="inline-flex h-9 w-9 items-center justify-center rounded-lg text-secondary hover:bg-container-hover focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gray-900">
+                <%= icon("x") %>
+              </button>
+            </div>
+          </header>
+
+          <div id="chat-container" class="relative min-h-0 flex-1" data-controller="chat hotkey">
+            <div class="h-full">
+              <%= turbo_frame_tag chat_frame, src: chat_view_path(@chat), loading: "lazy", class: "block h-full" do %>
+                <div class="flex h-full items-center justify-center">
+                  <%= icon("loader-circle", class: "animate-spin") %>
+                </div>
+              <% end %>
+            </div>
+            <% unless Current.user.ai_enabled? %>
+              <div class="absolute inset-0 z-10 flex h-full w-full flex-col items-center justify-center overflow-y-auto bg-surface/80 p-4 backdrop-blur-lg">
+                <%= render "chats/ai_consent" %>
+              </div>
+            <% end %>
           </div>
-        <% end %>
-      <% end %>
-    <% end %>
+        </div>
+      </dialog>
+    </div>
     <%# MOBILE - Bottom Nav %>
     <%= tag.nav class: "lg:hidden bg-surface shrink-0 z-10 pb-[env(safe-area-inset-bottom)] border-t border-tertiary flex justify-around" do %>
       <% mobile_nav_items.each do |nav_item| %>
