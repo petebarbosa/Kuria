@@ -11,6 +11,8 @@
 
 Issues live in GitHub Issues (uses `gh` CLI). See `docs/agents/issue-tracker.md`.
 
+- ALWAYS close the issue related to the PR
+
 ### Triage labels
 
 Five canonical roles: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.

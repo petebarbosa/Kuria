@@ -85,13 +85,12 @@ class Assistant
     provider_options = {
       model: message.ai_model,
       instructions: instructions,
-      streamer: streamer,
-      previous_response_id: legacy_opencode_session_id(llm)
+      streamer: streamer
     }
 
-    # Tool binding and audit persistence are RubyLLM-only. The legacy
-    # provider keeps its existing call contract, and the family and user always
-    # come from the chat's authenticated user, never from the model or Current.
+    # Tool binding and audit persistence are RubyLLM-only. The family and user
+    # always come from the chat's authenticated user, never from the model or
+    # Current.
     if llm.is_a?(Provider::RubyLlm)
       family = chat.user.family
       provider_options[:conversation_id] = chat.id
@@ -130,7 +129,7 @@ class Assistant
     finalized = true
     close_outstanding_audit_records!(audit_records, fallback: NOT_EXECUTED_TOOL_RESULT)
     resolve_pending_tool_outcomes!(tool_outcome_by_identity, :rejected)
-    persist_provider_response!(completed, provider: llm)
+    persist_provider_response!(completed)
 
     outcome = :success
     completed
@@ -485,27 +484,11 @@ class Assistant
       assistant_message.destroy!
     end
 
-    def persist_provider_response!(completed, provider:)
+    def persist_provider_response!(completed)
       id = completed_id(completed)
       return if id.blank?
 
       chat.update_latest_response!(id)
-      return unless legacy_opencode_provider?(provider)
-      return if chat.opencode_session_id.present?
-
-      chat.update!(opencode_session_id: id)
-    end
-
-    # The legacy OpenCode provider threads its session id through
-    # `previous_response_id`. RubyLLM owns its own conversation state, so a
-    # legacy OpenCode session id must never cross into a RubyLLM request. The
-    # provider the registry resolved decides this — no model-reference parsing.
-    def legacy_opencode_session_id(provider)
-      chat.opencode_session_id if legacy_opencode_provider?(provider)
-    end
-
-    def legacy_opencode_provider?(provider)
-      provider.is_a?(Provider::Opencode)
     end
 
     def completed_text(completed)

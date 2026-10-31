@@ -115,13 +115,6 @@ class Provider::Registry
         Provider::CompositeExchangeRates.new(freecrypto: freecrypto)
       end
 
-      def opencode
-        url = Setting.opencode_server_url
-        return nil unless url.present?
-
-        Provider::Opencode.new
-      end
-
       def ruby_llm
         Provider::RubyLlm.new
       end
@@ -170,7 +163,7 @@ class Provider::Registry
       when :llm
         %i[ruby_llm]
       else
-        %i[synth plaid_us plaid_eu github opencode]
+        %i[synth plaid_us plaid_eu github]
       end
     end
 end

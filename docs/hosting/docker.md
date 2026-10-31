@@ -153,12 +153,12 @@ There are no in-chat confirmation controls yet: the assistant exposes no confirm
 
 Remaining work is tracked in GitHub issues. In this checkout:
 
-| Issue | Status  | Scope                                                                                      |
-| ----- | ------- | ------------------------------------------------------------------------------------------ |
-| #21   | Pending | Produce the RubyLLM readiness acceptance report.                                           |
-| #31   | Pending | Complete the RubyLLM-only cutover and retire remaining OpenCode Server code/configuration. |
+| Issue | Status    | Scope                                                                                                  |
+| ----- | --------- | ------------------------------------------------------------------------------------------------------ |
+| #21   | Pending   | Produce the RubyLLM readiness acceptance report.                                                       |
+| #31   | In review | RubyLLM-only cutover: OpenCode Server provider code and settings retired; hosted OpenCode Go retained. |
 
-RubyLLM is the only LLM path used by the assistant and enrichment in this checkout, and the example Compose stack has no OpenCode Server service. #31 remains open because legacy OpenCode Server code and configuration still exist in the codebase; the cutover is not claimed complete until that issue is finished.
+RubyLLM is the only LLM path used by the assistant and enrichment in this checkout, and the example Compose stack has no OpenCode Server service. The legacy OpenCode Server provider integration has been removed here: the `opencode/` provider classes, their tests, and the `opencode_server_*` / `opencode_default_model` settings are gone. Hosted OpenCode Go (`opencode_go/<model>` via RubyLLM with `OPENCODE_GO_API_KEY`) remains supported, the historical `opencode-config` volume is retained deliberately for migration, and the MCP endpoint is independent of any LLM provider. #31 is implemented in this checkout but remains **open pending review and merge**.
 
 Unsupported or deferred operations fail safely: they surface as a failed provider response, a form alert, or a rejected model selection. They never report placeholder success or silently substitute a model.
 

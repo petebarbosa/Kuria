@@ -30,7 +30,7 @@ A personal finance app for multi-currency tracking, budgeting, and investment ma
 ### Requirements
 
 - Docker (recommended: runs the full development stack)
-- Ruby 4.0.7 (see `.ruby-version`) and Bundler (`gem install bundler`) only for the host-based workflow
+- Ruby 4.0.9 (see `.ruby-version`) and Bundler (`gem install bundler`) only for the host-based workflow
 
 ### Development with Docker (recommended)
 
@@ -165,12 +165,13 @@ At minimum you will need to set the following environment variables:
 
 ### Known capability gaps (deferred)
 
-Remaining capability parity is **incomplete**. The capabilities below are explicitly deferred to their tracked issues and are **not** claimed as working parity with the former OpenCode Server path:
+Remaining capability parity is **incomplete**. The capabilities below are explicitly deferred to their tracked issues and are **not** claimed as working parity:
 
-| Issue | Deferred capability                                                                       |
-| ----- | ----------------------------------------------------------------------------------------- |
-| #21   | Produce the RubyLLM readiness acceptance report                                           |
-| #31   | Complete the RubyLLM-only cutover and retire remaining OpenCode Server code/configuration |
+| Issue | Deferred capability                             |
+| ----- | ----------------------------------------------- |
+| #21   | Produce the RubyLLM readiness acceptance report |
+
+The former OpenCode Server provider integration has been retired from this checkout: the legacy `opencode/` provider classes, their tests, and the `opencode_server_*` / `opencode_default_model` settings are removed. Hosted **OpenCode Go** (`opencode_go/<model>` via RubyLLM and `OPENCODE_GO_API_KEY`) remains supported alongside OpenAI. Historical OpenCode data is retained — `chats.opencode_session_id`, `chats.latest_assistant_response_id`, and the `opencode-config` volume are deliberately preserved — and the independent `POST /mcp` endpoint is unrelated to any LLM provider. Issue #31 is implemented in this checkout but remains **open pending review and merge**; it is not claimed closed or shipped.
 
 Unsupported capabilities fail safely: they surface through the existing provider response/error path — a failed response, a form alert, or a rejected model selection — and never report placeholder success or silently substitute a model. Transaction enrichment (auto-categorization, merchant detection, and merchant suggestion) runs through RubyLLM structured output (#15 and #30 are closed), but it still requires an explicitly saved enrichment model and fails safely when that model is unavailable.
 
