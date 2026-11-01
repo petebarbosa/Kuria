@@ -1,4 +1,4 @@
-@import 'tailwindcss';
+@import "tailwindcss";
 
 @import "./maybe-design-system.css";
 
@@ -11,28 +11,65 @@
 @import "./simonweb_pickr.css";
 
 @layer components {
-  .pcr-app{
+  .pcr-app {
     position: static !important;
     background: none !important;
     box-shadow: none !important;
     padding: 0 !important;
     width: 100% !important;
   }
-  .pcr-color-palette{
-      height: 12em !important;
+  .pcr-color-palette {
+    height: 12em !important;
   }
-  .pcr-palette{
-      border-radius: 10px !important;
+  .pcr-palette {
+    border-radius: 10px !important;
   }
-  .pcr-palette:before{
-      border-radius: 10px !important;
+  .pcr-palette:before {
+    border-radius: 10px !important;
   }
-  .pcr-color-chooser{
-      height: 1.5em !important;
+  .pcr-color-chooser {
+    height: 1.5em !important;
   }
-  .pcr-picker{
-      height: 20px !important;
-      width: 20px !important;
+  .pcr-picker {
+    height: 20px !important;
+    width: 20px !important;
+  }
+}
+
+@layer components {
+  .chat-panel[open] {
+    animation: chat-panel-in 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .chat-panel[open]::backdrop {
+    animation: chat-backdrop-in 200ms ease-out;
+  }
+
+  @keyframes chat-panel-in {
+    from {
+      opacity: 0;
+      transform: translate3d(0, 0.75rem, 0) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+  }
+
+  @keyframes chat-backdrop-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .chat-panel[open],
+    .chat-panel[open]::backdrop {
+      animation: none;
+    }
   }
 }
 
@@ -53,7 +90,7 @@
   .hw-combobox__label {
     @apply block text-xs text-gray-500 peer-disabled:text-gray-400;
   }
-  
+
   .hw-combobox__option {
     @apply bg-container hover:bg-container-hover;
   }
@@ -74,7 +111,7 @@
 
 /* Typography */
 .prose {
-  @apply max-w-none text-primary; 
+  @apply max-w-none text-primary;
 
   a {
     @apply text-link;
@@ -122,7 +159,8 @@
 .prose--ai-chat {
   @apply break-words;
 
-  p, li {
+  p,
+  li {
     @apply text-sm text-primary;
   }
 
@@ -139,7 +177,7 @@
 
   ::-webkit-scrollbar-thumb {
     background-color: rgba(156, 163, 175, 0.5);
-    border-radius: 3px; 
+    border-radius: 3px;
   }
 }
 
@@ -156,7 +194,7 @@
 
   ::-webkit-scrollbar-thumb:hover {
     background: #a6a6a6;
-  }  
+  }
 }
 
 .scrollbar {
