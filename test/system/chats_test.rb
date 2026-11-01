@@ -382,6 +382,87 @@ class ChatsTest < ApplicationSystemTestCase
     page.driver.browser.manage.window.resize_to(1400, 1400)
   end
 
+  test "new chat composer can be scrolled to and used in a short viewport" do
+    # Regression lock for #35: the floating panel is a fixed-height column with
+    # overflow-hidden, and the new-chat branch had no scroll container, so on
+    # short viewports the composer rendered below the panel with no way to
+    # reach it. Synthetic chats only; the provider boundary stays stubbed.
+    @user.update!(ai_enabled: true)
+    @user.chats.destroy_all
+
+    [ [ 1280, 357 ], [ 844, 390 ] ].each do |width, height|
+      # Pin the CSS viewport exactly: resizing the browser window also resizes
+      # its chrome, so it cannot reproduce the reported 1280x357 viewport.
+      page.driver.browser.execute_cdp(
+        "Emulation.setDeviceMetricsOverride",
+        width: width,
+        height: height,
+        deviceScaleFactor: 1,
+        mobile: false
+      )
+      visit root_url(chat_view: "new")
+      open_chat_panel
+
+      geometry = page.evaluate_script(<<~JS)
+        (() => {
+          const panel = document.querySelector("#ai-chat-panel");
+          const form = document.querySelector("#chat-form");
+          if (!form) return { found: false };
+
+          // The composer must be movable into view the way a wheel or touch
+          // gesture moves the panel, not by resizing the browser.
+          let scroller = form.parentElement;
+          let scrollable = false;
+          while (scroller && scroller !== document.body) {
+            const style = getComputedStyle(scroller);
+            if (scroller.scrollHeight > scroller.clientHeight &&
+                [ "auto", "scroll" ].includes(style.overflowY)) {
+              scroller.scrollTop = scroller.scrollHeight;
+              scrollable = true;
+              break;
+            }
+            scroller = scroller.parentElement;
+          }
+
+          const formBounds = form.getBoundingClientRect();
+          const panelBounds = panel.getBoundingClientRect();
+
+          return {
+            found: true,
+            scrollable,
+            reachable: formBounds.top >= panelBounds.top && formBounds.bottom <= panelBounds.bottom,
+            formTop: formBounds.top,
+            formBottom: formBounds.bottom,
+            panelTop: panelBounds.top,
+            panelBottom: panelBounds.bottom,
+            viewportWidth: window.innerWidth,
+            viewportHeight: window.innerHeight
+          };
+        })()
+      JS
+
+      assert_equal true, geometry["found"], "expected the composer to render at #{width}x#{height}"
+      assert_equal true, geometry["scrollable"],
+        "expected the new chat to have an internal scroll container at #{width}x#{height}: #{geometry.inspect}"
+      assert_equal true, geometry["reachable"],
+        "expected scrolling to reach the composer at #{width}x#{height}: #{geometry.inspect}"
+
+      # Use the composer for real: selecting a model and submitting only works
+      # when the form is actually reachable inside the panel.
+      Chat.any_instance.expects(:ask_assistant_later).once
+
+      within "#chat-form" do
+        select "OpenAI / gpt-4o", from: "chat[ai_model]"
+        fill_in "chat[content]", with: "Short viewport message"
+        find("button[type='submit']").click
+      end
+
+      assert_text "Short viewport message"
+    end
+  ensure
+    page.driver.browser.execute_cdp("Emulation.clearDeviceMetricsOverride")
+  end
+
   private
 
     def open_chat_panel
