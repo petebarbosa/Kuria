@@ -278,7 +278,7 @@ Rails.application.routes.draw do
   get "privacy", to: redirect("https://github.com/petebarbosa/maybe")
   get "terms", to: redirect("https://github.com/petebarbosa/maybe")
 
-  post "mcp", to: "mcp#handle"
+  match "mcp", to: "mcp#handle", via: %i[post get delete]
 
   # Defines the root path route ("/")
   root "pages#dashboard"
