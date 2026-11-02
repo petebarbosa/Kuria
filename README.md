@@ -151,8 +151,10 @@ At minimum you will need to set the following environment variables:
 | `OPENAI_API_KEY`              | Optional. Enables `openai/<model>` selection; models are the verified catalog intersected with the provider's live list.                     |
 | `OPENCODE_GO_API_KEY`         | Optional. Enables `opencode_go/<model>` selection; models are the verified catalog intersected with the provider's live list.                |
 | `ASSISTANT_REQUESTS_PER_HOUR` | Optional. Per-authenticated-user assistant request allowance (web and API), in requests per hour, enforced in both modes; defaults to `100`. |
-| `MCP_AUTH_TOKEN`              | Optional. Bearer token for the independent MCP endpoint (`POST /mcp`); separate from the RubyLLM provider path.                              |
+| `APP_DOMAIN`                  | Public canonical host used in email links and in the MCP endpoint's Host/Origin allowlist.                                                   |
 | `SMTP_*`                      | Mail delivery configuration (optional).                                                                                                      |
+
+For MCP client setup, OAuth scopes, and OpenCode configuration, see [Connecting OpenCode to the Kuria MCP server](docs/hosting/mcp.md).
 
 ### Implemented assistant capability
 
@@ -171,7 +173,7 @@ Remaining capability parity is **incomplete**. The capabilities below are explic
 | ----- | ----------------------------------------------- |
 | #21   | Produce the RubyLLM readiness acceptance report |
 
-The former OpenCode Server provider integration has been retired from this checkout: the legacy `opencode/` provider classes, their tests, and the `opencode_server_*` / `opencode_default_model` settings are removed. Hosted **OpenCode Go** (`opencode_go/<model>` via RubyLLM and `OPENCODE_GO_API_KEY`) remains supported alongside OpenAI. Historical OpenCode data is retained — `chats.opencode_session_id`, `chats.latest_assistant_response_id`, and the `opencode-config` volume are deliberately preserved — and the independent `POST /mcp` endpoint is unrelated to any LLM provider. Issue #31 is implemented in this checkout but remains **open pending review and merge**; it is not claimed closed or shipped.
+The former OpenCode Server provider integration has been retired from this checkout: the legacy `opencode/` provider classes, their tests, and the `opencode_server_*` / `opencode_default_model` settings are removed. Hosted **OpenCode Go** (`opencode_go/<model>` via RubyLLM and `OPENCODE_GO_API_KEY`) remains supported alongside OpenAI. Historical OpenCode data is retained — `chats.opencode_session_id`, `chats.latest_assistant_response_id`, and the `opencode-config` volume are deliberately preserved — and the independent `POST /mcp` endpoint is authenticated with user/family OAuth and is unrelated to any LLM provider. Issue #31 is implemented in this checkout but remains **open pending review and merge**; it is not claimed closed or shipped.
 
 Unsupported capabilities fail safely: they surface through the existing provider response/error path — a failed response, a form alert, or a rejected model selection — and never report placeholder success or silently substitute a model. Transaction enrichment (auto-categorization, merchant detection, and merchant suggestion) runs through RubyLLM structured output (#15 and #30 are closed), but it still requires an explicitly saved enrichment model and fails safely when that model is unavailable.
 
