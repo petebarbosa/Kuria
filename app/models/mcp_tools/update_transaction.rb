@@ -61,13 +61,20 @@ module McpTools
       }
     end
 
-    def self.execute(params)
-      family = resolve_family(params["family_id"])
-      entry = Entry.joins(:account).find_by(id: params["entry_id"], accounts: { family_id: family.id })
+    def self.execute(params, user: nil)
+      family = McpTools::Base.resolve_family(params["family_id"])
+      entry = Entry.joins(:account).find_by(
+        id: params["entry_id"],
+        entryable_type: "Transaction",
+        accounts: { family_id: family.id }
+      )
 
       unless entry
-        return { content: [ { type: "text", text: "Error: Entry not found or does not belong to the specified family." } ] }
+        return { content: [ { type: "text", text: "Error: Entry not found or does not belong to the specified family." } ], isError: true }
       end
+
+      validate_reference!(params["category_id"], family.categories, "Category")
+      validate_reference!(params["merchant_id"], family.merchants, "Merchant")
 
       preview = {
         action: "update_transaction",
@@ -85,7 +92,8 @@ module McpTools
         action_type: "update_transaction",
         params: params,
         preview: preview,
-        family: family
+        family: family,
+        user: user
       )
 
       {
@@ -94,7 +102,14 @@ module McpTools
         ]
       }
     rescue => e
-      { content: [ { type: "text", text: "Error: #{e.message}" } ] }
+      { content: [ { type: "text", text: "Error: #{e.message}" } ], isError: true }
     end
+
+    def self.validate_reference!(id, relation, label)
+      return if id.blank? || relation.exists?(id: id)
+
+      raise ActiveRecord::RecordNotFound, "#{label} not found for family"
+    end
+    private_class_method :validate_reference!
   end
 end

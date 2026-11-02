@@ -137,6 +137,160 @@ class PendingActionTest < ActiveSupport::TestCase
     assert_equal false, confirmed.audit_result["success"]
   end
 
+  test "execute_update_transaction rejects valuation and trade entries without changing them" do
+    entries = [ valuation_entry_for_executor, trade_entry_for_executor ]
+
+    entries.each do |entry|
+      original_name = entry.name
+      original_amount = entry.amount
+
+      pending = PendingAction.create_pending!(
+        action_type: "update_transaction",
+        params: {
+          "entry_id" => entry.id,
+          "name" => "Mutated",
+          "amount" => "999999"
+        },
+        preview: { action: "update_transaction" },
+        family: @family,
+        user: @user
+      )
+
+      confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+      assert confirmed.present?
+      confirmed.reload
+
+      assert confirmed.confirmed?
+      assert_equal false, confirmed.audit_result["success"]
+      assert_equal "failed", confirmed.audit_result["execution_status"]
+
+      entry.reload
+      assert_equal original_name, entry.name
+      assert_equal original_amount, entry.amount
+    end
+  end
+
+  test "execute_create_transaction rejects category and merchant moved out of the family" do
+    other_family = Family.create!(currency: "USD")
+    references = [
+      [ "Category", "category_id", @family.categories.create!(name: "Executor stale category") ],
+      [ "Merchant", "merchant_id", @family.merchants.create!(name: "Executor stale merchant") ]
+    ]
+
+    references.each do |label, key, reference|
+      params = {
+        "account_id" => @account.id,
+        "date" => Date.current.to_s,
+        "name" => "Stale executor",
+        "amount" => "15.00"
+      }
+      params[key] = reference.id
+
+      pending = PendingAction.create_pending!(
+        action_type: "create_transaction",
+        params: params,
+        preview: { action: "create_transaction" },
+        family: @family,
+        user: @user
+      )
+      reference.update!(family: other_family)
+
+      confirmed = nil
+      assert_no_difference([ "Entry.count", "Transaction.count" ]) do
+        confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+      end
+
+      assert confirmed.present?
+      confirmed.reload
+
+      assert confirmed.confirmed?
+      assert_equal false, confirmed.audit_result["success"]
+      assert_equal "failed", confirmed.audit_result["execution_status"]
+      assert_match(/#{label} does not belong to family/, confirmed.audit_result["error"])
+    end
+  end
+
+  test "execute_update_transaction rejects category and merchant moved out of the family" do
+    other_family = Family.create!(currency: "USD")
+    entry = Entry.create!(
+      account: @account,
+      date: Date.current,
+      name: "Original update",
+      amount: 100,
+      currency: "USD",
+      entryable: Transaction.new
+    )
+    references = [
+      [ "Category", "category_id", @family.categories.create!(name: "Update stale category") ],
+      [ "Merchant", "merchant_id", @family.merchants.create!(name: "Update stale merchant") ]
+    ]
+
+    references.each do |label, key, reference|
+      params = {
+        "entry_id" => entry.id,
+        "name" => "Mutated",
+        "amount" => "999999"
+      }
+      params[key] = reference.id
+
+      pending = PendingAction.create_pending!(
+        action_type: "update_transaction",
+        params: params,
+        preview: { action: "update_transaction" },
+        family: @family,
+        user: @user
+      )
+      reference.update!(family: other_family)
+
+      confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+
+      assert confirmed.present?
+      confirmed.reload
+
+      assert confirmed.confirmed?
+      assert_equal false, confirmed.audit_result["success"]
+      assert_equal "failed", confirmed.audit_result["execution_status"]
+      assert_match(/#{label} does not belong to family/, confirmed.audit_result["error"])
+
+      entry.reload
+      assert_equal "Original update", entry.name
+      assert_equal BigDecimal("100"), entry.amount
+    end
+  end
+
+  test "execute_create_or_update_budget_category rejects a category moved out of the family" do
+    other_family = Family.create!(currency: "USD")
+    category = @family.categories.create!(name: "Budget stale category")
+    month_param = Budget.date_to_param(Date.current.beginning_of_month)
+
+    pending = PendingAction.create_pending!(
+      action_type: "create_or_update_budget_category",
+      params: {
+        "month_year" => month_param,
+        "category_id" => category.id,
+        "budgeted_spending" => "500"
+      },
+      preview: { action: "create_or_update_budget_category" },
+      family: @family,
+      user: @user
+    )
+    category.update!(family: other_family)
+
+    confirmed = nil
+    assert_no_difference([ "Budget.count", "BudgetCategory.count" ]) do
+      confirmed = PendingAction.confirm_and_execute!(id: pending.id, confirmed_by: @user)
+    end
+
+    assert confirmed.present?
+    confirmed.reload
+
+    assert confirmed.confirmed?
+    assert_equal false, confirmed.audit_result["success"]
+    assert_equal "failed", confirmed.audit_result["execution_status"]
+    assert_match(/Category does not belong to family/, confirmed.audit_result["error"])
+  end
+
   test "execute_create_or_update_budget creates budget" do
     month_param = Budget.date_to_param(Date.current.beginning_of_month)
 
@@ -1048,6 +1202,28 @@ class PendingActionTest < ActiveSupport::TestCase
 
     def mcp_tool_text(result)
       result[:content].first[:text]
+    end
+
+    def valuation_entry_for_executor
+      Entry.create!(
+        account: @account,
+        date: Date.current,
+        name: "Executor valuation",
+        amount: 100,
+        currency: "USD",
+        entryable: Valuation.new(kind: "reconciliation")
+      )
+    end
+
+    def trade_entry_for_executor
+      Entry.create!(
+        account: @account,
+        date: Date.current,
+        name: "Executor trade",
+        amount: 100,
+        currency: "USD",
+        entryable: Trade.new(security: securities(:aapl), qty: 1, price: 100, currency: "USD")
+      )
     end
 end
 
