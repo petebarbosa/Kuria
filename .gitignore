@@ -67,6 +67,7 @@ gcp-storage-keyfile.json
 
 # Ignore AI tools config.
 /.opencode/plans/*
+/.opencode/opencode.json
 
 # Ignore node related files
 node_modules
