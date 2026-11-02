@@ -26,7 +26,7 @@ x-rails-env: &rails_env
   DB_HOST: db
   DB_PORT: 5432
   REDIS_URL: redis://redis:6379/1
-  MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+  APP_DOMAIN: ${APP_DOMAIN:-localhost}
   FREECRYPTO_API_KEY: ${FREECRYPTO_API_KEY}
   # --- AI (RubyLLM) ---
   # AI runs exclusively through RubyLLM, calling hosted OpenAI and OpenCode Go

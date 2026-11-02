@@ -3,7 +3,6 @@ class Setting < RailsSettings::Base
   cache_prefix { "v1" }
 
   field :synth_api_key, type: :string, default: ENV["SYNTH_API_KEY"]
-  field :mcp_auth_token, type: :string, default: ENV["MCP_AUTH_TOKEN"]
 
   field :freecrypto_api_key, type: :string, default: ENV["FREECRYPTO_API_KEY"]
   field :require_invite_for_signup, type: :boolean, default: false
