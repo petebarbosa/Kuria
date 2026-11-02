@@ -22,8 +22,15 @@ x-rails-env: &rails_env
   <<: *db_env
   SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in the Dokploy environment}
   SELF_HOSTED: "true"
+  # TLS terminates at the edge (Cloudflare) or at Traefik, but the container is
+  # reached over plain HTTP, so Rails must be told the public request is HTTPS.
+  # Without ASSUME_SSL, request.base_url is http://<host> while browsers send
+  # `Origin: https://<host>`, and every non-GET request (sign-up, sign-in,
+  # password reset) fails with ActionController::InvalidAuthenticityToken.
+  # FORCE_SSL stays false: redirecting http->https inside the container loops
+  # when the edge forwards plain HTTP.
   RAILS_FORCE_SSL: "false"
-  RAILS_ASSUME_SSL: "false"
+  RAILS_ASSUME_SSL: "true"
   APP_DOMAIN: ${APP_DOMAIN:-kuria.petebarbosa.dev}
   DB_HOST: db
   DB_PORT: 5432
