@@ -38,7 +38,7 @@ Set at least:
 | `POSTGRES_PASSWORD` | Database password. Use a strong value; do not reuse an example value.   |
 | `SELF_HOSTED`       | Set to `true` for self-hosted mode. The example Compose file forces it. |
 
-The example Compose file passes through `SECRET_KEY_BASE`, the database settings, the AI provider keys, `MCP_AUTH_TOKEN`, `FREECRYPTO_API_KEY`, and `ASSISTANT_REQUESTS_PER_HOUR`. [`.env.example`](../../.env.example) documents the rest (`APP_DOMAIN`, `PAYMENTS_ENABLED`, `SMTP_*`, optional encryption keys). If you need an additional variable inside the containers, add it to the `x-rails-env` block in the Compose file and set it in `.env`.
+The example Compose file passes through `SECRET_KEY_BASE`, the database settings, the AI provider keys, `APP_DOMAIN`, `FREECRYPTO_API_KEY`, and `ASSISTANT_REQUESTS_PER_HOUR`. [`.env.example`](../../.env.example) documents those and the rest (`PAYMENTS_ENABLED`, `SMTP_*`, optional encryption keys). If you need an additional variable inside the containers, add it to the `x-rails-env` block in the Compose file and set it in `.env`.
 
 Do **not** put real keys in `.env.example`, `compose.example.yml`, or any committed file. `.env` is ignored by git and should stay local to the deployment host.
 
@@ -118,20 +118,13 @@ OpenCode Go is reached through its hosted OpenAI-compatible inference endpoint, 
 
 ## Optional: independent MCP endpoint
 
-Kuria exposes an MCP endpoint at `POST /mcp`. It is an **optional, independent integration** for MCP clients; it is not an LLM provider and is separate from the RubyLLM path. It does not require, start, or proxy an OpenCode Server.
+Kuria exposes a stateless MCP endpoint at `/mcp` (stateless `POST`; `GET` returns `405`; `DELETE` is handled as a stateless success). It is an **optional, independent integration** for MCP clients; it is not an LLM provider and is separate from the RubyLLM path. It does not require, start, or proxy an OpenCode Server.
 
-Set `MCP_AUTH_TOKEN` and send it as a Bearer token:
+Authentication uses Doorkeeper OAuth for a signed-in user and their family. Every call needs a token with the exact `mcp` scope; read tools require `mcp read`, and write tools require `mcp read_write` (`read_write` implies `read` but not `mcp`). API/mobile tokens without `mcp` are rejected. There is no global bearer-token fallback. In production, set `APP_DOMAIN` to the canonical public host: it feeds the endpoint's Host/Origin allowlist and email links.
 
-```sh
-MCP_AUTH_TOKEN=...
-```
+The catalog exposes nine tools: four read tools, four prepare-write tools, and `confirm_action`. The exchange-rate update tool (`upsert_exchange_rates`) is not exposed, and legacy pending actions of that type cannot be confirmed. Write calls only prepare a 10-minute pending action; confirmation records the real family user and the audit result.
 
-```http
-POST /mcp
-Authorization: Bearer <token>
-```
-
-The endpoint rejects requests with `401 Unauthorized` when no token is configured or the token does not match. Leave `MCP_AUTH_TOKEN` blank if you do not use MCP clients; the rest of the application is unaffected. The example Compose file passes the variable through but starts no MCP-specific service.
+See [Connecting OpenCode to the Kuria MCP server](mcp.md) for OAuth/PKCE setup, the OpenCode V2 client config, revocation, and current limitations, including the absence of automatic discovery, dynamic client registration, or refresh with `oauth: false`.
 
 ## Assistant request limit
 
@@ -226,5 +219,6 @@ The example stack publishes port 3000 directly and sets `RAILS_FORCE_SSL=false` 
 | A model reference is rejected                      | Use a currently listed `openai/<model>` or `opencode_go/<model>` reference. Responses-only, Anthropic Messages, and Gemini references are unsupported.                         |
 | A saved model stops working                        | The provider retired it or the live list changed. Reselect a model in the chat or in **Settings → Account → Transaction enrichment model**; Kuria will not choose one for you. |
 | Assistant requests return a rate-limit error       | Raise `ASSISTANT_REQUESTS_PER_HOUR` or wait for the window to reset.                                                                                                           |
-| MCP requests return `401`                          | Set `MCP_AUTH_TOKEN` and send the same value as a Bearer token.                                                                                                                |
+| MCP requests return `401`                          | The OAuth bearer token is missing, invalid, expired, revoked, or lacks the exact `mcp` scope. Obtain a user/family token with `mcp read` or `mcp read_write`; see [Connecting OpenCode to the Kuria MCP server](mcp.md). |
+| MCP requests return `403`                          | The token lacks `read` for a read tool, or the request Host/Origin is not allowed. Confirm scopes and set `APP_DOMAIN` in production; see [Connecting OpenCode to the Kuria MCP server](mcp.md). |
 | `web` exits during boot                            | Inspect `docker compose -f compose.example.yml logs web`; the usual causes are a blank `SECRET_KEY_BASE`, an unreachable database, or a failed migration.                      |

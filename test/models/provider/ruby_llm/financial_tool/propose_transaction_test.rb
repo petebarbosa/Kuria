@@ -53,6 +53,20 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
     assert_equal @account.name, pending.preview.fetch("account_name")
   end
 
+  test "prepares the proposal without depending on the MCP create_transaction adapter" do
+    McpTools::CreateTransaction.expects(:execute).never
+
+    result = nil
+
+    assert_difference("PendingAction.count", 1) do
+      result = @tool.call(**valid_arguments)
+    end
+
+    pending = PendingAction.find(result.fetch(:pending_action_id))
+    assert_equal "pending_confirmation", result.fetch(:status)
+    assert_equal pending.preview, result.fetch(:preview)
+  end
+
   test "ignores an embedded pending action id in model-controlled fields" do
     spoofed = PendingAction.create_pending!(
       action_type: "create_transaction",
@@ -105,7 +119,7 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
   end
 
   test "rejects model supplied family and user identifiers without forwarding" do
-    McpTools::CreateTransaction.expects(:execute).never
+    Transaction::Proposal.expects(:prepare!).never
 
     assert_no_difference("PendingAction.count") do
       family_result = @tool.call(**valid_arguments, family_id: @family.id)
@@ -117,7 +131,7 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
   end
 
   test "rejects unknown arguments without forwarding" do
-    McpTools::CreateTransaction.expects(:execute).never
+    Transaction::Proposal.expects(:prepare!).never
 
     assert_no_difference("PendingAction.count") do
       result = @tool.call(**valid_arguments, note: "not a transaction field")
@@ -127,7 +141,7 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
   end
 
   test "rejects missing required transaction fields without forwarding" do
-    McpTools::CreateTransaction.expects(:execute).never
+    Transaction::Proposal.expects(:prepare!).never
 
     assert_no_difference("PendingAction.count") do
       result = @tool.call(**valid_arguments.except(:amount))
@@ -137,7 +151,7 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
   end
 
   test "rejects account, category, and merchant references outside the bound family" do
-    McpTools::CreateTransaction.expects(:execute).never
+    Transaction::Proposal.expects(:prepare!).never
 
     other_family = families(:empty)
     other_account = other_family.accounts.create!(
@@ -213,15 +227,13 @@ class Provider::RubyLlm::FinancialTool::ProposeTransactionTest < ActiveSupport::
     refute_equal first.fetch(:pending_action_id), second.fetch(:pending_action_id)
   end
 
-  test "maps MCP proposal failures to a fixed error" do
-    McpTools::CreateTransaction.expects(:execute).returns(
-      { content: [ { type: "text", text: "Error: SECRET-MCP-PAYLOAD" } ] }
-    )
+  test "maps proposal failures to a fixed error" do
+    Transaction::Proposal.expects(:prepare!).raises(StandardError.new("SECRET-PROPOSAL-PAYLOAD"))
 
     result = @tool.call(**valid_arguments)
 
     assert_equal({ error: Provider::RubyLlm::FinancialTool::ProposeTransaction::PROPOSAL_ERROR }, result)
-    refute_match(/SECRET-MCP-PAYLOAD/, result.to_json)
+    refute_match(/SECRET-PROPOSAL-PAYLOAD/, result.to_json)
   end
 
   private

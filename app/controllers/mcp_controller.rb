@@ -1,66 +1,38 @@
-class McpController < ApplicationController
-  skip_before_action :verify_authenticity_token
-  skip_authentication
-  before_action :authenticate_mcp_client
-
-  LEGACY_TOOL_CLASSES = [
-    McpTools::ConfirmAction,
-    McpTools::CreateTransaction,
-    McpTools::UpdateTransaction,
-    McpTools::CreateOrUpdateBudget,
-    McpTools::CreateOrUpdateBudgetCategory,
-    McpTools::UpsertExchangeRates
-  ].freeze
-
+class McpController < ActionController::API
   def handle
-    server = MCP::Server.new(
-      name: "maybe-finance",
-      version: "1.0.0",
-      tools: mcp_tools
-    )
+    status, headers, body = transport.handle_request(Rack::Request.new(request.env))
 
-    result = server.handle_json(request.body.read)
-    render json: result
+    response.status = status
+    headers.each { |name, value| response.set_header(name, value) }
+    self.response_body = body
   end
 
   private
-
-    # Legacy tools expose tool_name/tool_description/tool_input_schema/execute and
-    # are not MCP::Tool subclasses, so wrap each one as an official MCP::Tool class
-    # at registration time.
-    def mcp_tools
-      [
-        McpTools::GetTransactions,
-        McpTools::GetAccounts,
-        McpTools::GetBalanceSheet,
-        McpTools::GetIncomeStatement,
-        *LEGACY_TOOL_CLASSES.map { |legacy_class| mcp_tool_wrapper(legacy_class) }
-      ]
+    def transport
+      MCP::Server::Transports::StreamableHTTPTransport.new(
+        server,
+        stateless: true,
+        enable_json_response: true,
+        serve_subscriptions_listen: false,
+        token_verifier: Mcp::OauthTokenVerifier.new,
+        required_scopes: %w[mcp read],
+        scope_matcher: Mcp::OauthTokenVerifier.method(:scope_satisfied?),
+        allowed_hosts: allowed_hosts
+      )
     end
 
-    def mcp_tool_wrapper(legacy_class)
-      MCP::Tool.define(
-        name: legacy_class.tool_name,
-        description: legacy_class.tool_description,
-        input_schema: legacy_class.tool_input_schema
-      ) do |server_context: nil, **params|
-        result = legacy_class.execute(params.deep_stringify_keys)
-        MCP::Tool::Response.new(result[:content])
-      end
+    def server
+      MCP::Server.new(
+        name: "maybe-finance",
+        version: "1.0.0",
+        tools: Mcp::ToolRegistry.tools
+      )
     end
 
-    def authenticate_mcp_client
-      token = extract_bearer_token
-      expected = Setting.mcp_auth_token
+    def allowed_hosts
+      mail_options = Rails.application.config.action_mailer.default_url_options || {}
+      mail_host = mail_options[:host] || mail_options["host"]
 
-      unless expected.present? && token.present? && ActiveSupport::SecurityUtils.secure_compare(token, expected)
-        render json: { error: "Unauthorized" }, status: :unauthorized
-      end
-    end
-
-    def extract_bearer_token
-      header = request.headers["Authorization"]
-      return nil unless header&.start_with?("Bearer ")
-      header.sub("Bearer ", "")
+      [ ENV["APP_DOMAIN"], mail_host ].compact_blank.uniq
     end
 end

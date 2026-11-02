@@ -63,30 +63,12 @@ module McpTools
 
     def self.execute(params, user: nil, idempotency_key: nil)
       family = McpTools::Base.resolve_family(params["family_id"])
-      account = family.accounts.find(params["account_id"])
       user ||= resolve_user(params["user_id"], family)
       idempotency_key = idempotency_key.presence || params["idempotency_key"].presence
-      currency = params["currency"] || family.currency
-      amount = BigDecimal(params["amount"])
-      kind = params["kind"] || "standard"
 
-      preview = {
-        action: "create_transaction",
-        account_name: account.name,
-        date: params["date"],
-        name: params["name"],
-        amount: amount.to_s,
-        currency: currency,
-        kind: kind,
-        category_id: params["category_id"],
-        merchant_id: params["merchant_id"]
-      }
-
-      pending = PendingAction.create_pending!(
-        action_type: "create_transaction",
-        params: params.except("user_id", "idempotency_key"),
-        preview: preview,
+      pending = Transaction::Proposal.prepare!(
         family: family,
+        params: params,
         user: user,
         idempotency_key: idempotency_key
       )
@@ -97,7 +79,7 @@ module McpTools
         ]
       }
     rescue => e
-      { content: [ { type: "text", text: "Error: #{e.message}" } ] }
+      { content: [ { type: "text", text: "Error: #{e.message}" } ], isError: true }
     end
 
     # The user and idempotency key are supplied by the server, never advertised

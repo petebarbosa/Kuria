@@ -37,8 +37,8 @@ module McpTools
       }
     end
 
-    def self.execute(params)
-      family = resolve_family(params["family_id"])
+    def self.execute(params, user: nil)
+      family = McpTools::Base.resolve_family(params["family_id"])
       month_date = Budget.param_to_date(params["month_year"])
       category = family.categories.find(params["category_id"])
 
@@ -58,7 +58,8 @@ module McpTools
         action_type: "create_or_update_budget_category",
         params: params,
         preview: preview,
-        family: family
+        family: family,
+        user: user
       )
 
       {
@@ -67,9 +68,9 @@ module McpTools
         ]
       }
     rescue ActiveRecord::RecordNotFound => e
-      { content: [ { type: "text", text: "Error: #{e.message}" } ] }
+      { content: [ { type: "text", text: "Error: #{e.message}" } ], isError: true }
     rescue => e
-      { content: [ { type: "text", text: "Error: #{e.message}" } ] }
+      { content: [ { type: "text", text: "Error: #{e.message}" } ], isError: true }
     end
   end
 end

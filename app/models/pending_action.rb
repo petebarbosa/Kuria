@@ -321,8 +321,17 @@ class PendingAction < ApplicationRecord
       errors.add(:preview, "must not be empty") if preview.is_a?(Hash) && preview.empty?
     end
 
+    def validate_family_reference!(id, relation, label, optional: true)
+      return if id.blank? && optional
+      return if id.present? && relation.exists?(id: id)
+
+      raise "#{label} does not belong to family"
+    end
+
     def execute_create_transaction
       account = family.accounts.find(params["account_id"])
+      validate_family_reference!(params["category_id"], family.categories, "Category")
+      validate_family_reference!(params["merchant_id"], family.merchants, "Merchant")
       entry = Entry.create!(
         account: account,
         date: Date.parse(params["date"]),
@@ -341,8 +350,12 @@ class PendingAction < ApplicationRecord
     end
 
     def execute_update_transaction
-      entry = Entry.find(params["entry_id"])
+      entry = Entry.where(entryable_type: "Transaction").find_by(id: params["entry_id"])
+      raise "Entry is not a transaction" unless entry
       raise "Entry does not belong to family" unless entry.account.family_id == family.id
+
+      validate_family_reference!(params["category_id"], family.categories, "Category")
+      validate_family_reference!(params["merchant_id"], family.merchants, "Merchant")
 
       update_attrs = {
         date: params["date"] ? Date.parse(params["date"]) : nil,
@@ -381,6 +394,7 @@ class PendingAction < ApplicationRecord
 
     def execute_create_or_update_budget_category
       month_date = Budget.param_to_date(params["month_year"])
+      validate_family_reference!(params["category_id"], family.categories, "Category", optional: false)
       budget = Budget.find_or_bootstrap(family, start_date: month_date)
       return { success: false, error: "Invalid budget date" } unless budget
 

@@ -16,7 +16,6 @@ class Provider
         REFERENCE_ERROR = "The account, category, or merchant is not available to the authenticated family.".freeze
         PROPOSAL_ERROR = "Unable to prepare the transaction proposal.".freeze
 
-        PENDING_ACTION_ID_PATTERN = /Call confirm_action with pending_action_id:\s*([0-9a-f-]{36})\s+to execute\.\s*\z/i
         PERMITTED_ARGUMENTS = %i[
           account_id date name amount currency category_id merchant_id kind
         ].freeze
@@ -58,13 +57,18 @@ class Provider
           return validation_error unless REQUIRED_ARGUMENTS.all? { |key| arguments[key].present? }
           return reference_error unless references_valid?(arguments)
 
-          result = McpTools::CreateTransaction.execute(
-            mcp_params(arguments),
+          pending = Transaction::Proposal.prepare!(
+            family: @family,
+            params: arguments.slice(*PERMITTED_ARGUMENTS),
             user: @user,
             idempotency_key: idempotency_key(tool_call, arguments)
           )
 
-          proposal_result(result)
+          {
+            status: "pending_confirmation",
+            pending_action_id: pending.id,
+            preview: pending.preview
+          }
         rescue StandardError
           proposal_error
         end
@@ -80,10 +84,6 @@ class Provider
 
           def optional_reference_valid?(id, relation)
             id.blank? || relation.exists?(id: id)
-          end
-
-          def mcp_params(arguments)
-            arguments.transform_keys(&:to_s).merge("family_id" => @family.id)
           end
 
           def idempotency_key(tool_call, arguments)
@@ -102,27 +102,6 @@ class Provider
             else
               value
             end
-          end
-
-          def proposal_result(result)
-            text = result.is_a?(Hash) ? result_content_text(result) : nil
-            pending_id = text&.match(PENDING_ACTION_ID_PATTERN)&.[](1)
-            pending = PendingAction.find_by(id: pending_id, family: @family, user: @user)
-            return proposal_error if pending.nil?
-
-            {
-              status: "pending_confirmation",
-              pending_action_id: pending.id,
-              preview: pending.preview
-            }
-          end
-
-          def result_content_text(result)
-            content = result[:content] || result["content"]
-            item = Array(content).first
-            return unless item.is_a?(Hash)
-
-            item[:text] || item["text"]
           end
 
           def authorization_error
