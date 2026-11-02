@@ -1,0 +1,100 @@
+# Dokploy deployment of the Kuria stack.
+#
+# This file is the Compose definition Dokploy deploys on the oracle-server host.
+# It mirrors compose.yml (the self-hosting reference) with three differences:
+#
+#   1. `web` also joins the external `dokploy-network` overlay so Dokploy's
+#      Traefik can route the public hostname into it.
+#   2. No service publishes a host port: the host's 3000 belongs to the Dokploy
+#      panel, and Traefik reaches `web` over the overlay instead.
+#   3. Required secrets are supplied by the Dokploy environment (Compose
+#      interpolation reads them from `.env`); nothing secret lives here.
+#
+# Deploying from Git uses this file as the Compose path; the Dokploy domain
+# record for kuria.petebarbosa.dev targets service `web` on port 3000.
+
+x-db-env: &db_env
+  POSTGRES_USER: ${POSTGRES_USER:-kuria_user}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the Dokploy environment}
+  POSTGRES_DB: ${POSTGRES_DB:-kuria_production}
+
+x-rails-env: &rails_env
+  <<: *db_env
+  SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in the Dokploy environment}
+  SELF_HOSTED: "true"
+  RAILS_FORCE_SSL: "false"
+  RAILS_ASSUME_SSL: "false"
+  APP_DOMAIN: ${APP_DOMAIN:-kuria.petebarbosa.dev}
+  DB_HOST: db
+  DB_PORT: 5432
+  REDIS_URL: redis://redis:6379/1
+  MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+  FREECRYPTO_API_KEY: ${FREECRYPTO_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - app-storage:/rails/storage
+    restart: unless-stopped
+    environment:
+      <<: *rails_env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - dokploy-network
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: bundle exec sidekiq
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *rails_env
+
+  db:
+    image: postgres:18.4-trixie
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    environment:
+      <<: *db_env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8.8.1-trixie
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  app-storage:
+  postgres-data:
+  redis-data:
+
+networks:
+  dokploy-network:
+    external: true
