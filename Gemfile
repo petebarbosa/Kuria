@@ -16,8 +16,13 @@ gem "bootsnap", require: false
 # Assets
 gem "importmap-rails"
 gem "propshaft"
-gem "tailwindcss-rails"
 gem "lucide-rails", github: "maybe-finance/lucide-rails"
+
+# Tailwind is compiled during the image build; the runtime image only serves
+# the generated CSS from app/assets/builds.
+group :development, :test, :build do
+  gem "tailwindcss-rails"
+end
 
 # Hotwire + UI
 gem "stimulus-rails"
